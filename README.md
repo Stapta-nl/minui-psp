@@ -79,3 +79,14 @@ This option can be found under Settings > Graphics > Speed Hacks > Skip buffer e
 This project uses PPSSPP, which is open-source software. Please refer to the original PPSSPP [LICENSE.TXT](PPSSPP/LICENSE.TXT) file for more details.
 
 The project code which is not part of PPSSPP is licensed under the [MIT License](https://opensource.org/licenses/MIT). See the project [LICENSE](LICENSE) file for more details.
+
+## Testing the Game Switcher image on a device
+
+`tests/device/run.sh` runs the real `launch.sh` and `bin/jpg2bmp` against a stub PPSSPP in a throw-away SD tree, and checks the preview image, slot file, record file, resume handling and the SIGTERM path. Over SSH:
+
+```sh
+scp -r tests root@<device>:/mnt/SDCARD/Emus/tg5040/PSP.pak/
+ssh root@<device> 'sh /mnt/SDCARD/Emus/tg5040/PSP.pak/tests/device/run.sh'
+```
+
+It prints PASS/FAIL per test and exits non-zero on failure. Logs are kept in `/tmp/psp-preview-test-out`. The real SD card is not modified.
