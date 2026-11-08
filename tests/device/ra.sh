@@ -46,7 +46,7 @@ RA_TOKEN="tok3nS3cr3tA1b2C3d4"
 RA_PASSWORD="pa55S3cr3tZ9y8"
 
 missing=""
-for tool in mktemp cp mv rm mkdir cmp grep head tr sed cat awk ls wc find touch chmod; do
+for tool in mktemp cp mv rm mkdir cmp grep head tr sed cat awk ls wc find touch chmod cut od; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
 if [ -n "$missing" ]; then
@@ -442,6 +442,37 @@ EOF
     check "($mode) PPSSPP still launched" launched
 done
 rm -f "$PAK/bin/awk"
+end
+
+begin "17 settings parsing: CRLF, last key wins, raAuthenticated missing or not 1"
+fresh
+settings raHardcoreMode=1 # the base file says 0 earlier: the later line must win
+sed "s/\$/$CR/" "$SETTINGS" >"$SETTINGS.crlf" && mv "$SETTINGS.crlf" "$SETTINGS"
+run_game
+check_enabled Player1 True
+settings -raAuthenticated
+run_game
+check "missing raAuthenticated -> off" ach_is AchievementsEnable False
+check "missing raAuthenticated -> token removed" token_absent
+settings raAuthenticated=yes
+run_game
+check "raAuthenticated=yes -> off" ach_is AchievementsEnable False
+end
+
+begin "18 only managed lines change; BOM kept; missing graphics key added"
+fresh
+settings raHardcoreMode=1
+run_game
+check_enabled Player1 True
+managed='^(AchievementsEnable|AchievementsUserName|AchievementsChallengeMode|DisplayAspectRatio|GraphicsBackend) = '
+grep -v -E "$managed" "$T/shipped.ini" >"$T/a.rest"
+grep -v -E "$managed" "$INI" >"$T/b.rest"
+check "all other lines byte for byte the same" same "$T/a.rest" "$T/b.rest"
+grep -v '^DisplayAspectRatio = ' "$T/shipped.ini" >"$INI" # the shipped ini starts with a BOM
+run_game
+check_enabled Player1 True
+check "BOM kept, once" [ "$(head -c 4 "$INI" | od -An -tx1 | tr -d ' \n')" = "efbbbf5b" ]
+check "DisplayAspectRatio added in [Graphics]" sh -c "awk '/^\\[/ { on = (\$0 == \"[Graphics]\") } on' '$INI' | grep -q '^DisplayAspectRatio = '"
 end
 
 echo
