@@ -269,7 +269,9 @@ end() {
     if [ "$CASE_FAIL" = 0 ]; then PASS=$((PASS + 1)); say "PASS $CASE"; else FAIL=$((FAIL + 1)); say "FAIL $CASE"; fi
 }
 
-seed_recent() { mkdir -p "$(dirname "$RECENT")" && printf '%s\n' "$ROM" >"$RECENT"; }
+# NextUI keeps recents relative to the SD card ("/Roms/..."), so it works on every platform.
+# An absolute path is not found and NextUI drops it, rewriting recent.txt empty.
+seed_recent() { mkdir -p "$(dirname "$RECENT")" && printf '%s\n' "${ROM#"$SD"}" >"$RECENT"; }
 
 restart_ui() {
     kill_ui
