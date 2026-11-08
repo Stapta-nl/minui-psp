@@ -4,3 +4,4 @@
 .gitignore export-ignore
 Makefile export-ignore
 src export-ignore
+tests export-ignore
