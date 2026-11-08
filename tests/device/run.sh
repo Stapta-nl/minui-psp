@@ -3,7 +3,7 @@
 #
 # It runs the *real* launch.sh and the *real* bin/jpg2bmp inside a throw-away SD card
 # tree, with a stub standing in for PPSSPP and minui-power-control. So it checks what the
-# PR's on-device table is really about (BusyBox cksum/cmp/sed, the aarch64 converter, the
+# PR's on-device table is really about (BusyBox tools, the aarch64 converter, the
 # NextUI file layout, SIGTERM handling) without needing a screen or button presses.
 # Nothing under the real SD card is touched; the sandbox is deleted afterwards.
 #
@@ -37,6 +37,17 @@ MINUI="$SHARED/.minui/PSP"
 STATES="$SHARED/PSP-ppsspp"
 STUB="$T/stub"
 INI="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
+
+# The device's BusyBox is small: say clearly which tool is missing instead of failing oddly.
+missing=""
+for tool in mktemp cp mv rm mkdir cmp grep head tr find sed cat sleep touch basename sync wc; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+    echo "run.sh: missing tools on this system:$missing" >&2
+    rm -rf "$T"
+    exit 2
+fi
 
 PASS=0
 FAIL=0
@@ -104,6 +115,7 @@ cat >"$PAK/PPSSPP/PPSSPPSDL_$PLATFORM" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$@" >"$STUB/args"
 echo $$ >"$STUB/pid"
+sleep 2 # like a real boot: saves must be newer than launch.sh's marker (FAT has 2 s mtime)
 while read -r action a b c; do
     case "$action" in
     save)

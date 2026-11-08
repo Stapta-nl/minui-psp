@@ -114,16 +114,10 @@ set_cpu_settings() {
 # then shows "No Preview"). Resume handling is not changed by this.
 STATE_DIR="$SHARED_USERDATA_PATH/PSP-ppsspp"
 PREVIEW_ROM=""
-STATE_THUMBS_BEFORE=""
-
-# One "<crc> <size> <path>" line per save-state thumbnail (undo thumbnails excluded).
-# Content checksums, unlike mtimes, catch every save, even several within one second.
-list_state_thumbnails() {
-    for jpg in "$STATE_DIR"/*.jpg; do
-        case "$jpg" in *.undo.jpg) continue ;; esac
-        [ -f "$jpg" ] && cksum "$jpg"
-    done
-}
+# Touched at launch: states saved afterwards have a newer mtime. Only the shell's own
+# test (-nt) is used, because the device's BusyBox has no cksum and few other tools.
+# (The SD card is FAT with 2 s mtime resolution; a save is never made within 2 s of launch.)
+STATE_MARKER="/tmp/psp-ppsspp-launch-marker"
 
 # Prints the NextUI emu tag of a ROM the way NextUI's getEmuName() does: the Roms folder
 # name, then the text in its last (...). Falls back to the pak name, then "PSP".
@@ -162,24 +156,19 @@ write_game_switcher_preview() {
     PREVIEW_ROM=""
     [ -n "$rom_path" ] && [ -n "$SHARED_USERDATA_PATH" ] || return 0
 
-    # Thumbnails that are new or changed since launch. Only the launched game ran, so they
-    # all belong to it; take the newest.
+    # Thumbnails saved since launch. Only the launched game ran, so they all belong to it;
+    # take the newest (undo thumbnails excluded).
     thumb=""
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        case "
-$STATE_THUMBS_BEFORE
-" in *"
-$line
-"*) continue ;; esac
-        jpg="${line#* * }"
+    for jpg in "$STATE_DIR"/*.jpg; do
+        case "$jpg" in *.undo.jpg) continue ;; esac
+        [ -f "$jpg" ] || continue
         # shellcheck disable=SC3013 # -nt is supported by BusyBox ash and dash
+        [ "$jpg" -nt "$STATE_MARKER" ] || continue
+        # shellcheck disable=SC3013
         if [ -z "$thumb" ] || [ "$jpg" -nt "$thumb" ]; then
             thumb="$jpg"
         fi
-    done <<EOF
-$(list_state_thumbnails)
-EOF
+    done
     [ -n "$thumb" ] || return 0
 
     # PPSSPP names states <DISC_ID>_<DISC_VERSION>_<slot>.ppst/.jpg
@@ -258,7 +247,7 @@ main() {
     # NextUI's Resume hands the chosen slot over in this file; PPSSPP does not use it, and
     # minarch would load it in the next game it launches, so remove it.
     rm -f /tmp/resume_slot.txt
-    STATE_THUMBS_BEFORE="$(list_state_thumbnails)"
+    touch "$STATE_MARKER"
     PREVIEW_ROM="$1"
 
     # Launch emulator

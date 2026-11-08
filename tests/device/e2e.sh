@@ -58,6 +58,13 @@ CASE_FAIL=0
 say() { echo "$*"; }
 die() { echo "e2e: $*" >&2; exit 2; }
 
+# The device's BusyBox is small: say clearly which tool is missing instead of failing oddly.
+missing=""
+for tool in awk cmp cp mv rm mkdir grep head tail tr find ls wc sed cat sleep touch basename sync pgrep pkill killall printf; do
+    command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+[ -z "$missing" ] || die "missing tools on this system:$missing"
+
 # --- preflight -----------------------------------------------------------------------
 [ "$(id -u)" = 0 ] || die "run as root (needed to write to /dev/input)"
 [ -d "$PAK" ] || die "PSP pak not found at $PAK"
@@ -268,6 +275,7 @@ open_switcher() { # restarts NextUI directly into the Game Switcher
     restart_ui
 }
 
+differs() { ! cmp -s "$1" "$2"; }
 have_shot() { [ -n "$SHOT" ] && [ -s "$SHOT" ]; }
 is_image() { head -c 2 "$1" | grep -q BM || head -c 4 "$1" | tail -c 3 | grep -q PNG; }
 
@@ -368,7 +376,7 @@ else
     shot e2-switcher-nopreview
     check "switcher screenshot without preview taken" have_shot
     mv "$PREVIEW_N.off" "$PREVIEW_N"
-    check "the preview changes what the switcher shows" test "$(cksum <"$with_preview")" != "$(cksum <"$SHOT")"
+    check "the preview changes what the switcher shows" differs "$with_preview" "$SHOT"
 fi
 end
 
