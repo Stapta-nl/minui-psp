@@ -90,3 +90,16 @@ ssh root@<device> 'sh /mnt/SDCARD/Emus/tg5040/PSP.pak/tests/device/run.sh'
 ```
 
 It prints PASS/FAIL per test and exits non-zero on failure. Logs are kept in `/tmp/psp-preview-test-out`. The real SD card is not modified.
+
+### Fully automated end-to-end test
+
+`tests/device/e2e.sh` drives the real NextUI and PPSSPP on a TrimUI device with no one at the buttons: it injects button presses through the `TRIMUI Player1` evdev device, launches the first game in `Roms/*(PSP)` through NextUI's `/tmp/next` hand-off, and takes screenshots with the [Screenshot Monitor](https://github.com/josegonzalez/minui-screenshot-monitor-pak) pak's `bin/screenshot`. Screenshots are judged by the bundled `pngcolor` helper.
+
+Requirements: root over SSH, this pak and the Screenshot Monitor pak installed, and a game in `Roms/*(PSP)`. CI publishes the `psp-device-tests` artifact (`psp-device-tests.tar.gz`) with the script, fixtures and the aarch64 helper:
+
+```sh
+scp psp-device-tests.tar.gz root@<device>:/tmp/
+ssh root@<device> 'cd /tmp && tar xzf psp-device-tests.tar.gz && sh tests/device/e2e.sh'
+```
+
+The script temporarily changes the recents and resume files of the test game and restores them on exit. See the header of `e2e.sh` for the settings, including `PSP_KEYS`, the button steps that make PPSSPP save a state.

@@ -50,8 +50,17 @@ jobs:
           name: "${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
           path: "dist/${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
 
+      - name: Build device test bundle
+        run: make test-bundle
+
+      - name: Upload device test bundle
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: psp-device-tests
+          path: dist/psp-device-tests.tar.gz
+
       - name: Lint shell scripts
-        run: shellcheck launch.sh tests/device/run.sh
+        run: shellcheck launch.sh tests/device/run.sh tests/device/e2e.sh
 
       - name: Check release contents
         run: |
