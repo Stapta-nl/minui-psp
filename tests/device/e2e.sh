@@ -43,9 +43,9 @@ SHARED="$SD/.userdata/shared"
 LOGS="$SD/.userdata/$PLATFORM/logs"
 OUT="${OUT_DIR:-/tmp/psp-e2e-out}"
 BOOT_WAIT="${BOOT_WAIT:-20}"
-UI_WAIT="${UI_WAIT:-4}"
+UI_WAIT="${UI_WAIT:-6}"
 KEY_GAP="${KEY_GAP:-0.5}"
-PSP_KEYS="${PSP_KEYS-select+r1 sleep3 select+right sleep1 select+r1 sleep3}"
+PSP_KEYS="${PSP_KEYS-select+r1 sleep3 shot select+right sleep1 shot select+r1 sleep3 shot}"
 EXIT_KEYS="${EXIT_KEYS-select+start}"
 STATE_DIR="$SD/.userdata/shared/PSP-ppsspp"
 PNGCOLOR="$HERE/bin/pngcolor"
@@ -115,12 +115,16 @@ kill_ui() { killall -9 nextui.elf 2>/dev/null; }
 # first puts the files back from it.
 restore_files() {
     rm -f /tmp/next
-    while IFS= read -r f; do
-        [ -n "$f" ] && cp -p "$BAK$f" "$f"
-    done <"$BAK/present" 2>/dev/null
-    while IFS= read -r f; do
-        [ -n "$f" ] && rm -f "$f"
-    done <"$BAK/absent" 2>/dev/null
+    if [ -f "$BAK/present" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] && cp -p "$BAK$f" "$f"
+        done <"$BAK/present"
+    fi
+    if [ -f "$BAK/absent" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] && rm -f "$f"
+        done <"$BAK/absent"
+    fi
     rm -f "$PERSIST.tmp"
     # delete previews of other slots that the test created
     for f in "$MINUI/$ROM_FILE".*.bmp; do
@@ -242,6 +246,9 @@ shot() {
         SHOT="$OUT/$1.png"
         SHOT_NAME="$newest"
         mv "$SHOTDIR/$newest" "$SHOT"
+        say "  info: $1.png average colour (R G B): $(colour "$SHOT")"
+    else
+        say "  info: $1: no screenshot was written (see $OUT/$1.shot.log)"
     fi
 }
 
@@ -340,6 +347,7 @@ running PPSSPPSDL && killall PPSSPPSDL_"$PLATFORM" 2>/dev/null
 check "PPSSPP exited" wait_for 30 not_running PPSSPPSDL
 check "NextUI is back" wait_for 90 running nextui.elf
 sleep "$UI_WAIT"
+ls -l --full-time "$STATE_DIR" >"$OUT/e2-states.txt" 2>/dev/null || ls -l "$STATE_DIR" >"$OUT/e2-states.txt" 2>&1
 cp "$LOGS/PSP.txt" "$OUT/e2-PSP.log" 2>/dev/null
 
 if [ -z "$PSP_KEYS" ]; then
