@@ -60,7 +60,7 @@ jobs:
           path: dist/psp-device-tests.tar.gz
 
       - name: Lint shell scripts
-        run: shellcheck launch.sh tests/device/run.sh tests/device/e2e.sh
+        run: shellcheck launch.sh tests/device/run.sh tests/device/e2e.sh tests/device/ra.sh
 
       - name: Check release contents
         run: |
@@ -80,6 +80,14 @@ jobs:
       # against a stub PPSSPP. Tests the unpacked release, not the repository checkout.
       - name: Test Game Switcher preview
         run: SRC_PAK="$RUNNER_TEMP/rel" OUT_DIR="$RUNNER_TEMP/test-out" sh tests/device/run.sh
+
+      # Runs the real launch.sh against a stub PPSSPP with NextUI-style settings.
+      # Tests the unpacked release, under dash (sh) and BusyBox ash like on the device.
+      - name: Test RetroAchievements sync
+        run: |
+          SRC_PAK="$RUNNER_TEMP/rel" OUT_DIR="$RUNNER_TEMP/test-out/ra-dash" sh tests/device/ra.sh
+          command -v busybox >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq busybox; }
+          SRC_PAK="$RUNNER_TEMP/rel" OUT_DIR="$RUNNER_TEMP/test-out/ra-busybox" LAUNCH_SHELL="busybox sh" busybox sh tests/device/ra.sh
 
       - name: Upload test logs
         if: failure()
