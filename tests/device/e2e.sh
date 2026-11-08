@@ -60,7 +60,7 @@ die() { echo "e2e: $*" >&2; exit 2; }
 
 # The device's BusyBox is small: say clearly which tool is missing instead of failing oddly.
 missing=""
-for tool in awk cmp cp mv rm mkdir grep head tail tr find ls wc sed cat sleep touch basename sync pgrep pkill killall printf; do
+for tool in awk cmp cp mv rm mkdir grep head tail tr find ls wc sed cat sleep touch basename dirname sync pgrep killall id printf; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
 [ -z "$missing" ] || die "missing tools on this system:$missing"
@@ -142,7 +142,7 @@ if [ -f "$BAK/active" ]; then
 fi
 
 restore() {
-    pkill -f PPSSPPSDL 2>/dev/null
+    killall PPSSPPSDL_"$PLATFORM" 2>/dev/null
     restore_files
     rm -f "$BAK/active"
     kill_ui # relaunches NextUI with the restored files
