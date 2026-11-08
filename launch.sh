@@ -304,11 +304,18 @@ _sync_retroachievements() {
     fi
 
     # PPSSPP reads the token file verbatim, so write it without a newline,
-    # and compare byte for byte so a stray trailing newline gets fixed.
+    # and compare byte for byte so a stray trailing newline gets fixed. The
+    # temp file is checked before it replaces the old token, so a full SD
+    # card cannot leave a truncated token behind.
     if ! printf '%s' "$ra_token" | cmp -s - "$PPSSPP_RA_TOKEN_FILE"; then
         ra_token_tmp="$PPSSPP_RA_TOKEN_FILE.tmp.$$"
-        (umask 077 && printf '%s' "$ra_token" >"$ra_token_tmp") &&
-            mv -f "$ra_token_tmp" "$PPSSPP_RA_TOKEN_FILE"
+        if (umask 077 && printf '%s' "$ra_token" >"$ra_token_tmp") &&
+            printf '%s' "$ra_token" | cmp -s - "$ra_token_tmp" &&
+            mv -f "$ra_token_tmp" "$PPSSPP_RA_TOKEN_FILE"; then
+            echo "RetroAchievements: login token updated."
+        else
+            echo "Error: could not write the RetroAchievements token (disk full?)."
+        fi
         rm -f "$ra_token_tmp"
     fi
 }
