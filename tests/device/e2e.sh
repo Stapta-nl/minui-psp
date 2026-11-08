@@ -16,6 +16,8 @@
 #   ssh root@<device> 'sh /path/to/tests/device/e2e.sh'
 #
 # It temporarily changes recents / resume files of the test game and restores them on exit.
+# The backup is kept on the SD card (/.userdata/shared/.psp-e2e-backup); if a run is cut
+# short, the next run restores from it first.
 # Do not touch the device while it runs. Results and screenshots: $OUT_DIR.
 #
 # Env overrides:
@@ -47,7 +49,7 @@ PSP_KEYS="${PSP_KEYS-select+r1 sleep3 select+right sleep1 select+r1 sleep3}"
 EXIT_KEYS="${EXIT_KEYS-select+start}"
 STATE_DIR="$SD/.userdata/shared/PSP-ppsspp"
 PNGCOLOR="$HERE/bin/pngcolor"
-BAK="/tmp/psp-e2e-backup"
+BAK="$SD/.userdata/shared/.psp-e2e-backup" # on the SD card, so a power loss cannot lose it
 
 PASS=0
 FAIL=0
@@ -95,26 +97,16 @@ AUTORESUME="$SHARED/.minui/auto_resume.txt"
 SHOTDIR="$SD/Screenshots"
 
 mkdir -p "$OUT" "$BAK"
-rm -f "${OUT:?}"/*.png "${OUT:?}"/*.log "${BAK:?}/present" "${BAK:?}/absent" "${BAK:?}/states.before" "${BAK:?}/marker"
-say "device pad: $PAD"
-say "game:       $ROM"
-say "emu tag:    $tag"
+
+# NEVER send SIGTERM to nextui.elf: SDL turns it into SDL_QUIT, which NextUI handles as
+# PWR_powerOff(0) and the device shuts down. SIGKILL has no handler: NextUI just dies and the
+# launcher loop in MinUI.pak starts it again (that is also what happens when it crashes).
+kill_ui() { killall -9 nextui.elf 2>/dev/null; }
 
 # --- back up everything we will touch, restore on exit ---------------------------------
-stash() {
-    if [ -e "$1" ]; then
-        mkdir -p "$BAK$(dirname "$1")"
-        cp -p "$1" "$BAK$1"
-        echo "$1" >>"$BAK/present"
-    else
-        echo "$1" >>"$BAK/absent"
-    fi
-}
-for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW"; do stash "$f"; done
-for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && stash "$f"; done # previews of other slots
-
-restore() {
-    pkill -f PPSSPPSDL 2>/dev/null
+# The backup lives on the SD card. If a run is cut short (power loss, SIGKILL), the next run
+# first puts the files back from it.
+restore_files() {
     rm -f /tmp/next
     while IFS= read -r f; do
         [ -n "$f" ] && cp -p "$BAK$f" "$f"
@@ -134,9 +126,40 @@ restore() {
         done
     fi
     sync
-    killall nextui.elf 2>/dev/null # relaunches NextUI with the restored files
+}
+
+if [ -f "$BAK/active" ]; then
+    say "found the backup of an aborted run: restoring those files first"
+    restore_files
+    rm -f "$BAK/active"
+fi
+
+restore() {
+    pkill -f PPSSPPSDL 2>/dev/null
+    restore_files
+    rm -f "$BAK/active"
+    kill_ui # relaunches NextUI with the restored files
     echo "restored; results in $OUT"
 }
+
+rm -f "${OUT:?}"/*.png "${OUT:?}"/*.log "${BAK:?}/present" "${BAK:?}/absent" "${BAK:?}/states.before" "${BAK:?}/marker"
+say "device pad: $PAD"
+say "game:       $ROM"
+say "emu tag:    $tag"
+
+stash() {
+    if [ -e "$1" ]; then
+        mkdir -p "$BAK$(dirname "$1")"
+        cp -p "$1" "$BAK$1"
+        echo "$1" >>"$BAK/present"
+    else
+        echo "$1" >>"$BAK/absent"
+    fi
+}
+for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW"; do stash "$f"; done
+for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && stash "$f"; done # previews of other slots
+: >"$BAK/active"
+sync
 trap restore EXIT
 
 # --- helpers ---------------------------------------------------------------------------
@@ -235,7 +258,7 @@ end() {
 seed_recent() { mkdir -p "$(dirname "$RECENT")" && printf '%s\n' "$ROM" >"$RECENT"; }
 
 restart_ui() {
-    killall nextui.elf 2>/dev/null
+    kill_ui
     sleep 1
     wait_for 40 running nextui.elf && sleep "$UI_WAIT"
 }
@@ -282,7 +305,7 @@ ls -1 "$STATE_DIR" >"$BAK/states.before" 2>/dev/null
 touch "$BAK/marker"
 sleep 2 # FAT mtimes have 2 s resolution
 printf "'%s/launch.sh' '%s'\n" "$PAK" "$ROM" >/tmp/next
-killall nextui.elf 2>/dev/null
+kill_ui # the launcher loop then runs /tmp/next
 check "PPSSPP started" wait_for 60 running PPSSPPSDL
 sleep "$BOOT_WAIT"
 
