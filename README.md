@@ -66,8 +66,10 @@ On NextUI, the pak copies the RetroAchievements settings from the NextUI Setting
 
 Notes:
 
-- NextUI's offline RetroAchievements mode (caching and replaying unlocks when Wi-Fi returns) is built into NextUI's own emulator frontend and is not available to standalone PPSSPP. PPSSPP connects to retroachievements.org directly, so Wi-Fi must be connected when the game starts. If the login fails at startup, PPSSPP retries it periodically while its menu is open.
-- In Hardcore Mode, PPSSPP disables save states.
+- NextUI's offline RetroAchievements mode (caching and replaying unlocks when Wi-Fi returns) is built into NextUI's own emulator frontend and is not available to standalone PPSSPP. PPSSPP connects to retroachievements.org directly, so Wi-Fi must be connected when the game starts. If the login fails at startup (no Wi-Fi), achievements stay off for that session: PPSSPP only retries the login from its main menu, which this pak never shows. If Wi-Fi drops during play, PPSSPP keeps retrying unlocks in the background, but unlocks not yet sent when you quit the game are lost.
+- In Hardcore Mode, PPSSPP disables save states (unless "save states in hardcore mode" was turned on inside PPSSPP).
+- Per-game PPSSPP settings (game-specific configs created in PPSSPP) can override the RetroAchievements on/off and Hardcore Mode settings for that game; the pak only changes the global `ppsspp.ini`.
+- If PPSSPP reports the login token as expired, it deletes it; log in again in NextUI Settings > RetroAchievements to get a new one.
 - To manage RetroAchievements inside PPSSPP yourself, create a file named `no-ra-sync` in `/.userdata/<PLATFORM>/PSP-ppsspp/`. The `no-config-changes` file also disables this sync.
 - To use a different RetroAchievements server (for example a local caching proxy), put its URL (e.g. `http://192.168.1.10:8080`) on the first line of `/.userdata/<PLATFORM>/PSP-ppsspp/ra-host`. Delete the file to switch back to retroachievements.org.
 
@@ -112,3 +114,22 @@ ssh root@<device> 'cd /tmp && tar xzf psp-device-tests.tar.gz && sh tests/device
 ```
 
 The script temporarily changes the recents and resume files of the test game and restores them on exit (its backup is kept on the SD card, so a run that was cut short is restored at the start of the next one). It restarts NextUI with SIGKILL, never SIGTERM, because NextUI treats SIGTERM as a power-off request. It expects these PPSSPP hotkeys: select+R1 saves a state, select+right moves to the next slot, select+start exits. See the header of `e2e.sh` for the settings (`PSP_KEYS`, `EXIT_KEYS`, wait times).
+
+## Testing RetroAchievements on a device
+
+`tests/device/ra.sh` runs the real `launch.sh` against a stub PPSSPP in a throw-away SD tree with a NextUI-style `minuisettings.txt`, and checks what PPSSPP would see at start-up (the `[Achievements]` section of `ppsspp.ini` and the token file): enabled in softcore and hardcore, disabled, not logged in, MinUI and older NextUI (PPSSPP left alone), the `no-ra-sync` and `no-config-changes` flags, usernames with special characters, older and CRLF ini files, token normalisation, the `ra-host` override, that a second launch rewrites nothing, that the token and password never reach the log (also with the `debug` flag), and that a failed ini write (full SD card) leaves `ppsspp.ini` unchanged. Over SSH:
+
+```sh
+scp -r tests root@<device>:/mnt/SDCARD/Emus/tg5040/PSP.pak/
+ssh root@<device> 'sh /mnt/SDCARD/Emus/tg5040/PSP.pak/tests/device/ra.sh'
+```
+
+Logs are kept in `/tmp/psp-ra-test-out`. Set `TMP_ROOT=/mnt/SDCARD` to run the sandbox on the SD card's FAT file system instead of `/tmp`. The script is also in the `psp-device-tests` bundle.
+
+What needs a person and a real account (not automated):
+
+1. **Login via NextUI only:** log out inside PPSSPP (or delete `PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp_retroachievements.dat`), log in under NextUI Settings > RetroAchievements, start a PSP game with Wi-Fi on. PPSSPP shows the RetroAchievements login message and the game's achievement count; the pak log (`.userdata/<PLATFORM>/logs/PSP.txt`) says `RetroAchievements: enabling for user ...`.
+2. **Unlock:** earn an easy achievement. The unlock pop-up appears in PPSSPP and the unlock shows on retroachievements.org.
+3. **Hardcore:** with Hardcore Mode on in NextUI, saving or loading a state in PPSSPP is refused; with it off, save states work and the game shows as softcore on the site.
+4. **Disable:** turn RetroAchievements off in NextUI and start a game: no login message, and PPSSPP's Achievements settings show it disabled and logged out.
+5. **Wi-Fi off:** start a game with Wi-Fi off. The game runs normally, PPSSPP shows a login failure, and no achievements are active for that session. Turn Wi-Fi on and restart the game: login works again.
