@@ -76,7 +76,7 @@ The project code which is not part of PPSSPP is licensed under the [MIT License]
 
 ## Testing the Game Switcher image on a device
 
-`tests/device/run.sh` runs the real `launch.sh` and `bin/jpg2bmp` against a stub PPSSPP in a throw-away SD tree, and checks the preview image, slot file, record file, resume handling and the SIGTERM path. Over SSH:
+`tests/device/run.sh` runs the real `launch.sh` and `bin/jpg2bmp` against a stub PPSSPP in a throw-away SD tree, and checks the preview image and slot file (no save state, one state, the newest slot wins, other games unaffected), that the resume hand-off file is removed, and the SIGTERM (power-off) path. Over SSH:
 
 ```sh
 scp -r tests root@<device>:/mnt/SDCARD/Emus/tg5040/PSP.pak/
@@ -96,4 +96,4 @@ scp psp-device-tests.tar.gz root@<device>:/tmp/
 ssh root@<device> 'cd /tmp && tar xzf psp-device-tests.tar.gz && sh tests/device/e2e.sh'
 ```
 
-The script temporarily changes the recents and resume files of the test game and restores them on exit. It expects these PPSSPP hotkeys: select+R1 saves a state, select+right moves to the next slot, select+start exits. See the header of `e2e.sh` for the settings (`PSP_KEYS`, `EXIT_KEYS`, wait times).
+The script temporarily changes the recents and resume files of the test game and restores them on exit (its backup is kept on the SD card, so a run that was cut short is restored at the start of the next one). It restarts NextUI with SIGKILL, never SIGTERM, because NextUI treats SIGTERM as a power-off request. It expects these PPSSPP hotkeys: select+R1 saves a state, select+right moves to the next slot, select+start exits. See the header of `e2e.sh` for the settings (`PSP_KEYS`, `EXIT_KEYS`, wait times).
