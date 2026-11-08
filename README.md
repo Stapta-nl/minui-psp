@@ -102,4 +102,4 @@ scp psp-device-tests.tar.gz root@<device>:/tmp/
 ssh root@<device> 'cd /tmp && tar xzf psp-device-tests.tar.gz && sh tests/device/e2e.sh'
 ```
 
-The script temporarily changes the recents and resume files of the test game and restores them on exit. See the header of `e2e.sh` for the settings, including `PSP_KEYS`, the button steps that make PPSSPP save a state.
+The script temporarily changes the recents and resume files of the test game and restores them on exit. It expects these PPSSPP hotkeys: select+R1 saves a state, select+right moves to the next slot, select+start exits. See the header of `e2e.sh` for the settings (`PSP_KEYS`, `EXIT_KEYS`, wait times).

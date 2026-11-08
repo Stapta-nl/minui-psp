@@ -20,12 +20,17 @@
 #
 # Env overrides:
 #   SDCARD_PATH (/mnt/SDCARD)  PLATFORM (tg5040)  ROM_DIR  ROM  OUT_DIR (/tmp/psp-e2e-out)
-#   PSP_KEYS   space separated steps run inside PPSSPP after boot, to make a save state.
-#              Steps: up down left right a b x y l1 r1 select start | sleep<sec> | shot
-#              Default empty (no save state; the preview then comes from box art / placeholder).
-#              Tip: first run with PSP_KEYS="select sleep1 shot" and look at $OUT_DIR/e2e-*.png
-#              to see the PPSSPP pause menu, then script the clicks that save a state.
+#   PSP_KEYS   space separated steps run inside PPSSPP after boot, to make save states.
+#              Steps: up down left right a b x y l1 r1 select start | chords joined with +
+#              (select+r1) | sleep<sec> | shot
+#              Default uses the PPSSPP hotkeys set up on the device: select+r1 = save state,
+#              select+right = next slot. It saves slot 0, moves to slot 1 and saves again.
+#              PSP_KEYS="" skips saving (the preview then comes from box art / placeholder).
+#   EXIT_KEYS  how the emulator is quit (default select+start; "" kills PPSSPP instead).
 #   BOOT_WAIT (20)  UI_WAIT (4)  KEY_GAP (0.5)
+#
+# The save states made by the test (new files in /.userdata/shared/PSP-ppsspp) are deleted
+# on exit. A state that already existed in slot 0 or 1 of the test game is overwritten.
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SD="${SDCARD_PATH:-/mnt/SDCARD}"
@@ -38,7 +43,9 @@ OUT="${OUT_DIR:-/tmp/psp-e2e-out}"
 BOOT_WAIT="${BOOT_WAIT:-20}"
 UI_WAIT="${UI_WAIT:-4}"
 KEY_GAP="${KEY_GAP:-0.5}"
-PSP_KEYS="${PSP_KEYS:-}"
+PSP_KEYS="${PSP_KEYS-select+r1 sleep3 select+right sleep1 select+r1 sleep3}"
+EXIT_KEYS="${EXIT_KEYS-select+start}"
+STATE_DIR="$SD/.userdata/shared/PSP-ppsspp"
 PNGCOLOR="$HERE/bin/pngcolor"
 BAK="/tmp/psp-e2e-backup"
 
@@ -89,7 +96,7 @@ AUTORESUME="$SHARED/.minui/auto_resume.txt"
 SHOTDIR="$SD/Screenshots"
 
 mkdir -p "$OUT" "$BAK"
-rm -f "$OUT"/*.png "$OUT"/*.log "$BAK/present" "$BAK/absent"
+rm -f "${OUT:?}"/*.png "${OUT:?}"/*.log "${BAK:?}/present" "${BAK:?}/absent" "${BAK:?}/states.before" "${BAK:?}/marker"
 say "device pad: $PAD"
 say "game:       $ROM"
 say "emu tag:    $tag"
@@ -115,6 +122,12 @@ restore() {
         [ -n "$f" ] && rm -f "$f"
     done <"$BAK/absent" 2>/dev/null
     rm -f "$PERSIST.tmp"
+    # delete save states the test created (files that were not there before)
+    if [ -f "$BAK/states.before" ]; then
+        for f in "$STATE_DIR"/*; do
+            [ -f "$f" ] && ! grep -qxF "$(basename "$f")" "$BAK/states.before" && rm -f "$f"
+        done
+    fi
     sync
     killall nextui.elf 2>/dev/null # relaunches NextUI with the restored files
     echo "restored; results in $OUT"
@@ -144,7 +157,8 @@ pad() { # pad <type> <code> <value>
 }
 syn() { pad 0 0 0; }
 
-press() { # press <button name>
+btn_set() { # sets t (event type), c (code), val (value while pressed) for a button name
+    val=1
     case "$1" in
     b) t=1 c=304 ;;
     a) t=1 c=305 ;;
@@ -155,18 +169,29 @@ press() { # press <button name>
     select) t=1 c=314 ;;
     start) t=1 c=315 ;;
     left) t=3 c=16 val=-1 ;;
-    right) t=3 c=16 val=1 ;;
+    right) t=3 c=16 ;;
     up) t=3 c=17 val=-1 ;;
-    down) t=3 c=17 val=1 ;;
+    down) t=3 c=17 ;;
     *) echo "unknown button: $1" >&2; return 1 ;;
     esac
-    val="${val:-1}"
-    pad "$t" "$c" "$val"
-    syn
-    sleep 0.05 # short, or NextUI's key repeat moves the selection more than once
-    pad "$t" "$c" 0
-    syn
-    val=""
+}
+
+# press <button>[+<button>...]: a tap, or a chord (all held together, then released).
+press() {
+    keys="$(printf '%s' "$1" | tr '+' ' ')"
+    hold=0.05 # short, or NextUI's key repeat moves the selection more than once
+    case "$1" in *+*) hold="${CHORD_HOLD:-0.3}" ;; esac
+    for k in $keys; do
+        btn_set "$k" || return 1
+        pad "$t" "$c" "$val"
+        syn
+    done
+    sleep "$hold"
+    for k in $keys; do
+        btn_set "$k"
+        pad "$t" "$c" 0
+        syn
+    done
 }
 
 # shot <label>: takes a screenshot with the Screenshot Monitor pak, keeps it in $OUT.
@@ -246,6 +271,10 @@ end
 begin "E2 real PPSSPP launch, exit, preview, switcher"
 rm -f "$SLOT_FILE" "$PREVIEW" "$RECORD" "$PERSIST"
 seed_recent
+mkdir -p "$STATE_DIR"
+ls -1 "$STATE_DIR" >"$BAK/states.before" 2>/dev/null
+touch "$BAK/marker"
+sleep 2 # FAT mtimes have 2 s resolution
 printf "'%s/launch.sh' '%s'\n" "$PAK" "$ROM" >/tmp/next
 killall nextui.elf 2>/dev/null
 check "PPSSPP started" wait_for 60 running PPSSPPSDL
@@ -266,7 +295,11 @@ for k in $PSP_KEYS; do
     esac
 done
 
-killall PPSSPPSDL_"$PLATFORM" 2>/dev/null || pkill -f PPSSPPSDL
+if [ -n "$EXIT_KEYS" ]; then
+    press "$EXIT_KEYS"
+    check "PPSSPP exits on $EXIT_KEYS" wait_for 20 not_running PPSSPPSDL
+fi
+running PPSSPPSDL && killall PPSSPPSDL_"$PLATFORM" 2>/dev/null
 check "PPSSPP exited" wait_for 30 not_running PPSSPPSDL
 check "NextUI is back" wait_for 90 running nextui.elf
 sleep "$UI_WAIT"
@@ -279,6 +312,15 @@ check "record file has a source" grep -q '^source=' "$RECORD"
 if [ -n "$PSP_KEYS" ]; then
     check "record: source=thumbnail (state was saved)" grep -q '^source=thumbnail$' "$RECORD"
     check "log: preview from save state" sh -c "grep -v '^+' '$OUT/e2-PSP.log' | grep -q 'Game switcher preview from save state'"
+    # shellcheck disable=SC2012,SC2046 # state names are PPSSPP's (no spaces); splitting is intended
+    newest_state="$(ls -t $(find "$STATE_DIR" -name '*.jpg' ! -name '*.undo.jpg' -newer "$BAK/marker") 2>/dev/null | head -n 1)"
+    new_states="$(find "$STATE_DIR" -name '*.jpg' ! -name '*.undo.jpg' -newer "$BAK/marker" | wc -l)"
+    check "two save states were written (slot hotkey worked): $new_states" test "$new_states" -ge 2
+    if [ -n "$newest_state" ] && "$PAK/bin/jpg2bmp" "$newest_state" "$BAK/expected.bmp"; then
+        check "preview is the newest state's thumbnail ($(basename "$newest_state"))" cmp -s "$PREVIEW" "$BAK/expected.bmp"
+    else
+        check "found a new state thumbnail to compare with" false
+    fi
 fi
 say "  info: $(tr '\n' ' ' <"$RECORD" 2>/dev/null)"
 
