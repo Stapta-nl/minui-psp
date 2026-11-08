@@ -65,7 +65,7 @@ jobs:
       - name: Check release contents
         run: |
           zip="dist/${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
-          for f in launch.sh pak.json bin/jpg2bmp res/game-switcher-placeholder.png; do
+          for f in launch.sh pak.json bin/jpg2bmp; do
             unzip -l "$zip" | grep -q " $f$" || { echo "missing from release: $f"; exit 1; }
           done
           if unzip -l "$zip" | grep -qE " (src|tests)/"; then

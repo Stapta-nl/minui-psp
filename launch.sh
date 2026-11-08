@@ -109,11 +109,9 @@ set_cpu_settings() {
 # The stock TrimUI SDL2_image cannot decode JPEG, so PPSSPP's save-state thumbnails are
 # converted to BMP with the bundled jpg2bmp.
 #
-# The same <rom file>.txt makes NextUI offer "Resume" for the game. Resuming is done by
-# PPSSPP itself: the pak ships AutoLoadSaveState = 2 (newest), so every launch, resume or
-# not, loads the game's newest save state, which is also the state whose thumbnail is
-# shown. If the user turned auto-load off, a NextUI resume passes that state with --state
-# instead. Without any save state, "Resume" simply starts the game.
+# Like minarch, the image only ever comes from a save state: the newest state saved during
+# this launch, with its slot written to <rom file>.txt. No save state, no preview (NextUI
+# then shows "No Preview"). Resume handling is not changed by this.
 STATE_DIR="$SHARED_USERDATA_PATH/PSP-ppsspp"
 PREVIEW_ROM=""
 STATE_THUMBS_BEFORE=""
@@ -150,41 +148,10 @@ game_switcher_emu_tag() {
     printf '%s' "$emu_tag"
 }
 
-# The pak's own record of a ROM's preview: "source=<thumbnail|boxart|placeholder>" and
-# "prefix=<PPSSPP save-state prefix of the game, e.g. ULUS10041_1.00>".
-game_switcher_meta_file() {
-    printf '%s' "$SHARED_USERDATA_PATH/.minui/$(game_switcher_emu_tag "$1")/.ppsspp/$(basename "$1").txt"
-}
-
-read_meta_value() {
-    [ -f "$1" ] && sed -n "s/^$2=//p" "$1" | head -n 1
-}
-
-# Prints the newest slot thumbnail of a save-state prefix (nothing if none).
-newest_state_thumbnail() {
-    newest=""
-    [ -n "$1" ] || return 0
-    for jpg in "$STATE_DIR/$1"_*.jpg; do
-        slot_part="${jpg#"$STATE_DIR/$1"_}"
-        slot_part="${slot_part%.jpg}"
-        case "$slot_part" in "" | *[!0-9]*) continue ;; esac
-        [ -f "$jpg" ] || continue
-        # shellcheck disable=SC3013 # -nt is supported by BusyBox ash and dash
-        if [ -z "$newest" ] || [ "$jpg" -nt "$newest" ]; then
-            newest="$jpg"
-        fi
-    done
-    printf '%s' "$newest"
-}
-
-# Writes image $2 to $1 through a temp file, so a partial file never replaces the preview.
+# Converts JPEG $1 to $2 through a temp file, so a partial file never replaces the preview.
 install_preview() {
-    if [ "$3" = convert ]; then
-        jpg2bmp "$2" "$1.tmp"
-    else
-        cp -f "$2" "$1.tmp"
-    fi && mv -f "$1.tmp" "$1" && return 0
-    rm -f "$1.tmp"
+    jpg2bmp "$1" "$2.tmp" && mv -f "$2.tmp" "$2" && return 0
+    rm -f "$2.tmp"
     return 1
 }
 
@@ -195,40 +162,8 @@ write_game_switcher_preview() {
     PREVIEW_ROM=""
     [ -n "$rom_path" ] && [ -n "$SHARED_USERDATA_PATH" ] || return 0
 
-    rom_file="$(basename "$rom_path")"
-    minui_dir="$SHARED_USERDATA_PATH/.minui/$(game_switcher_emu_tag "$rom_path")"
-    slot_file="$minui_dir/$rom_file.txt"
-    meta_file="$(game_switcher_meta_file "$rom_path")"
-    mkdir -p "$minui_dir" "$(dirname "$meta_file")" || return 0
-
-    # Reuse the slot if something already wrote one, otherwise point NextUI at slot 0.
-    slot=""
-    [ -f "$slot_file" ] && slot="$(head -n 1 "$slot_file" | tr -cd '0-9')"
-    if [ -z "$slot" ]; then
-        slot=0
-        printf '%s' "$slot" >"$slot_file.tmp" && mv -f "$slot_file.tmp" "$slot_file"
-    fi
-    preview="$minui_dir/$rom_file.$slot.bmp"
-
-    prefix="$(read_meta_value "$meta_file" prefix)"
-    preview_source="$(read_meta_value "$meta_file" source)"
-    boxart="$(dirname "$rom_path")/.media/${rom_file%.*}.png"
-    placeholder="$PAK_DIR/res/game-switcher-placeholder.png"
-    if [ ! -f "$preview" ]; then
-        preview_source=""
-    elif [ -z "$preview_source" ]; then
-        # A preview without a record (older pak version): identify it by content.
-        if cmp -s "$preview" "$placeholder"; then
-            preview_source=placeholder
-        elif [ -f "$boxart" ] && cmp -s "$preview" "$boxart"; then
-            preview_source=boxart
-        else
-            preview_source=thumbnail
-        fi
-    fi
-
     # Thumbnails that are new or changed since launch. Only the launched game ran, so they
-    # all belong to it; the newest is also the state PPSSPP auto-loads next time.
+    # all belong to it; take the newest.
     thumb=""
     while IFS= read -r line; do
         [ -n "$line" ] || continue
@@ -245,42 +180,24 @@ $line
     done <<EOF
 $(list_state_thumbnails)
 EOF
-    if [ -n "$thumb" ]; then
-        # PPSSPP names states <DISC_ID>_<DISC_VERSION>_<slot>.ppst/.jpg
-        prefix="$(basename "$thumb" .jpg)"
-        prefix="${prefix%_*}"
-    elif [ "$preview_source" != thumbnail ]; then
-        # No new state, but an earlier one of this game still beats boxart/placeholder.
-        thumb="$(newest_state_thumbnail "$prefix")"
-    fi
+    [ -n "$thumb" ] || return 0
 
-    # Upgrade order: placeholder < boxart < save-state thumbnail.
-    if [ -n "$thumb" ] && install_preview "$preview" "$thumb" convert; then
-        preview_source=thumbnail
+    # PPSSPP names states <DISC_ID>_<DISC_VERSION>_<slot>.ppst/.jpg
+    slot="$(basename "$thumb" .jpg)"
+    slot="${slot##*_}"
+    case "$slot" in "" | *[!0-9]*) return 0 ;; esac
+
+    rom_file="$(basename "$rom_path")"
+    minui_dir="$SHARED_USERDATA_PATH/.minui/$(game_switcher_emu_tag "$rom_path")"
+    mkdir -p "$minui_dir" || return 0
+
+    # Image first, then the slot file that makes NextUI look for it.
+    if install_preview "$thumb" "$minui_dir/$rom_file.$slot.bmp"; then
         echo "Game switcher preview from save state: $thumb"
-    elif [ -f "$boxart" ] && { [ -z "$preview_source" ] || [ "$preview_source" = placeholder ]; }; then
-        install_preview "$preview" "$boxart" && preview_source=boxart
-    elif [ -z "$preview_source" ]; then
-        install_preview "$preview" "$placeholder" && preview_source=placeholder
+        printf '%s' "$slot" >"$minui_dir/$rom_file.txt.tmp" &&
+            mv -f "$minui_dir/$rom_file.txt.tmp" "$minui_dir/$rom_file.txt"
+        sync
     fi
-
-    if [ -n "$preview_source" ]; then
-        printf 'source=%s\nprefix=%s\n' "$preview_source" "$prefix" >"$meta_file.tmp" &&
-            mv -f "$meta_file.tmp" "$meta_file"
-    fi
-    sync
-}
-
-# NextUI writes /tmp/resume_slot.txt when the user picks "Resume". PPSSPP's auto-load
-# already resumes, so this only prints a state for --state when auto-load is turned off.
-resume_state_path() {
-    [ -f /tmp/resume_slot.txt ] || return 0
-    rm -f /tmp/resume_slot.txt
-    auto_load="$(sed -n 's/^AutoLoadSaveState *= *//p' "$PPSSPP_INI" 2>/dev/null | head -n 1)"
-    [ "$auto_load" = 0 ] || return 0
-    state="$(newest_state_thumbnail "$(read_meta_value "$(game_switcher_meta_file "$1")" prefix)")"
-    state="${state%.jpg}.ppst"
-    [ -f "$state" ] && printf '%s' "$state"
 }
 
 main() {
@@ -338,14 +255,15 @@ main() {
     mkdir -p "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE"
     mount -o bind "$SHARED_USERDATA_PATH/PSP-ppsspp" "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE"
 
-    resume_state="$(resume_state_path "$1")"
-    [ -n "$resume_state" ] && echo "Resuming from $resume_state"
+    # NextUI's Resume hands the chosen slot over in this file; PPSSPP does not use it, and
+    # minarch would load it in the next game it launches, so remove it.
+    rm -f /tmp/resume_slot.txt
     STATE_THUMBS_BEFORE="$(list_state_thumbnails)"
     PREVIEW_ROM="$1"
 
     # Launch emulator
     minui-power-control "${PPSSPP_BIN}_${PLATFORM}" &
-    "${PPSSPP_BIN}_${PLATFORM}" "$*" --fullscreen --pause-menu-exit ${resume_state:+"--state=$resume_state"}
+    "${PPSSPP_BIN}_${PLATFORM}" "$*" --fullscreen --pause-menu-exit
 
     write_game_switcher_preview
 }

@@ -25,7 +25,7 @@
 #              (select+r1) | sleep<sec> | shot
 #              Default uses the PPSSPP hotkeys set up on the device: select+r1 = save state,
 #              select+right = next slot. It saves slot 0, moves to slot 1 and saves again.
-#              PSP_KEYS="" skips saving (the preview then comes from box art / placeholder).
+#              PSP_KEYS="" skips saving: then there must be no preview (NextUI shows No Preview).
 #   EXIT_KEYS  how the emulator is quit (default select+start; "" kills PPSSPP instead).
 #   BOOT_WAIT (20)  UI_WAIT (4)  KEY_GAP (0.5)
 #
@@ -88,8 +88,7 @@ case "$tag" in *"("*")"*) tag="${tag##*(}"; tag="${tag%%)*}" ;; esac
 ROM_FILE="$(basename "$ROM")"
 MINUI="$SHARED/.minui/$tag"
 SLOT_FILE="$MINUI/$ROM_FILE.txt"
-PREVIEW="$MINUI/$ROM_FILE.0.bmp"
-RECORD="$MINUI/.ppsspp/$ROM_FILE.txt"
+PREVIEW="$MINUI/$ROM_FILE.0.bmp" # slot 0, used by E1; E2 uses whatever slot the game saved
 RECENT="$SHARED/.minui/recent.txt"
 PERSIST="$SHARED/.minui/game_switcher.txt"
 AUTORESUME="$SHARED/.minui/auto_resume.txt"
@@ -102,15 +101,17 @@ say "game:       $ROM"
 say "emu tag:    $tag"
 
 # --- back up everything we will touch, restore on exit ---------------------------------
-for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW" "$RECORD"; do
-    if [ -e "$f" ]; then
-        mkdir -p "$BAK$(dirname "$f")"
-        cp -p "$f" "$BAK$f"
-        echo "$f" >>"$BAK/present"
+stash() {
+    if [ -e "$1" ]; then
+        mkdir -p "$BAK$(dirname "$1")"
+        cp -p "$1" "$BAK$1"
+        echo "$1" >>"$BAK/present"
     else
-        echo "$f" >>"$BAK/absent"
+        echo "$1" >>"$BAK/absent"
     fi
-done
+}
+for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW"; do stash "$f"; done
+for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && stash "$f"; done # previews of other slots
 
 restore() {
     pkill -f PPSSPPSDL 2>/dev/null
@@ -122,6 +123,10 @@ restore() {
         [ -n "$f" ] && rm -f "$f"
     done <"$BAK/absent" 2>/dev/null
     rm -f "$PERSIST.tmp"
+    # delete previews of other slots that the test created
+    for f in "$MINUI/$ROM_FILE".*.bmp; do
+        [ -f "$f" ] && ! grep -qxF "$f" "$BAK/present" 2>/dev/null && rm -f "$f"
+    done
     # delete save states the test created (files that were not there before)
     if [ -f "$BAK/states.before" ]; then
         for f in "$STATE_DIR"/*; do
@@ -245,7 +250,7 @@ is_image() { head -c 2 "$1" | grep -q BM || head -c 4 "$1" | tail -c 3 | grep -q
 
 # --- E1: NextUI renders the BMP that jpg2bmp makes -------------------------------------
 begin "E1 NextUI shows converted thumbnails in the Game Switcher"
-mkdir -p "$MINUI/.ppsspp"
+mkdir -p "$MINUI"
 seed_recent
 printf 0 >"$SLOT_FILE"
 
@@ -269,7 +274,8 @@ end
 
 # --- E2: real PPSSPP run, exit, preview written, switcher shows it ----------------------
 begin "E2 real PPSSPP launch, exit, preview, switcher"
-rm -f "$SLOT_FILE" "$PREVIEW" "$RECORD" "$PERSIST"
+rm -f "$SLOT_FILE" "$PERSIST"
+for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && rm -f "$f"; done
 seed_recent
 mkdir -p "$STATE_DIR"
 ls -1 "$STATE_DIR" >"$BAK/states.before" 2>/dev/null
@@ -305,35 +311,42 @@ check "NextUI is back" wait_for 90 running nextui.elf
 sleep "$UI_WAIT"
 cp "$LOGS/PSP.txt" "$OUT/e2-PSP.log" 2>/dev/null
 
-check "slot file written" grep -q '^[0-9][0-9]*$' "$SLOT_FILE"
-check "preview file written" test -s "$PREVIEW"
-check "preview is a BMP/PNG" is_image "$PREVIEW"
-check "record file has a source" grep -q '^source=' "$RECORD"
-if [ -n "$PSP_KEYS" ]; then
-    check "record: source=thumbnail (state was saved)" grep -q '^source=thumbnail$' "$RECORD"
-    check "log: preview from save state" sh -c "grep -v '^+' '$OUT/e2-PSP.log' | grep -q 'Game switcher preview from save state'"
+if [ -z "$PSP_KEYS" ]; then
+    check "no save state: no slot file" test ! -e "$SLOT_FILE"
+    check "no save state: no preview image" test -z "$(find "$MINUI" -name "$ROM_FILE.*.bmp")"
+    open_switcher
+    shot e2-switcher
+    check "switcher screenshot taken" have_shot
+    check "switcher shows No Preview (neither fixture colour)" not_fixture "$SHOT"
+else
     # shellcheck disable=SC2012,SC2046 # state names are PPSSPP's (no spaces); splitting is intended
     newest_state="$(ls -t $(find "$STATE_DIR" -name '*.jpg' ! -name '*.undo.jpg' -newer "$BAK/marker") 2>/dev/null | head -n 1)"
     new_states="$(find "$STATE_DIR" -name '*.jpg' ! -name '*.undo.jpg' -newer "$BAK/marker" | wc -l)"
     check "two save states were written (slot hotkey worked): $new_states" test "$new_states" -ge 2
+    state_slot="${newest_state%.jpg}"
+    state_slot="${state_slot##*_}"
+    check "slot file holds the newest state's slot ($state_slot)" grep -qx "$state_slot" "$SLOT_FILE"
+    PREVIEW_N="$MINUI/$ROM_FILE.$state_slot.bmp"
+    check "preview file written for that slot" test -s "$PREVIEW_N"
+    check "preview is a BMP/PNG" is_image "$PREVIEW_N"
+    check "log: preview from save state" sh -c "grep -v '^+' '$OUT/e2-PSP.log' | grep -q 'Game switcher preview from save state'"
     if [ -n "$newest_state" ] && "$PAK/bin/jpg2bmp" "$newest_state" "$BAK/expected.bmp"; then
-        check "preview is the newest state's thumbnail ($(basename "$newest_state"))" cmp -s "$PREVIEW" "$BAK/expected.bmp"
+        check "preview is the newest state's thumbnail ($(basename "$newest_state"))" cmp -s "$PREVIEW_N" "$BAK/expected.bmp"
     else
         check "found a new state thumbnail to compare with" false
     fi
-fi
-say "  info: $(tr '\n' ' ' <"$RECORD" 2>/dev/null)"
 
-open_switcher
-shot e2-switcher
-check "switcher screenshot taken" have_shot
-with_preview="$SHOT"
-mv "$PREVIEW" "$PREVIEW.off"
-open_switcher
-shot e2-switcher-nopreview
-check "switcher screenshot without preview taken" have_shot
-mv "$PREVIEW.off" "$PREVIEW"
-check "preview changes what the switcher shows" test "$(cksum <"$with_preview")" != "$(cksum <"$SHOT")"
+    open_switcher
+    shot e2-switcher
+    check "switcher screenshot taken" have_shot
+    with_preview="$SHOT"
+    mv "$PREVIEW_N" "$PREVIEW_N.off"
+    open_switcher
+    shot e2-switcher-nopreview
+    check "switcher screenshot without preview taken" have_shot
+    mv "$PREVIEW_N.off" "$PREVIEW_N"
+    check "the preview changes what the switcher shows" test "$(cksum <"$with_preview")" != "$(cksum <"$SHOT")"
+fi
 end
 
 say

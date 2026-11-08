@@ -85,9 +85,8 @@ lacks() { ! grep -q -- "$2" "$1"; }
 same() { cmp -s "$1" "$2"; }
 
 # --- sandbox -------------------------------------------------------------------------
-mkdir -p "$PAK/bin" "$PAK/res" "$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM" "$LOGS" "$ROMDIR/.media" "$MINUI" "$STATES" "$STUB"
+mkdir -p "$PAK/bin" "$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM" "$LOGS" "$ROMDIR" "$MINUI" "$STATES" "$STUB"
 cp "$SRC_PAK/launch.sh" "$SRC_PAK/pak.json" "$PAK/"
-cp "$SRC_PAK"/res/* "$PAK/res/"
 cp "$SRC_PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini" "$INI"
 cp "${JPG2BMP:-$SRC_PAK/bin/jpg2bmp}" "$PAK/bin/jpg2bmp" || { echo "no jpg2bmp found (set JPG2BMP)"; exit 2; }
 chmod +x "$PAK/bin/jpg2bmp"
@@ -119,17 +118,14 @@ done <"$STUB/actions"
 EOF
 chmod +x "$PAK/PPSSPP/PPSSPPSDL_$PLATFORM" "$PAK/bin/"*
 
-printf 'a' >"$ROMDIR/Game A.iso"
 printf 'b' >"$ROMDIR/Game B.iso"
 printf 'c' >"$ROMDIR/Game C.iso"
-cp "$FIX/boxart.png" "$ROMDIR/.media/Game A.png"
 
 export PLATFORM DEVICE=brick SDCARD_PATH="$SD" USERDATA_PATH="$USERDATA" LOGS_PATH="$LOGS" \
     SHARED_USERDATA_PATH="$SHARED" ROMS_PATH="$ROMS" STUB FIX STATES
 mkdir -p "$USERDATA/PSP-ppsspp"
 touch "$USERDATA/PSP-ppsspp/debug" # trace logging, like the PR's setup step
 
-PLACEHOLDER="$PAK/res/game-switcher-placeholder.png"
 conv() { "$PAK/bin/jpg2bmp" "$FIX/$1.jpg" "$T/expected-$1.bmp" && echo "$T/expected-$1.bmp"; }
 
 # run_game <rom file> [action lines...]: runs launch.sh to completion and saves its log.
@@ -142,71 +138,49 @@ run_game() {
     cp "$LOGS/PSP.txt" "$OUT_DIR/$CASE.log" 2>/dev/null
 }
 
-preview() { echo "$MINUI/$1.0.bmp"; }
-record() { echo "$MINUI/.ppsspp/$1.txt"; }
+preview() { echo "$MINUI/$1.$2.bmp"; }
 
-# --- tests (numbering follows the PR description) ------------------------------------
-begin "1 no art, no states -> placeholder"
+# --- tests ---------------------------------------------------------------------------
+begin "1 no save state -> no preview, no slot file (NextUI shows No Preview)"
 run_game "Game B.iso" "sleep 0"
-check "slot file holds 0" contains "$MINUI/Game B.iso.txt" '^0$'
-check "preview is the placeholder" same "$(preview "Game B.iso")" "$PLACEHOLDER"
-check "record: source=placeholder" contains "$(record "Game B.iso")" '^source=placeholder$'
+check "no slot file" test ! -e "$MINUI/Game B.iso.txt"
+check "no preview image" test -z "$(find "$MINUI" -name 'Game B.iso.*.bmp')"
 end
 
-begin "2 boxart, no states -> boxart"
-run_game "Game A.iso" "sleep 0"
-check "preview is the boxart" same "$(preview "Game A.iso")" "$ROMDIR/.media/Game A.png"
-check "record: source=boxart" contains "$(record "Game A.iso")" '^source=boxart$'
-end
-
-begin "3 save state -> thumbnail"
+begin "2 save state -> preview and slot file"
 run_game "Game C.iso" "save thumb1 ULUS10041_1.00 0"
-check "preview is converted thumb1" same "$(preview "Game C.iso")" "$(conv thumb1)"
-check "preview is a real BMP" sh -c "head -c 2 '$(preview "Game C.iso")' | grep -q BM"
+check "slot file holds 0" contains "$MINUI/Game C.iso.txt" '^0$'
+check "preview is converted thumb1" same "$(preview "Game C.iso" 0)" "$(conv thumb1)"
+check "preview is a real BMP" sh -c "head -c 2 '$(preview "Game C.iso" 0)' | grep -q BM"
 check "log says from save state" contains "$OUT_DIR/$CASE.log" 'Game switcher preview from save state'
-check "record: source=thumbnail" contains "$(record "Game C.iso")" '^source=thumbnail$'
-check "record: prefix=ULUS10041_1.00" contains "$(record "Game C.iso")" '^prefix=ULUS10041_1.00$'
 end
 
-begin "4 two saves -> the second wins"
-run_game "Game C.iso" "save thumb1 ULUS10041_1.00 1" "sleep 2" "save thumb2 ULUS10041_1.00 2"
-check "preview is converted thumb2" same "$(preview "Game C.iso")" "$(conv thumb2)"
+begin "3 two saves in different slots -> newest slot wins"
+run_game "Game C.iso" "save thumb1 ULUS10041_1.00 1" "sleep 2" "save thumb2 ULUS10041_1.00 5"
+check "slot file holds 5" contains "$MINUI/Game C.iso.txt" '^5$'
+check "preview .5 is converted thumb2" same "$(preview "Game C.iso" 5)" "$(conv thumb2)"
 end
 
-begin "5 other game without saving keeps its placeholder"
+begin "4 other game without saving gets no preview"
 run_game "Game B.iso" "sleep 0"
-check "B still placeholder, not C's screenshot" same "$(preview "Game B.iso")" "$PLACEHOLDER"
-check "B record: source=placeholder" contains "$(record "Game B.iso")" '^source=placeholder$'
+check "B has no slot file" test ! -e "$MINUI/Game B.iso.txt"
+check "B has no preview image" test -z "$(find "$MINUI" -name 'Game B.iso.*.bmp')"
 end
 
-begin "6 boxart added later replaces placeholder"
-cp "$FIX/boxart.png" "$ROMDIR/.media/Game B.png"
-run_game "Game B.iso" "sleep 0"
-check "B preview is boxart" same "$(preview "Game B.iso")" "$ROMDIR/.media/Game B.png"
-check "B record: source=boxart" contains "$(record "Game B.iso")" '^source=boxart$'
-end
-
-begin "6b boxart never downgrades a thumbnail"
+begin "5 launch without saving keeps the previous preview"
 run_game "Game C.iso" "sleep 0"
-check "C preview still thumb2" same "$(preview "Game C.iso")" "$(conv thumb2)"
+check "slot file still 5" contains "$MINUI/Game C.iso.txt" '^5$'
+check "preview .5 still thumb2" same "$(preview "Game C.iso" 5)" "$(conv thumb2)"
 end
 
-begin "7a resume with auto-load on: no --state argument"
-printf '2' >/tmp/resume_slot.txt
+begin "6 resume hand-off file is removed and no state is forced"
+printf '5' >/tmp/resume_slot.txt
 run_game "Game C.iso" "sleep 0"
-check "resume_slot.txt consumed" test ! -f /tmp/resume_slot.txt
-check "no --state passed" lacks "$STUB/args" '^--state='
+check "resume_slot.txt removed (minarch would pick it up)" test ! -f /tmp/resume_slot.txt
+check "no --state argument" lacks "$STUB/args" '^--state='
 end
 
-begin "7b resume with auto-load off: newest .ppst passed"
-sed -i 's/^AutoLoadSaveState *=.*/AutoLoadSaveState = 0/' "$INI"
-printf '2' >/tmp/resume_slot.txt
-run_game "Game C.iso" "sleep 0"
-check "--state points at newest state (slot 2)" contains "$STUB/args" "^--state=.*ULUS10041_1.00_2.ppst$"
-sed -i 's/^AutoLoadSaveState *=.*/AutoLoadSaveState = 2/' "$INI"
-end
-
-begin "8 SIGTERM (power off) still writes the preview, once"
+begin "7 SIGTERM (power off) still writes the preview, once"
 rm -f "$STUB/args" "$STUB/pid" "$STUB/saved"
 printf '%s\n' "save thumb1 ULUS10041_1.00 3" "hang" >"$STUB/actions"
 sh "$PAK/launch.sh" "$ROMDIR/Game C.iso" >"$T/launch.out" 2>&1 &
@@ -218,12 +192,12 @@ kill -TERM "$LAUNCH_PID" 2>/dev/null
 kill -TERM "$(cat "$STUB/pid" 2>/dev/null)" 2>/dev/null
 wait "$LAUNCH_PID" 2>/dev/null
 cp "$LOGS/PSP.txt" "$OUT_DIR/$CASE.log" 2>/dev/null
-check "preview is converted thumb1 (slot 3 is newest)" same "$(preview "Game C.iso")" "$(conv thumb1)"
-check "log says from save state" contains "$OUT_DIR/$CASE.log" 'Game switcher preview from save state'
+check "slot file holds 3" contains "$MINUI/Game C.iso.txt" '^3$'
+check "preview .3 is converted thumb1" same "$(preview "Game C.iso" 3)" "$(conv thumb1)"
 check "preview written exactly once" test "$(grep -v '^+' "$OUT_DIR/$CASE.log" | grep -c 'Game switcher preview from save state')" = 1
 end
 
-begin "9 jpg2bmp works on this CPU and rejects junk"
+begin "8 jpg2bmp works on this CPU and rejects junk"
 echo "  info: $(uname -m)"
 printf 'not an image' >"$T/junk.jpg"
 check "converts a JPEG" "$PAK/bin/jpg2bmp" "$FIX/thumb1.jpg" "$T/out.bmp"
