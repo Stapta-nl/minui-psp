@@ -169,6 +169,7 @@ newest_state_thumbnail() {
         slot_part="${slot_part%.jpg}"
         case "$slot_part" in "" | *[!0-9]*) continue ;; esac
         [ -f "$jpg" ] || continue
+        # shellcheck disable=SC3013 # -nt is supported by BusyBox ash and dash
         if [ -z "$newest" ] || [ "$jpg" -nt "$newest" ]; then
             newest="$jpg"
         fi
@@ -237,6 +238,7 @@ $STATE_THUMBS_BEFORE
 $line
 "*) continue ;; esac
         jpg="${line#* * }"
+        # shellcheck disable=SC3013 # -nt is supported by BusyBox ash and dash
         if [ -z "$thumb" ] || [ "$jpg" -nt "$thumb" ]; then
             thumb="$jpg"
         fi
