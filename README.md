@@ -60,14 +60,14 @@ The pak auto-sets the Aspect Ratio based on the device model. On Trimui Brick it
 
 On NextUI, the pak copies the RetroAchievements settings from the NextUI Settings menu into PPSSPP every time a game is launched:
 
-- **Enabled and logged in** in NextUI: RetroAchievements are enabled in PPSSPP with the same username and login token, and NextUI's Hardcore Mode setting is applied to PPSSPP's Hardcore Mode. No separate login inside PPSSPP is needed.
+- **Enabled and logged in** in NextUI: RetroAchievements are enabled in PPSSPP with the same username and login token. No separate login inside PPSSPP is needed. PPSSPP's Hardcore Mode is turned off, like in NextUI (see below).
 - **Disabled, or not logged in** in NextUI: RetroAchievements are disabled in PPSSPP, and the PPSSPP username and login token are removed.
 - **MinUI** (no NextUI settings file), or a NextUI version without RetroAchievements settings: PPSSPP's own RetroAchievements settings are left untouched.
 
 Notes:
 
-- NextUI's offline RetroAchievements mode (caching and replaying unlocks when Wi-Fi returns) is built into NextUI's own emulator frontend and is not available to standalone PPSSPP. PPSSPP connects to retroachievements.org directly, so Wi-Fi must be connected when the game starts. If the login fails at startup (no Wi-Fi), achievements stay off for that session: PPSSPP only retries the login from its main menu, which this pak never shows. If Wi-Fi drops during play, PPSSPP keeps retrying unlocks in the background, but unlocks not yet sent when you quit the game are lost.
-- In Hardcore Mode, PPSSPP disables save states (unless "save states in hardcore mode" was turned on inside PPSSPP).
+- NextUI's offline RetroAchievements mode (caching and replaying unlocks when Wi-Fi returns) is built into NextUI's own emulator frontend and is not available to standalone PPSSPP. PPSSPP connects to retroachievements.org directly, so Wi-Fi must be connected when the game starts. If the login fails at startup (no Wi-Fi), achievements stay off for that session: PPSSPP only retries the login from its game browser, not from the in-game menu that opens with the Menu button, and this pak never shows the game browser. If Wi-Fi drops during play, PPSSPP keeps retrying unlocks in the background, but unlocks not yet sent when you quit the game are lost.
+- Hardcore Mode: NextUI has a Hardcore Mode setting, but it is hidden from its Settings menu and off, so NextUI always plays in softcore. PPSSPP has Hardcore Mode on by default, so the pak turns it off to match. If a NextUI version shows the setting, the pak follows it. In Hardcore Mode, PPSSPP disables save states (unless "save states in hardcore mode" was turned on inside PPSSPP).
 - Per-game PPSSPP settings (game-specific configs created in PPSSPP) can override the RetroAchievements on/off and Hardcore Mode settings for that game; the pak only changes the global `ppsspp.ini`.
 - If PPSSPP reports the login token as expired, it deletes it; log in again in NextUI Settings > RetroAchievements to get a new one.
 - To manage RetroAchievements inside PPSSPP yourself, create a file named `no-ra-sync` in `/.userdata/<PLATFORM>/PSP-ppsspp/`. The `no-config-changes` file also disables this sync.
@@ -129,6 +129,6 @@ What needs a person and a real account (not automated):
 
 1. **Login via NextUI only:** log out inside PPSSPP (or delete `PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp_retroachievements.dat`), log in under NextUI Settings > RetroAchievements, start a PSP game with Wi-Fi on. PPSSPP shows the RetroAchievements login message and the game's achievement count; the pak log (`.userdata/<PLATFORM>/logs/PSP.txt`) says `RetroAchievements: enabling for user ...`.
 2. **Unlock:** earn an easy achievement. The unlock pop-up appears in PPSSPP and the unlock shows on retroachievements.org.
-3. **Hardcore:** with Hardcore Mode on in NextUI, saving or loading a state in PPSSPP is refused; with it off, save states work and the game shows as softcore on the site.
+3. **Softcore:** after a launch, PPSSPP's Hardcore Mode is off, save states work, and the game shows as softcore on the site.
 4. **Disable:** turn RetroAchievements off in NextUI and start a game: no login message, and PPSSPP's Achievements settings show it disabled and logged out.
 5. **Wi-Fi off:** start a game with Wi-Fi off. The game runs normally, PPSSPP shows a login failure, and no achievements are active for that session. Turn Wi-Fi on and restart the game: login works again.
