@@ -98,6 +98,7 @@ same() { cmp -s "$1" "$2"; }
 # --- sandbox -------------------------------------------------------------------------
 mkdir -p "$PAK/bin" "$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM" "$LOGS" "$ROMDIR" "$MINUI" "$STATES" "$STUB"
 cp "$SRC_PAK/launch.sh" "$SRC_PAK/pak.json" "$PAK/"
+cp -R "$SRC_PAK/scripts" "$PAK/"
 cp "$SRC_PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini" "$INI"
 cp "${JPG2BMP:-$SRC_PAK/bin/jpg2bmp}" "$PAK/bin/jpg2bmp" || { echo "no jpg2bmp found (set JPG2BMP)"; exit 2; }
 chmod +x "$PAK/bin/jpg2bmp"

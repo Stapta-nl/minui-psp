@@ -110,6 +110,7 @@ ach_section() {
 # --- sandbox -------------------------------------------------------------------------
 mkdir -p "$PAK/bin" "$SYSDIR" "$LOGS" "$ROMDIR" "$FLAGS" "$SHARED" "$STUB"
 cp "$SRC_PAK/launch.sh" "$SRC_PAK/pak.json" "$PAK/"
+cp -R "$SRC_PAK/scripts" "$PAK/"
 cp "$SRC_PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini" "$T/shipped.ini"
 for b in minui-power-control setalpha show_message jpg2bmp; do
     printf '#!/bin/sh\nexit 0\n' >"$PAK/bin/$b"
@@ -413,21 +414,23 @@ fresh
 settings raHardcoreMode=1
 cp "$INI" "$T/before.ini"
 # launch.sh puts the pak's bin/ first in PATH: this awk truncates its output when it is
-# rewriting ppsspp.ini (launch.sh runs: awk -- PROGRAM INI TMP ...), and then
+# rewriting ppsspp.ini (the argument ending in ppsspp.ini.tmp.<pid>), and then
 # says it failed (FAIL_MODE=exit) or claims success (FAIL_MODE=lie).
 REAL_AWK="$(command -v awk)"
 for mode in exit lie; do
     cat >"$PAK/bin/awk" <<EOF
 #!/bin/sh
-case "\$4" in
-*/ppsspp.ini.tmp.*)
-    "$REAL_AWK" "\$@" >/dev/null
-    head -n 3 "\$4" >"\$4.cut" && mv "\$4.cut" "\$4"
-    [ "$mode" = exit ] && exit 1
-    echo 999
-    exit 0
-    ;;
-esac
+for arg in "\$@"; do
+    case "\$arg" in
+    */ppsspp.ini.tmp.*)
+        "$REAL_AWK" "\$@" >/dev/null
+        head -n 3 "\$arg" >"\$arg.cut" && mv "\$arg.cut" "\$arg"
+        [ "$mode" = exit ] && exit 1
+        echo 999
+        exit 0
+        ;;
+    esac
+done
 exec "$REAL_AWK" "\$@"
 EOF
     chmod +x "$PAK/bin/awk"

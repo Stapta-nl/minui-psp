@@ -60,12 +60,12 @@ jobs:
           path: dist/psp-device-tests.tar.gz
 
       - name: Lint shell scripts
-        run: shellcheck launch.sh tests/device/run.sh tests/device/e2e.sh tests/device/ra.sh
+        run: shellcheck -x launch.sh scripts/*.sh tests/device/run.sh tests/device/e2e.sh tests/device/ra.sh
 
       - name: Check release contents
         run: |
           zip="dist/${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
-          for f in launch.sh pak.json bin/jpg2bmp; do
+          for f in launch.sh scripts/ini.sh scripts/set_ini_values.awk scripts/retroachievements.sh pak.json bin/jpg2bmp; do
             unzip -l "$zip" | grep -q " $f$" || { echo "missing from release: $f"; exit 1; }
           done
           if unzip -l "$zip" | grep -qE " (src|tests)/"; then
