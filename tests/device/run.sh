@@ -1,9 +1,9 @@
 #!/bin/sh
-# On-device (or host) test of the Game Switcher preview logic in launch.sh (PR #9).
+# On-device (or host) test of the Game Switcher preview logic in launch.sh.
 #
 # It runs the *real* launch.sh and the *real* bin/jpg2bmp inside a throw-away SD card
-# tree, with a stub standing in for PPSSPP and minui-power-control. So it checks what the
-# PR's on-device table is really about (BusyBox tools, the aarch64 converter, the
+# tree, with a stub standing in for PPSSPP and minui-power-control. So it checks what matters
+# on the device (BusyBox tools, the aarch64 converter, the
 # NextUI file layout, SIGTERM handling) without needing a screen or button presses.
 # Nothing under the real SD card is touched; the sandbox is deleted afterwards.
 #
@@ -136,7 +136,7 @@ printf 'c' >"$ROMDIR/Game C.iso"
 export PLATFORM DEVICE=brick SDCARD_PATH="$SD" USERDATA_PATH="$USERDATA" LOGS_PATH="$LOGS" \
     SHARED_USERDATA_PATH="$SHARED" ROMS_PATH="$ROMS" STUB FIX STATES
 mkdir -p "$USERDATA/PSP-ppsspp"
-touch "$USERDATA/PSP-ppsspp/debug" # trace logging, like the PR's setup step
+touch "$USERDATA/PSP-ppsspp/debug" # trace logging, as with the debug flag on a device
 
 conv() { "$PAK/bin/jpg2bmp" "$FIX/$1.jpg" "$T/expected-$1.bmp" && echo "$T/expected-$1.bmp"; }
 
