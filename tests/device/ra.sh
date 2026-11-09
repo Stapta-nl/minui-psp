@@ -146,7 +146,7 @@ PERMS_WORK=0
 fresh() {
     cp "$T/shipped.ini" "$INI"
     rm -f "$TOKEN" "$SETTINGS" "$FLAGS/no-ra-sync" "$FLAGS/no-config-changes" \
-        "$FLAGS/ra-host" "$FLAGS/.ra-host-managed" "$FLAGS/debug"
+        "$FLAGS/debug"
 }
 
 # settings [key=value ...]: a NextUI-style minuisettings.txt (as NextUI's CFG_sync writes
@@ -362,27 +362,23 @@ check "log says token updated" contains "$LOG" "login token updated"
 check "token and password not in log" no_secrets "$LOG"
 end
 
-begin "13 ra-host override set, then removed; hand-set host kept"
+begin "13 AchievementsHost is never touched"
 fresh
 settings
-printf '  http://192.168.1.10:8080 \r\nsecond line\n' >"$FLAGS/ra-host"
 run_game
 check_enabled Player1 False
-check "AchievementsHost = http://192.168.1.10:8080" ach_is AchievementsHost "http://192.168.1.10:8080"
-check "marker written" test -f "$FLAGS/.ra-host-managed"
-rm -f "$FLAGS/ra-host"
+check "no AchievementsHost added" lacks "$STUB/ach.ini" '^AchievementsHost'
+awk '/^AchievementsUserName = / { print; print "AchievementsHost = http://hand.example"; next } 1' "$INI" >"$INI.x" && mv "$INI.x" "$INI"
 run_game
-check "AchievementsHost cleared after removing ra-host" ach_is AchievementsHost ""
-check "marker removed" test ! -f "$FLAGS/.ra-host-managed"
-awk '{ sub(/^AchievementsHost = .*/, "AchievementsHost = http://hand.example") } 1' "$INI" >"$INI.x" && mv "$INI.x" "$INI"
+check "host set by hand in PPSSPP is kept" ach_is AchievementsHost "http://hand.example"
+settings raEnable=0
 run_game
-check "host set by hand in PPSSPP is left alone" ach_is AchievementsHost "http://hand.example"
+check "kept when disabling too" ach_is AchievementsHost "http://hand.example"
 end
 
 begin "14 second launch changes nothing (same inodes, same content)"
 fresh
 settings raHardcoreMode=1
-printf '%s\n' "http://10.0.0.2:8080" >"$FLAGS/ra-host"
 run_game
 cp "$STUB/ach.ini" "$T/run1.ach"
 cp "$INI" "$T/run1.ini"

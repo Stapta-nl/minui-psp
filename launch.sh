@@ -269,39 +269,14 @@ _sync_retroachievements() {
     [ "$ra_hardcore" = "1" ] && ra_hardcore_value="True"
 
     printf "RetroAchievements: enabling for user '%s' (hardcore: %s).\n" "$ra_username" "$ra_hardcore_value"
-    set -- \
+    # NextUI's offline RetroAchievements support lives inside minarch (it
+    # hooks rcheevos' server calls in-process); it is not a network service
+    # PPSSPP can use, so PPSSPP talks to retroachievements.org directly.
+    # AchievementsHost is left as it is (offline support: see issue #10).
+    set_ini_values "$PPSSPP_INI" "Achievements" \
         "AchievementsEnable" "True" \
         "AchievementsUserName" "$ra_username" \
         "AchievementsChallengeMode" "$ra_hardcore_value"
-
-    # NextUI's offline RetroAchievements support lives inside minarch (it
-    # hooks rcheevos' server calls in-process); it is not a network service
-    # PPSSPP can use. PPSSPP therefore talks to retroachievements.org
-    # directly, unless the user points it at another server (e.g. a local
-    # caching proxy) by putting a URL in $USERDATA_PATH/PSP-ppsspp/ra-host.
-    # Only a host set this way is ever reset, so a host configured by hand
-    # inside PPSSPP is left alone.
-    ra_host_file="$USERDATA_PATH/PSP-ppsspp/ra-host"
-    ra_host_marker="$USERDATA_PATH/PSP-ppsspp/.ra-host-managed"
-    ra_host=""
-    if [ -f "$ra_host_file" ]; then
-        ra_host="$(head -n 1 "$ra_host_file" | tr -d '\r\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-    fi
-    if [ -n "$ra_host" ]; then
-        printf 'RetroAchievements: using custom server %s.\n' "$ra_host"
-        set -- "$@" "AchievementsHost" "$ra_host"
-    elif [ -f "$ra_host_marker" ]; then
-        echo "RetroAchievements: custom server removed, using retroachievements.org."
-        set -- "$@" "AchievementsHost" ""
-    fi
-
-    if set_ini_values "$PPSSPP_INI" "Achievements" "$@"; then
-        if [ -n "$ra_host" ]; then
-            touch "$ra_host_marker"
-        else
-            rm -f "$ra_host_marker"
-        fi
-    fi
 
     # PPSSPP reads the token file verbatim, so write it without a newline,
     # and compare byte for byte so a stray trailing newline gets fixed. The
