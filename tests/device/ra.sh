@@ -46,7 +46,7 @@ RA_TOKEN="tok3nS3cr3tA1b2C3d4"
 RA_PASSWORD="pa55S3cr3tZ9y8"
 
 missing=""
-for tool in mktemp cp mv rm mkdir cmp grep head tr sed cat awk ls wc find touch chmod cut od; do
+for tool in mktemp cp mv rm mkdir cmp grep head tr sed cat awk ls wc find touch chmod cut; do
     command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 done
 if [ -n "$missing" ]; then
@@ -467,7 +467,9 @@ check "all other lines byte for byte the same" same "$T/a.rest" "$T/b.rest"
 grep -v '^DisplayAspectRatio = ' "$T/shipped.ini" >"$INI" # the shipped ini starts with a BOM
 run_game
 check_enabled Player1 True
-check "BOM kept, once" [ "$(head -c 4 "$INI" | od -An -tx1 | tr -d ' \n')" = "efbbbf5b" ]
+printf '\357\273\277[' >"$T/bom" # the device's BusyBox has no od
+bom_once() { head -c 4 "$INI" | cmp -s - "$T/bom"; }
+check "BOM kept, once" bom_once
 check "DisplayAspectRatio added in [Graphics]" sh -c "awk '/^\\[/ { on = (\$0 == \"[Graphics]\") } on' '$INI' | grep -q '^DisplayAspectRatio = '"
 end
 
