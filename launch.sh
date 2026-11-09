@@ -272,7 +272,7 @@ _sync_retroachievements() {
     # NextUI's offline RetroAchievements support lives inside minarch (it
     # hooks rcheevos' server calls in-process); it is not a network service
     # PPSSPP can use, so PPSSPP talks to retroachievements.org directly.
-    # AchievementsHost is left as it is (offline support: see issue #10).
+    # AchievementsHost is left as it is.
     set_ini_values "$PPSSPP_INI" "Achievements" \
         "AchievementsEnable" "True" \
         "AchievementsUserName" "$ra_username" \
