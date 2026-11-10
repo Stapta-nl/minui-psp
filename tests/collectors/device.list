@@ -1,0 +1,13 @@
+# Collected on the device after every on-device run (see tests/collect.sh for the format).
+# One collector per line: <output file> | <command>. Runs in the unpacked test bundle with
+# PLATFORM and SDCARD_PATH set; $SD is the SD card. Plain POSIX sh: it must work on BusyBox.
+uname.txt | uname -a
+os-release.txt | cat /etc/os-release
+busybox-version.txt | busybox 2>&1 | head -n 1
+bash-version.txt | bash --version | head -n 1
+nextui-version.txt | cat "$SD/.system/version.txt"
+required-tools.txt | for t in bash tar gzip mktemp awk pgrep killall; do printf '%s: ' "$t"; command -v "$t" || echo MISSING; done
+df.txt | df -h
+pak.json | cat "$SD/Emus/$PLATFORM/PSP.pak/pak.json"
+ppsspp.ini | cat "$SD/Emus/$PLATFORM/PSP.pak/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
+PSP.txt | cat "$SD/.userdata/$PLATFORM/logs/PSP.txt"
