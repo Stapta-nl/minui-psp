@@ -79,7 +79,7 @@ jobs:
       - name: Test report
         if: always()
         continue-on-error: true
-        uses: dorny/test-reporter@v2.0.0
+        uses: dorny/test-reporter@v3.0.0
         with:
           name: Tests
           path: dist/test-out/host/junit/report.xml
@@ -120,7 +120,7 @@ jobs:
       - name: Test report (BusyBox sh)
         if: always()
         continue-on-error: true
-        uses: dorny/test-reporter@v2.0.0
+        uses: dorny/test-reporter@v3.0.0
         with:
           name: Tests (BusyBox sh)
           path: dist/test-out/host/junit/report.xml
