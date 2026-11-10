@@ -28,8 +28,9 @@ restore_files() {
         done <"$BAK/absent"
     fi
     rm -f "$PERSIST.tmp"
-    # delete previews of other slots that the test created
-    for f in "$MINUI/$ROM_FILE".*.bmp; do
+    # delete previews of other slots that the test created, and any preview a test renamed
+    # to .bmp.off (the restore above has already put back the ones that existed before)
+    for f in "$MINUI/$ROM_FILE".*.bmp "$MINUI/$ROM_FILE".*.bmp.off; do
         [ -f "$f" ] && ! grep -qxF "$f" "$BAK/present" 2>/dev/null && rm -f "$f"
     done
     # delete save states the test created (files that were not there before)
@@ -138,13 +139,25 @@ shot() {
     fi
 }
 
-have_shot() { [ -s "$OUT/$1.png" ]; }
+have_shot() {
+    [ -s "$OUT/$1.png" ] || {
+        echo "no screenshot named $1 was taken (missing or empty $OUT/$1.png)" >&2
+        return 1
+    }
+}
 
 # shellcheck disable=SC2046,SC2086 # word splitting of "R G B" is intended
-is_red() { set -- $(colour "$1"); [ -n "$3" ] && [ "$1" -gt $(($2 + 60)) ] && [ "$1" -gt $(($3 + 60)) ]; }
+_is_red() { set -- $(colour "$1"); [ -n "$3" ] && [ "$1" -gt $(($2 + 60)) ] && [ "$1" -gt $(($3 + 60)) ]; }
 # shellcheck disable=SC2046,SC2086
-is_blue() { set -- $(colour "$1"); [ -n "$3" ] && [ "$3" -gt $(($1 + 60)) ] && [ "$3" -gt $(($2 + 60)) ]; }
-not_fixture() { ! is_red "$1" && ! is_blue "$1"; }
+_is_blue() { set -- $(colour "$1"); [ -n "$3" ] && [ "$3" -gt $(($1 + 60)) ] && [ "$3" -gt $(($2 + 60)) ]; }
+is_red() { _is_red "$1" || { echo "the centre of $1 is not red (colour: $(colour "$1"))" >&2; return 1; }; }
+is_blue() { _is_blue "$1" || { echo "the centre of $1 is not blue (colour: $(colour "$1"))" >&2; return 1; }; }
+not_fixture() {
+    if _is_red "$1" || _is_blue "$1"; then
+        echo "$1 shows a fixture colour, expected No Preview (colour: $(colour "$1"))" >&2
+        return 1
+    fi
+}
 
 # NextUI keeps recents relative to the SD card ("/Roms/..."), so it works on every platform.
 # An absolute path is not found and NextUI drops it, rewriting recent.txt empty.
@@ -153,7 +166,11 @@ seed_recent() { mkdir -p "$(dirname "$RECENT")" && printf '%s\n' "${ROM#"$SD"}" 
 restart_ui() {
     kill_ui
     sleep 1
-    wait_for 40 running nextui.elf && sleep "$UI_WAIT"
+    wait_for 40 running nextui.elf || {
+        echo "NextUI did not come back within 40 s of being restarted" >&2
+        return 1
+    }
+    sleep "$UI_WAIT"
 }
 
 open_switcher() { # restarts NextUI directly into the Game Switcher
@@ -161,7 +178,12 @@ open_switcher() { # restarts NextUI directly into the Game Switcher
     restart_ui
 }
 
-is_image() { head -c 2 "$1" | grep -q BM || head -c 4 "$1" | tail -c 3 | grep -q PNG; }
+is_image() {
+    head -c 2 "$1" | grep -q BM || head -c 4 "$1" | tail -c 3 | grep -q PNG || {
+        echo "$1 is neither a BMP nor a PNG" >&2
+        return 1
+    }
+}
 
 # The newest save state thumbnail made since the test marked its start ("" if none).
 new_state_thumbs() { find "$STATE_DIR" -name '*.jpg' ! -name '*.undo.jpg' -newer "$BAK/marker"; }

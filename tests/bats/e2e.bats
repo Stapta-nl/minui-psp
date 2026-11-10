@@ -10,7 +10,7 @@
 # /tmp/next hand-off, screenshots come from the "Screenshot Monitor" pak and are judged by the
 # bundled pngcolor. See tests/helpers/e2e.bash.
 #
-# Requirements on the device: root, NextUI, this PSP pak installed in Emus/<platform>/PSP.pak,
+# Requirements on the device: root, NextUI, this PSP pak installed in Emus/<platform>/<PAK_NAME>.pak (PSP),
 # the Screenshot Monitor pak installed in Tools/<platform>/Screenshot Monitor.pak, and at
 # least one file in a "...(PSP)" folder under Roms/. The test uses the FIRST file there.
 #
@@ -42,7 +42,8 @@ setup_file() {
 
     SD="${SDCARD_PATH:-/mnt/SDCARD}"
     PLATFORM="$(psp_platform)"
-    PAK="$SD/Emus/$PLATFORM/PSP.pak"
+    PAK_NAME="$(psp_pak_name)"
+    PAK="$SD/Emus/$PLATFORM/$PAK_NAME.pak"
     MON="$SD/Tools/$PLATFORM/Screenshot Monitor.pak"
     SHARED="$SD/.userdata/shared"
     LOGS="$SD/.userdata/$PLATFORM/logs"
@@ -58,7 +59,7 @@ setup_file() {
 
     # --- preflight ---
     [ "$(id -u)" = 0 ] || fail "run as root (needed to write to /dev/input)"
-    [ -d "$PAK" ] || fail "PSP pak not found at $PAK"
+    [ -d "$PAK" ] || fail "the pak is not installed at $PAK"
     [ -x "$PAK/bin/jpg2bmp" ] || fail "$PAK/bin/jpg2bmp missing (install a pak built by CI or make build)"
     [ -f "$MON/bin/screenshot" ] || fail "Screenshot Monitor pak not found at $MON"
     [ -x "$PNGCOLOR" ] || fail "$PNGCOLOR missing (use the bundle from make test-bundle)"
@@ -116,15 +117,29 @@ setup_file() {
     info "game:       $ROM"
     info "emu tag:    $tag"
 
+    # "active" is set before anything is copied or changed, so an abort at any point from here
+    # on (also halfway through the stashing) is restored by teardown_file or the next run.
+    : >"$BAK/active"
+    sync
     for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW"; do stash "$f"; done
     for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && stash "$f"; done # previews of other slots
-    : >"$BAK/active"
     sync
 
     # E1 starts from: the game in recents, slot 0 chosen.
     mkdir -p "$MINUI"
     seed_recent
     printf 0 >"$SLOT_FILE"
+}
+
+# After every test: undo a preview that a test renamed to .off, even when the test aborted.
+teardown() {
+    local off
+    [ -n "${MINUI:-}" ] && [ -n "${ROM_FILE:-}" ] || return 0
+    for off in "$MINUI/$ROM_FILE".*.bmp.off; do
+        [ -f "$off" ] || continue
+        if [ -e "${off%.off}" ]; then rm -f "$off"; else mv "$off" "${off%.off}"; fi
+    done
+    return 0
 }
 
 teardown_file() {
@@ -174,11 +189,11 @@ teardown_file() {
     sleep 2 # FAT mtimes have 2 s resolution
     printf "'%s/launch.sh' '%s'\n" "$PAK" "$ROM" >/tmp/next
     kill_ui # the launcher loop then runs /tmp/next
-    wait_for 60 running PPSSPPSDL || fail "PPSSPP started"
+    wait_for 60 running PPSSPPSDL || fail "PPSSPP did not start within 60 s"
     sleep "$BOOT_WAIT"
 
     shot e2-game
-    have_shot e2-game # screenshot of the running game taken
+    have_shot e2-game
     name="$(cat "$OUT/e2-game.shotname")"
     info "screenshot name: $name"
     case "$name" in Screenshot.*) fail "game screenshot is not named after the game ($name)" ;; esac
@@ -203,8 +218,8 @@ teardown_file() {
         wait_for 20 not_running PPSSPPSDL || exit_ok=0
     fi
     running PPSSPPSDL && killall PPSSPPSDL_"$PLATFORM" 2>/dev/null
-    wait_for 30 not_running PPSSPPSDL || fail "PPSSPP exited"
-    wait_for 90 running nextui.elf || fail "NextUI is back"
+    wait_for 30 not_running PPSSPPSDL || fail "PPSSPP was still running 30 s after it was killed"
+    wait_for 90 running nextui.elf || fail "NextUI did not come back within 90 s"
     sleep "$UI_WAIT"
     ls -l --full-time "$STATE_DIR" >"$OUT/e2-states.txt" 2>/dev/null || ls -l "$STATE_DIR" >"$OUT/e2-states.txt" 2>&1
     cp "$LOGS/PSP.txt" "$OUT/e2-PSP.log" 2>/dev/null
@@ -261,7 +276,7 @@ teardown_file() {
     [ -n "$PSP_KEYS" ] || skip "PSP_KEYS is empty: no states are saved"
     local newest
     newest="$(newest_state_thumb)"
-    [ -n "$newest" ] || fail "found a new state thumbnail to compare with"
+    [ -n "$newest" ] || fail "no new state thumbnail was found to compare the preview with"
     "$PAK/bin/jpg2bmp" "$newest" "$BAK/expected.bmp"
     info "thumbnail: $(basename "$newest")"
     assert_same "$MINUI/$ROM_FILE.$(newest_state_slot).bmp" "$BAK/expected.bmp"
@@ -273,11 +288,11 @@ teardown_file() {
     preview="$MINUI/$ROM_FILE.$(newest_state_slot).bmp"
     open_switcher
     shot e2-switcher
-    have_shot e2-switcher # switcher screenshot taken
-    mv "$preview" "$preview.off"
+    have_shot e2-switcher
+    mv "$preview" "$preview.off" # put back by teardown (and restore_files) if this test aborts
     open_switcher
     shot e2-switcher-nopreview
     mv "$preview.off" "$preview"
-    have_shot e2-switcher-nopreview # switcher screenshot without preview taken
+    have_shot e2-switcher-nopreview
     assert_differ "$OUT/e2-switcher.png" "$OUT/e2-switcher-nopreview.png"
 }
