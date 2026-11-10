@@ -9,12 +9,12 @@
 # Nothing under the real SD card is touched; the sandbox is deleted afterwards.
 #
 # Usage (on the device, over ssh):
-#   scp -r tests root@device:/mnt/SDCARD/Emus/tg5040/PSP.pak/
-#   ssh root@device 'sh /mnt/SDCARD/Emus/tg5040/PSP.pak/tests/device/ra.sh'
+#   scp -r tests root@device:/mnt/SDCARD/Emus/tg5040/PSP.pak/   (or: make test-device-tg5040)
+#   ssh root@device 'sh /mnt/SDCARD/Emus/tg5040/PSP.pak/tests/ra.sh'
 # Output: PASS/FAIL per test, exit code 0 only if all pass. Logs are kept in $OUT_DIR.
 #
 # Env overrides:
-#   SRC_PAK       pak to test (default: two directories above this script)
+#   SRC_PAK       pak to test (default: the directory above tests/)
 #   PLATFORM      tg5040 (default) or tg5050
 #   OUT_DIR       where to keep logs (and the sandbox on failure) (default /tmp/psp-ra-test-out)
 #   TMP_ROOT      where the sandbox is made (default /tmp; e.g. /mnt/SDCARD to test on FAT)
@@ -22,7 +22,7 @@
 #   KEEP=1        keep the sandbox
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SRC_PAK="${SRC_PAK:-$(cd "$HERE/../.." && pwd)}"
+SRC_PAK="${SRC_PAK:-$(cd "$HERE/.." && pwd)}"
 PLATFORM="${PLATFORM:-tg5040}"
 OUT_DIR="${OUT_DIR:-/tmp/psp-ra-test-out}"
 LAUNCH_SHELL="${LAUNCH_SHELL:-sh}"
