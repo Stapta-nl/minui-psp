@@ -9,11 +9,13 @@ STB_COMMIT := d14d46f6b44456eb88beac58cba833a4135d4c89
 # when building elsewhere pass a cross compiler, e.g. CC=aarch64-linux-gnu-gcc.
 
 # Off-device checks: syntax, shellcheck, poweroff shim protocol.
-SHELL_FILES := launch.sh bin/poweroff tests/poweroff_shim_test.sh tests/device/autoresume.sh $(wildcard scripts/*.sh)
+SHELL_FILES := launch.sh bin/poweroff $(wildcard scripts/*.sh tests/*.sh tests/device/*.sh)
 
-test:
+lint:
 	for f in $(SHELL_FILES); do sh -n "$$f" || exit 1; done
 	shellcheck -x $(SHELL_FILES)
+
+test: lint
 	sh tests/poweroff_shim_test.sh
 	sh tests/device/autoresume.sh
 

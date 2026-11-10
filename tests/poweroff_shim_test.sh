@@ -118,6 +118,28 @@ PSP_POWEROFF_TIMEOUT=abc run_shim
 check "garbage pid file: no wait (${ELAPSED}s)" between "$ELAPSED" 0 1
 check "garbage pid file: real poweroff called" exists "$T/real-called"
 
+# 7. Real poweroff and busybox missing: another poweroff in PATH is used, but never
+# the shim itself (its own directory is in PATH, first).
+setup fallback
+SH="$(command -v sh)"
+mkdir -p "$T/shimdir" "$T/other"
+cp "$SHIM" "$T/shimdir/poweroff"
+cp "$T/fake-poweroff" "$T/other/poweroff"
+PSP_POWEROFF_REAL="$T/missing" PSP_POWEROFF_BUSYBOX="$T/missing" \
+    PATH="$T/shimdir:$T/other:$PATH" "$SH" "$T/shimdir/poweroff" -f
+check "fallback: poweroff from PATH used, shim skipped" contents_are "$T/real-called" "called -f"
+
+# 8. Nothing to run at all: gives up with an error instead of looping or calling itself.
+setup nothing
+mkdir -p "$T/shimdir"
+cp "$SHIM" "$T/shimdir/poweroff"
+SH="$(command -v sh)"
+PSP_POWEROFF_REAL="$T/missing" PSP_POWEROFF_BUSYBOX="$T/missing" \
+    PATH="$T/shimdir" "$SH" "$T/shimdir/poweroff" 2>/dev/null
+rc=$?
+check "nothing to run: non-zero exit, no hang" test "$rc" -ne 0
+check "nothing to run: logged" grep -q 'no real poweroff found' "$T/psp-poweroff-shim.log"
+
 if [ "$failures" -ne 0 ]; then
     echo "$failures test(s) failed"
     exit 1

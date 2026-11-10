@@ -209,20 +209,28 @@ arm_auto_resume_and_wait() {
         fi
     fi
 
+    armed=0
     if set_auto_resume "$rom_path"; then
+        armed=1
         echo "Auto-resume armed for $rom_path."
     else
         echo "Auto-resume not armed ($rom_path is not on the SD card)."
     fi
     sync
+    # The marker is on the card: the shim may go ahead. (The preview, which
+    # can take a while, is written afterwards by cleanup().)
     : >"$POWEROFF_OK"
     echo "Told the poweroff shim to go ahead."
     cleanup
+    # Nothing armed: nothing to protect, return as before PR #6.
+    [ "$armed" = 1 ] || return 0
     # Signals are ignored by the caller; poweroff ends us with SIGKILL. If
-    # the device has not powered off after a minute, drop the marker and go
-    # back to the menu.
+    # the device has not powered off after a minute (PSP_AUTORESUME_WAIT, for
+    # tests), drop the marker and go back to the menu.
+    wait_secs="${PSP_AUTORESUME_WAIT:-60}"
+    case "$wait_secs" in "" | *[!0-9]*) wait_secs=60 ;; esac
     i=0
-    while [ "$i" -lt 60 ]; do
+    while [ "$i" -lt "$wait_secs" ]; do
         sleep 1
         i=$((i + 1))
     done
@@ -373,6 +381,8 @@ main() {
     fi
 
     chmod +x "$PAK_DIR/bin/minui-power-control"
+    # Without the exec bit the poweroff shim is skipped and the marker may be written too late.
+    chmod +x "$PAK_DIR/bin/poweroff" 2>/dev/null
 
     allowed_platforms="tg5040 tg5050"
     if ! echo "$allowed_platforms" | grep -q "$PLATFORM"; then
@@ -390,11 +400,10 @@ main() {
     mkdir -p "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE"
     mount -o bind "$SHARED_USERDATA_PATH/PSP-ppsspp" "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE"
 
-    # NextUI's Resume hands the chosen slot over in this file; PPSSPP does not use it, and
-    # minarch would load it in the next game it launches, so remove it.
-    rm -f /tmp/resume_slot.txt
     touch "$STATE_MARKER"
-    PREVIEW_ROM="$1"
+    # One ROM variable (NextUI passes the path as the argument(s)).
+    rom_arg="$*"
+    PREVIEW_ROM="$rom_arg"
 
     # Power-off state: only with a PPSSPP build that supports it. A state file
     # left over from an earlier session is never trusted: it is removed unless
@@ -402,7 +411,7 @@ main() {
     resume_state=""
     if ppsspp_supports_autoresume_state; then
         mkdir -p "$STATE_DIR/autoresume"
-        AUTORESUME_STATE="$STATE_DIR/autoresume/$(basename "$1").ppst"
+        AUTORESUME_STATE="$STATE_DIR/autoresume/$(basename "$rom_arg").ppst"
         if [ "$resume_slot" = "9" ] && [ -f "$AUTORESUME_STATE" ]; then
             resume_state="$AUTORESUME_STATE"
             echo "Auto-resume: starting from $resume_state"
@@ -417,18 +426,20 @@ main() {
     # Launch emulator
     minui-power-control "${PPSSPP_BIN}_${PLATFORM}" &
     if [ -n "$resume_state" ]; then
-        "${PPSSPP_BIN}_${PLATFORM}" "$*" --state="$resume_state" --fullscreen --pause-menu-exit
+        "${PPSSPP_BIN}_${PLATFORM}" "$rom_arg" --state="$resume_state" --fullscreen --pause-menu-exit
     else
-        "${PPSSPP_BIN}_${PLATFORM}" "$*" --fullscreen --pause-menu-exit
+        "${PPSSPP_BIN}_${PLATFORM}" "$rom_arg" --fullscreen --pause-menu-exit
     fi
 
     # PPSSPP exited. A SIGTERM from here on most likely comes from poweroff
     # tearing everything down: finish the decision instead of dying halfway.
     trap "" INT TERM HUP QUIT
-    write_game_switcher_preview
     if shutdown_in_progress; then
-        arm_auto_resume_and_wait "$*"
+        # Marker and ok first: the preview must not eat the shim's time budget.
+        arm_auto_resume_and_wait "$rom_arg"
+        write_game_switcher_preview
     else
+        write_game_switcher_preview
         # Normal quit or crash: a power-off state must not outlive its session.
         remove_autoresume_state_files
     fi

@@ -18,10 +18,12 @@
 # Test overrides (production uses the defaults):
 #   PSP_POWEROFF_TMP      directory of the files above   (default /tmp)
 #   PSP_POWEROFF_REAL     the real poweroff               (default /sbin/poweroff)
+#   PSP_POWEROFF_BUSYBOX  busybox fallback                (default /bin/busybox)
 #   PSP_POWEROFF_TIMEOUT  seconds to wait at most         (default 10)
 
 TMP_DIR="${PSP_POWEROFF_TMP:-/tmp}"
 REAL_POWEROFF="${PSP_POWEROFF_REAL:-/sbin/poweroff}"
+BUSYBOX="${PSP_POWEROFF_BUSYBOX:-/bin/busybox}"
 TIMEOUT="${PSP_POWEROFF_TIMEOUT:-10}"
 case "$TIMEOUT" in "" | *[!0-9]*) TIMEOUT=10 ;; esac
 
@@ -66,8 +68,35 @@ else
     log "no PSP session running, not waiting"
 fi
 
-# Absolute paths only, so this can never call itself.
+# Absolute paths first, so this can never call itself.
 if [ -x "$REAL_POWEROFF" ]; then
     exec "$REAL_POWEROFF" "$@"
 fi
-exec /bin/busybox poweroff "$@"
+[ -x "$BUSYBOX" ] && exec "$BUSYBOX" poweroff "$@"
+
+# Last resort: any other poweroff in PATH, skipping this script's own directory
+# (and anything that is this script).
+# (No dirname/basename: parameter expansion only, PATH may be odd here.)
+case "$0" in
+*/*) self_dir="$(cd "${0%/*}" 2>/dev/null && pwd)" ;;
+*) self_dir="" ;;
+esac
+self_name="${0##*/}"
+[ -n "$self_name" ] || self_name=poweroff
+old_ifs="$IFS"
+IFS=:
+for dir in $PATH; do
+    IFS="$old_ifs"
+    [ -n "$dir" ] || continue
+    [ "$dir" = "$self_dir" ] && continue
+    [ "$(cd "$dir" 2>/dev/null && pwd)" = "$self_dir" ] && continue
+    cand="$dir/$self_name"
+    [ -f "$cand" ] && [ -x "$cand" ] || continue
+    # shellcheck disable=SC3013 # -ef is supported by BusyBox ash and dash
+    [ "$cand" -ef "$0" ] 2>/dev/null && continue
+    # shellcheck disable=SC2093 # exec is the point: the loop ends here
+    exec "$cand" "$@"
+done
+IFS="$old_ifs"
+log "no real poweroff found (tried $REAL_POWEROFF, $BUSYBOX, PATH)"
+exit 1
