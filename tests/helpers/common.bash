@@ -33,6 +33,16 @@ psp_src_pak() {
     printf '%s' "${SRC_PAK:-$REPO_DIR}"
 }
 
+# The pak directory name (Emus/<platform>/<name>.pak): $PAK_NAME (the Makefile's value, forwarded
+# to the device), else "name" in pak.json, else PSP.
+psp_pak_name() {
+    local n="${PAK_NAME:-}"
+    if [ -z "$n" ] && command -v jq >/dev/null 2>&1; then
+        n="$(jq -r '.name // empty' "$REPO_DIR/pak.json" 2>/dev/null)"
+    fi
+    printf '%s' "${n:-PSP}"
+}
+
 # require_tools <tool...>: fails naming every tool that is missing. The device's BusyBox is
 # small, so say clearly what is missing instead of failing oddly later.
 require_tools() {

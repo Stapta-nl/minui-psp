@@ -15,6 +15,7 @@
 #
 # Env overrides:
 #   SRC_PAK       pak to test (default: the directory above tests/)
+#   PAK_NAME      pak directory name without .pak (default PSP)
 #   PLATFORM      tg5040 (default) or tg5050
 #   OUT_DIR       where to keep logs (and the sandbox on failure) (default /tmp/psp-ra-test-out)
 #   TMP_ROOT      where the sandbox is made (default /tmp; e.g. /mnt/SDCARD to test on FAT)
@@ -29,7 +30,7 @@ LAUNCH_SHELL="${LAUNCH_SHELL:-sh}"
 T="$(mktemp -d "${TMP_ROOT:-/tmp}/psp-ra-test.XXXXXX")" || exit 2
 
 SD="$T/sd"
-PAK="$SD/Emus/$PLATFORM/PSP.pak"
+PAK="$SD/Emus/$PLATFORM/${PAK_NAME:-PSP}.pak"
 USERDATA="$SD/.userdata/$PLATFORM"
 SHARED="$SD/.userdata/shared"
 LOGS="$USERDATA/logs"

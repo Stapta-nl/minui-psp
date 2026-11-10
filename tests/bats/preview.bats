@@ -32,7 +32,7 @@ setup_file() {
     T="$(mktemp -d /tmp/psp-preview-test.XXXXXX)" || fail "cannot create a temp dir"
 
     SD="$T/sd"
-    PAK="$SD/Emus/$PLATFORM/PSP.pak"
+    PAK="$SD/Emus/$PLATFORM/$(psp_pak_name).pak"
     USERDATA="$SD/.userdata/$PLATFORM"
     SHARED="$SD/.userdata/shared"
     LOGS="$USERDATA/logs"
