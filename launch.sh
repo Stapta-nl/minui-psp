@@ -35,7 +35,14 @@ PPSSPP_INI="$PPSSPP_SYSTEM_DIR/ppsspp.ini"
 # shellcheck source=scripts/retroachievements.sh
 . "$PAK_DIR/scripts/retroachievements.sh"
 
+# Teardown runs once: arm_auto_resume_and_wait calls it before its wait, and
+# the EXIT trap calls it again.
+CLEANED=""
+MOUNTED_SAVEDATA=""
+MOUNTED_STATE=""
 cleanup() {
+    [ -z "$CLEANED" ] || return 0
+    CLEANED=1
     write_game_switcher_preview
     rm -f /tmp/stay_awake
     # Only our own pid file (a newer launch.sh may have replaced it).
@@ -46,8 +53,13 @@ cleanup() {
     restore_cpu_settings 0
     restore_cpu_settings 4
 
-    umount "$EMU_DIR/.config/ppsspp/PSP/SAVEDATA" || true
-    umount "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE" || true
+    # Only what we mounted. States, marker and preview are synced by now.
+    if [ -n "$MOUNTED_SAVEDATA" ]; then
+        umount "$EMU_DIR/.config/ppsspp/PSP/SAVEDATA" 2>/dev/null || echo "Could not unmount SAVEDATA."
+    fi
+    if [ -n "$MOUNTED_STATE" ]; then
+        umount "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE" 2>/dev/null || echo "Could not unmount PPSSPP_STATE."
+    fi
 }
 
 # Succeeds (and says so) when the user opted out of config changes.
@@ -155,12 +167,21 @@ now() {
 # without a marker. So: once the shim has asked for the power-off and PPSSPP
 # is still running after PSP_PPSSPP_WAIT seconds (default 8), arm the marker
 # and release the shim right away; PPSSPP may still finish its save, and the
-# newest state is loaded either way. $1 PPSSPP pid, $2 ROM path.
+# newest state is loaded either way.
+# If PPSSPP is still running PSP_REQ_MAX_AGE seconds (default 20: the shim's
+# cap plus a margin) after the request, the power-off did not happen (aborted:
+# poweroff would have killed us): the marker, request and ok file are withdrawn,
+# so a later crash or a later normal quit is not taken for a power-off.
+# $1 PPSSPP pid, $2 ROM path.
 poweroff_watchdog() {
     wd_pid="$1"
     wd_rom="$2"
     wd_wait="${PSP_PPSSPP_WAIT:-8}"
     case "$wd_wait" in "" | *[!0-9]*) wd_wait=8 ;; esac
+    wd_max="${PSP_REQ_MAX_AGE:-20}"
+    case "$wd_max" in "" | *[!0-9]*) wd_max=20 ;; esac
+    # The shim must have time to see the ok file.
+    [ "$wd_max" -ge $((wd_wait + 2)) ] || wd_max=$((wd_wait + 2))
     while kill -0 "$wd_pid" 2>/dev/null; do
         if [ -f "$POWEROFF_REQ" ]; then
             i=0
@@ -172,7 +193,15 @@ poweroff_watchdog() {
             echo "PPSSPP still running ${wd_wait}s after the power-off request: arming auto-resume without waiting for it."
             set_auto_resume "$wd_rom" && echo "Auto-resume armed for $wd_rom."
             : >"$POWEROFF_OK"
-            return 0
+            while [ "$i" -lt "$wd_max" ]; do
+                sleep 1
+                i=$((i + 1))
+                kill -0 "$wd_pid" 2>/dev/null || return 0
+            done
+            echo "PPSSPP still running ${i}s after the power-off request: the power-off did not happen, withdrawing the auto-resume marker."
+            rm -f "$AUTO_RESUME_PATH" "$POWEROFF_REQ" "$POWEROFF_OK"
+            sync
+            continue
         fi
         sleep 1
     done
@@ -193,6 +222,12 @@ poweroff_watchdog() {
 # the save, then its shutdown):
 #   - PPSSPP still running 8 s after the request appears: poweroff_watchdog()
 #     arms the marker and releases the shim anyway (ok at ~9-10 s, cap 15 s).
+#   - PPSSPP exited on a signal but no power-off is visible yet: up to
+#     PSP_SHUTDOWN_GRACE seconds (default 3) of polling, see
+#     shutdown_in_progress(). This is spent before the shim's request exists
+#     (once it does, the first poll sees it), and it counts as time since
+#     PPSSPP exited, so it can only make the preview be skipped, never delay
+#     the ok file past the numbers below.
 #   - after PPSSPP exits: marker + sync first; the preview only if that was
 #     quick (PSP_PREVIEW_BUDGET, default 3 s), so the ok file is given at most
 #     ~7 s + 3 s + 3 s after the SIGTERM; nothing slow happens after it.
@@ -221,13 +256,32 @@ log_resume_settings() {
         }' "$PPSSPP_INI"
 }
 
-# True if the device is powering off (rather than the user quitting PPSSPP).
-# Called once, right after PPSSPP exits.
-shutdown_in_progress() {
+# True if $POWEROFF_REQ is older than PSP_REQ_MAX_AGE seconds (default 20,
+# the shim's 15 s cap plus a margin). The shim writes the epoch into it; a
+# file without a number (older shim, tests) counts as fresh.
+request_is_stale() {
+    max_age="${PSP_REQ_MAX_AGE:-20}"
+    case "$max_age" in "" | *[!0-9]*) max_age=20 ;; esac
+    req_ts=""
+    read -r req_ts <"$POWEROFF_REQ" 2>/dev/null
+    case "$req_ts" in "" | *[!0-9]*) return 1 ;; esac
+    req_now="$(now)"
+    [ "$req_now" -gt 0 ] || return 1
+    [ $((req_now - req_ts)) -gt "$max_age" ]
+}
+
+# One look for signs of a power-off; says which one it found.
+power_off_visible() {
     # Written by our poweroff shim (bin/poweroff): the primary signal.
     if [ -f "$POWEROFF_REQ" ]; then
-        echo "Power-off detected: $POWEROFF_REQ exists."
-        return 0
+        if request_is_stale; then
+            # A power-off that never happened (the watchdog normally clears it).
+            echo "Ignoring a stale power-off request ($POWEROFF_REQ is older than the shim's wait)."
+            rm -f "$POWEROFF_REQ" "$POWEROFF_OK"
+        else
+            echo "Power-off detected: $POWEROFF_REQ exists."
+            return 0
+        fi
     fi
     # Set by NextUI and by minui-power-control 3.0.0+.
     if [ -f /tmp/poweroff ]; then
@@ -236,13 +290,43 @@ shutdown_in_progress() {
     fi
     # minui-power-control 1.x/2.x: button-handler runs its `shutdown` script
     # by absolute path (/tmp/selfgz*/shutdown). That script kills the
-    # emulator first, then runs `poweroff` and sleeps until the system kills
-    # it. This check can lose the race against it, hence the shim above.
-    # Match the command line only: the selfgz dir itself is deleted as soon as
-    # power-control's launcher notices the emulator is gone.
+    # emulator first, then syncs, shows "Powering off" and only then runs
+    # `poweroff`, so this can lose the race against it (hence the shim, and
+    # the grace period in shutdown_in_progress). Match the command line only:
+    # the selfgz dir itself is deleted as soon as power-control's launcher
+    # notices the emulator is gone.
     if pgrep -f '/shutdown$|^([^ ]*/)?poweroff( |$)' >/dev/null 2>&1; then
         echo "Power-off detected: shutdown/poweroff process found."
         return 0
+    fi
+    return 1
+}
+
+# True if the device is powering off (rather than the user quitting PPSSPP).
+# Called once, right after PPSSPP exits. $1: grace period in seconds (0: look
+# once). When PPSSPP was stopped by a signal the shutdown script is at work
+# and its `poweroff` (our shim, which creates $POWEROFF_REQ) usually comes a
+# moment later, so look again for that long. A user quit passes 0: no delay.
+shutdown_in_progress() {
+    grace="$1"
+    case "$grace" in "" | *[!0-9]*) grace=0 ;; esac
+    ticks=0
+    while :; do
+        if power_off_visible; then
+            [ "$ticks" -eq 0 ] || echo "(found after waiting $((ticks / 2)).$((ticks % 2 * 5))s)"
+            return 0
+        fi
+        [ "$ticks" -lt $((grace * 2)) ] || break
+        # Half-second steps; a sleep without fractions takes a whole second.
+        if sleep 0.5 2>/dev/null; then
+            ticks=$((ticks + 1))
+        else
+            sleep 1
+            ticks=$((ticks + 2))
+        fi
+    done
+    if [ "$grace" -gt 0 ]; then
+        echo "No power-off detected within ${grace}s (no request file, no /tmp/poweroff, no shutdown process; pgrep: $(command -v pgrep || echo missing)): treating this as a normal exit."
     fi
     return 1
 }
@@ -280,19 +364,19 @@ arm_auto_resume_and_wait() {
     fi
     : >"$POWEROFF_OK"
     echo "Told the poweroff shim to go ahead."
+    # Marker, states and preview are synced and PPSSPP is gone: release the
+    # bind mounts (poweroff would anyway) and restore CPU settings now; the
+    # EXIT trap's cleanup is then a no-op.
     cleanup
     # Nothing armed: nothing to protect, return as before PR #6.
     [ "$armed" = 1 ] || return 0
-    # Signals are ignored by the caller; poweroff ends us with SIGKILL. If
-    # the device has not powered off after a minute (PSP_AUTORESUME_WAIT, for
-    # tests), drop the marker and go back to the menu.
+    # The caller ignores INT/TERM/HUP/QUIT (trap "") and children inherit
+    # that, so one sleep cannot be cut short; poweroff ends us with SIGKILL.
+    # If the device has not powered off after a minute (PSP_AUTORESUME_WAIT,
+    # for tests), drop the marker and go back to the menu.
     wait_secs="${PSP_AUTORESUME_WAIT:-60}"
     case "$wait_secs" in "" | *[!0-9]*) wait_secs=60 ;; esac
-    i=0
-    while [ "$i" -lt "$wait_secs" ]; do
-        sleep 1
-        i=$((i + 1))
-    done
+    sleep "$wait_secs"
     echo "Device did not power off, removing auto-resume marker."
     rm -f "$AUTO_RESUME_PATH" "$POWEROFF_REQ" "$POWEROFF_OK"
     sync
@@ -452,11 +536,11 @@ main() {
 
     mkdir -p "$SDCARD_PATH/Saves/PSP"
     mkdir -p "$EMU_DIR/.config/ppsspp/PSP/SAVEDATA"
-    mount -o bind "$SDCARD_PATH/Saves/PSP" "$EMU_DIR/.config/ppsspp/PSP/SAVEDATA"
+    mount -o bind "$SDCARD_PATH/Saves/PSP" "$EMU_DIR/.config/ppsspp/PSP/SAVEDATA" && MOUNTED_SAVEDATA=1
 
     mkdir -p "$SHARED_USERDATA_PATH/PSP-ppsspp"
     mkdir -p "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE"
-    mount -o bind "$SHARED_USERDATA_PATH/PSP-ppsspp" "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE"
+    mount -o bind "$SHARED_USERDATA_PATH/PSP-ppsspp" "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE" && MOUNTED_STATE=1
 
     touch "$STATE_MARKER"
     # One ROM variable (NextUI passes the path as the argument(s)).
@@ -479,8 +563,10 @@ main() {
     ppsspp_pid=$!
     poweroff_watchdog "$ppsspp_pid" "$rom_arg" &
     watchdog_pid=$!
+    ppsspp_rc=0
     while kill -0 "$ppsspp_pid" 2>/dev/null; do
         wait "$ppsspp_pid" 2>/dev/null
+        ppsspp_rc=$?
     done
     PPSSPP_EXIT_TS="$(now)"
     kill "$watchdog_pid" 2>/dev/null
@@ -490,7 +576,14 @@ main() {
     # here on most likely comes from poweroff tearing everything down: finish
     # the decision instead of dying halfway.
     trap "" INT TERM HUP QUIT
-    if shutdown_in_progress; then
+    # Exit status above 128: killed by a signal (the shutdown script's SIGTERM
+    # if PPSSPP does not handle it itself). A user Exit is not delayed.
+    grace=0
+    if [ "$ppsspp_rc" -gt 128 ] || [ -n "$got_signal" ]; then
+        grace="${PSP_SHUTDOWN_GRACE:-3}"
+        echo "PPSSPP stopped by a signal (status $ppsspp_rc): looking for a power-off for up to ${grace}s."
+    fi
+    if shutdown_in_progress "$grace"; then
         # Marker, then preview, then ok (see arm_auto_resume_and_wait).
         arm_auto_resume_and_wait "$rom_arg"
     else

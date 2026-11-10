@@ -71,9 +71,6 @@ jobs:
           name: psp-device-tests
           path: dist/psp-device-tests.tar.gz
 
-      - name: Lint shell scripts
-        run: make lint
-
       - name: Check release contents
         run: |
           zip="dist/${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"

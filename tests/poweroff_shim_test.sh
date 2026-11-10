@@ -64,6 +64,7 @@ start_pak
 run_shim -f
 stop_pak
 check "present: request file created" exists "$T/psp-poweroff-req"
+check "present: request file holds the epoch" grep -Eq '^[0-9]{9,}$' "$T/psp-poweroff-req"
 check "present: no wait (${ELAPSED}s)" between "$ELAPSED" 0 1
 check "present: real poweroff called with args" contents_are "$T/real-called" "called -f"
 

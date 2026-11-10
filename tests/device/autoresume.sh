@@ -58,12 +58,21 @@ rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 LAUNCH_PID=""
 
+# Mounts of a launch.sh that was SIGKILLed (stacked ones need several umounts).
+drop_mounts() {
+    for m in "$PAK/PPSSPP/.config/ppsspp/PSP/SAVEDATA" "$PAK/PPSSPP/.config/ppsspp/PSP/PPSSPP_STATE"; do
+        n=0
+        while grep -q " $m " /proc/self/mountinfo 2>/dev/null && [ "$n" -lt 10 ]; do
+            umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
+            n=$((n + 1))
+        done
+    done
+}
+
 finish() {
     [ -n "$LAUNCH_PID" ] && kill -KILL "$LAUNCH_PID" 2>/dev/null
     # launch.sh bind-mounts into the sandbox; a SIGKILL can leave them behind.
-    for m in "$PAK/PPSSPP/.config/ppsspp/PSP/SAVEDATA" "$PAK/PPSSPP/.config/ppsspp/PSP/PPSSPP_STATE"; do
-        umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
-    done
+    drop_mounts
     rm -f "$REQ" "$OK" "$PIDFILE" /tmp/resume_slot.txt /tmp/psp-poweroff-shim.log
     if [ -n "$KEEP" ] || [ "$FAIL" -gt 0 ]; then echo "Logs kept in $OUT_DIR"; fi
     [ -n "$KEEP" ] || rm -rf "$T"
@@ -81,6 +90,7 @@ check() { # check <description> <command...>
     fi
 }
 begin() {
+    drop_mounts
     CASE="$1"
     CASE_FAIL=0
     echo "[$CASE]"
@@ -131,6 +141,7 @@ printf 'b' >"$ROMDIR/Game B.iso"
 # Lines of $STUB/actions:
 #   save <slot>  the user saves a state to <slot>
 #   quit         Exit hotkey / pause-menu Exit: save on exit (mode save), then exit
+#   sigdie       die from a SIGTERM (exit status 143), nothing saved
 #   crash        exit with an error, nothing saved
 #   hang         run until killed; SIGTERM saves on exit (mode save, takes 1 s), then exits
 cat >"$EMU" <<'STUB_BODY'
@@ -147,10 +158,15 @@ save_state() {
 on_term() {
     [ -n "$sleeper" ] && kill "$sleeper" 2>/dev/null
     [ "$mode" = stuck ] && sleep 20 # PPSSPP hangs after SIGTERM (watchdog test)
-    if [ "$mode" = save ]; then
+    if [ "$mode" = save ] || [ "$mode" = savesig ]; then
         sleep 1 # saving takes a moment; the shim must wait for it
         save_state 0
         : >"$STUB/saved_on_term"
+    fi
+    if [ "$mode" = savesig ]; then
+        trap - TERM # then die from the SIGTERM (status 143)
+        kill -TERM $$
+        sleep 5
     fi
     exit 0
 }
@@ -164,6 +180,12 @@ while read -r action a; do
         exit 0
         ;;
     crash) exit 139 ;;
+    sigdie)
+        # killed by the SIGTERM like PPSSPP without a handler: status 143
+        trap - TERM
+        kill -TERM $$
+        sleep 5
+        ;;
     hang)
         sleep 300 &
         sleeper=$!
@@ -201,6 +223,11 @@ power_button() {
         wait_for "$REQ"
         ;;
     req) : >"$REQ" ;;
+    late)
+        # the shutdown script SIGTERMs PPSSPP first; its `poweroff` (the shim,
+        # which creates the request file) comes after syncing and its message
+        (sleep 4; date +%s >"$REQ") &
+        ;;
     esac
     kill -TERM "$(cat "$STUB/pid")"
 }
@@ -365,6 +392,108 @@ check "shim reached the real poweroff" present "$STUB/real-called"
 check "PPSSPP had not exited yet (no save on term)" absent "$STUB/saved_on_term"
 check "log says the watchdog armed it" contains "$LOG" 'PPSSPP still running 2s'
 kill -KILL "$(cat "$STUB/pid")" 2>/dev/null
+end
+
+begin "10 late request file: PPSSPP dies on SIGTERM before the shim exists, grace poll finds it"
+reset_states
+PSP_SHUTDOWN_GRACE=4 run_game savesig "" late hang
+use_log
+check "marker armed when ok is given" test "$MARKER_AT_OK" = "$EXPECT_MARKER"
+check "log says PPSSPP was stopped by a signal" contains "$LOG" 'PPSSPP stopped by a signal'
+check "log says it was found after waiting" contains "$LOG" 'found after waiting'
+check "log says power-off detected" contains "$LOG" 'Power-off detected: .*psp-poweroff-req'
+end
+
+begin "11 signal exit and no sign of a power-off: detection failure is logged, no marker, no hang"
+reset_states
+PSP_SHUTDOWN_GRACE=2 NOKILL=1 run_game save "" "" sigdie
+use_log
+check "launch.sh returned by itself" test -z "$LAUNCH_HUNG"
+check "no marker" absent "$MARKER"
+check "log says the grace poll ran" contains "$LOG" 'looking for a power-off for up to 2s'
+check "log says detection failed" contains "$LOG" 'No power-off detected within 2s'
+end
+
+begin "12 normal quit: no grace poll, no delay"
+reset_states
+run_game save "" "" quit
+use_log
+check "no grace poll" lacks "$LOG" 'looking for a power-off'
+check "no failed-detection message" lacks "$LOG" 'No power-off detected'
+end
+
+begin "13 launch.sh teardown runs once: mounts released before the wait, no umount errors"
+reset_states
+PSP_AUTORESUME_WAIT=3 NOKILL=1 run_game save "" shim hang
+use_log
+check "give-up path was taken" contains "$LOG" 'Device did not power off'
+check "SAVEDATA unmounted exactly once" test "$(grep -c '^+ umount .*SAVEDATA' "$LOG")" = 1
+check "PPSSPP_STATE unmounted exactly once" test "$(grep -c '^+ umount .*PPSSPP_STATE' "$LOG")" = 1
+check "no umount errors" lacks "$LOG" 'umount: '
+check "no unmount failure logged" lacks "$LOG" 'Could not unmount'
+check "bind mounts gone" sh -c "! grep -q '$PAK' /proc/self/mountinfo"
+end
+
+begin "14 aborted power-off: watchdog withdraws marker and request, a later quit is a normal quit"
+reset_states
+printf 'stuck' >"$STUB/mode"
+printf 'hang\n' >"$STUB/actions"
+rm -f "$REQ" "$OK" "$MARKER" "$STUB/pid" "$STUB/real-called" /tmp/psp-poweroff-shim.log
+PSP_PPSSPP_WAIT=2 PSP_REQ_MAX_AGE=5 PSP_SHUTDOWN_GRACE=1 sh "$PAK/launch.sh" "$ROMFILE" >"$T/launch.out" 2>&1 &
+LAUNCH_PID=$!
+power_button shim
+wait_for "$OK"
+check "marker armed by the watchdog" test "$(cat "$MARKER" 2>/dev/null)" = "$EXPECT_MARKER"
+i=0
+while [ -e "$MARKER" ] && [ "$i" -lt 150 ]; do
+    sleep 0.1 2>/dev/null || sleep 1
+    i=$((i + 1))
+done
+check "marker withdrawn" absent "$MARKER"
+check "request file withdrawn" absent "$REQ"
+check "ok file withdrawn" absent "$OK"
+# The user now quits normally (here: PPSSPP dies without a power-off).
+kill -KILL "$(cat "$STUB/pid")" 2>/dev/null
+i=0
+while kill -0 "$LAUNCH_PID" 2>/dev/null && [ "$i" -lt 100 ]; do
+    sleep 0.1 2>/dev/null || sleep 1
+    i=$((i + 1))
+done
+if kill -0 "$LAUNCH_PID" 2>/dev/null; then LAUNCH_HUNG=1; else LAUNCH_HUNG=""; fi
+kill -KILL "$LAUNCH_PID" 2>/dev/null
+wait "$LAUNCH_PID" 2>/dev/null
+LAUNCH_PID=""
+cp "$LOGS/PSP.txt" "$OUT_DIR/$CASE.log" 2>/dev/null
+use_log
+check "launch.sh ended by itself (no 60 s re-arm)" test -z "$LAUNCH_HUNG"
+check "no marker after the later quit" absent "$MARKER"
+check "log says the power-off did not happen" contains "$LOG" 'power-off did not happen'
+end
+
+begin "15 stale request file (old timestamp) is ignored on a normal quit"
+reset_states
+printf 'save' >"$STUB/mode"
+printf 'quit\n' >"$STUB/actions"
+rm -f "$REQ" "$OK" "$MARKER" "$STUB/pid"
+sh "$PAK/launch.sh" "$ROMFILE" >"$T/launch.out" 2>&1 &
+LAUNCH_PID=$!
+wait_for "$STUB/pid"
+echo $(($(date +%s) - 300)) >"$REQ"
+i=0
+while kill -0 "$LAUNCH_PID" 2>/dev/null && [ "$i" -lt 150 ]; do
+    sleep 0.1 2>/dev/null || sleep 1
+    i=$((i + 1))
+done
+if kill -0 "$LAUNCH_PID" 2>/dev/null; then LAUNCH_HUNG=1; else LAUNCH_HUNG=""; fi
+kill -KILL "$LAUNCH_PID" 2>/dev/null
+wait "$LAUNCH_PID" 2>/dev/null
+LAUNCH_PID=""
+cp "$LOGS/PSP.txt" "$OUT_DIR/$CASE.log" 2>/dev/null
+use_log
+check "launch.sh ended by itself" test -z "$LAUNCH_HUNG"
+check "no marker" absent "$MARKER"
+check "stale request removed" absent "$REQ"
+check "log says stale" contains "$LOG" 'Ignoring a stale power-off request'
 end
 
 echo

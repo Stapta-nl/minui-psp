@@ -8,7 +8,7 @@
 # Game Switcher preview, then hands over to the real poweroff.
 #
 # Protocol (all files in /tmp):
-#   psp-poweroff-req  created here: "a power-off is being requested"
+#   psp-poweroff-req  created here: "a power-off is being requested" (holds the epoch)
 #   psp-poweroff-ok   created by launch.sh once it is ready for power-off
 #   psp-pak.pid       pid of launch.sh; if that process is gone nobody can
 #                     answer, so we stop waiting
@@ -51,7 +51,8 @@ pak_alive() {
 
 if pak_alive; then
     log "requesting power-off from launch.sh (pid $pak_pid)"
-    : >"$REQ_FILE" 2>/dev/null
+    # The epoch inside lets launch.sh tell a stale request from a live one.
+    date +%s >"$REQ_FILE" 2>/dev/null
     waited=0
     while :; do
         if [ -f "$OK_FILE" ]; then
