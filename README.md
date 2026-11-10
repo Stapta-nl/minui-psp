@@ -90,40 +90,56 @@ This project uses PPSSPP, which is open-source software. Please refer to the ori
 
 The project code which is not part of PPSSPP is licensed under the [MIT License](https://opensource.org/licenses/MIT). See the project [LICENSE](LICENSE) file for more details.
 
-## Testing the Game Switcher image on a device
+## Testing
 
-`tests/device/run.sh` runs the real `launch.sh` and `bin/jpg2bmp` against a stub PPSSPP in a throw-away SD tree, and checks the preview image and slot file (no save state, one state, the newest slot wins, other games unaffected), that the resume hand-off file is removed, and the SIGTERM (power-off) path. Over SSH:
+The tests use [bats-core](https://github.com/bats-core/bats-core) with `bats-support`, `bats-assert` and `bats-file`. The Makefile downloads them at pinned versions into `tests/lib/` (git-ignored; `make clean` removes them). Needs `bash`, `jq`, `curl`, `shellcheck` and an aarch64 `bin/jpg2bmp` (built natively on aarch64, otherwise `make test CC=aarch64-linux-gnu-gcc`; it is run through `qemu-aarch64-static` when the host is not aarch64 and that is installed).
 
-```sh
-scp -r tests root@<device>:/mnt/SDCARD/Emus/tg5040/PSP.pak/
-ssh root@<device> 'sh /mnt/SDCARD/Emus/tg5040/PSP.pak/tests/device/run.sh'
+| Command | What it does |
+|---|---|
+| `make test` | The tests tagged `host`, on this machine. Never uses ssh. This is what CI runs. |
+| `make test-device` | The tests tagged `device`, over ssh, on every configured device. Unconfigured devices are skipped (exit 0); a configured device that is unreachable is an error. |
+| `make test-device-<platform>` | One device, e.g. `make test-device-tg5040`. Fails if it is not configured. One target exists for every platform in `pak.json`. |
+| `make test-bundle` | `dist/psp-device-tests.tar.gz`: bats, its libraries, the tests, fixtures and the aarch64 `pngcolor` helper. |
+
+`make test` runs shellcheck, the release contents check, the check that `tests/devices.env.example` matches the platforms in `pak.json`, and the tests that run the real `launch.sh` and `bin/jpg2bmp` against a stub PPSSPP in a throw-away SD tree (`tests/bats/preview.bats`: Game Switcher image; `tests/bats/ra.bats`: RetroAchievements sync, see below). By default it tests the repository checkout; `make test SRC_PAK=<unpacked release> RELEASE_ZIP=<release zip>` tests a release the way CI does. `JPG2BMP=<file>` overrides the converter, `PLATFORM` the platform under test (default: the first in `pak.json`), `KEEP=1` keeps the sandbox and `OUT_DIR` sets where logs go.
+
+### Tags
+
+Tests say where they run with bats tags (`# bats file_tags=...`, `# bats test_tags=...`):
+
+- `host`: runs on the host and in CI. `device`: runs over ssh only. The stub-PPSSPP tests carry both.
+- `platform:<name>`: only on that platform, e.g. `tests/bats/e2e.bats`. Device tests without a platform tag run on every device. A new platform in `pak.json` therefore gets its `make` target, and the right tests, without changes to the test setup.
+
+### Devices
+
+Configure the devices you have in `tests/devices.env` (git-ignored; start from `tests/devices.env.example`):
+
+```make
+TG5040_HOST ?= root@brick.local
+TG5040_SSH_OPTS ?= -p 2222 -i ~/.ssh/trimui
 ```
 
-It prints PASS/FAIL per test and exits non-zero on failure. Logs are kept in `/tmp/psp-preview-test-out`. The real SD card is not modified.
+Values from the command line or the environment win: `make test-device-tg5040 TG5040_HOST=root@192.168.1.50`. Configuring a host is all the consent the tests need, even though the end-to-end test injects button presses and changes (then restores) the recents and resume files of its test game. ssh runs with `BatchMode=yes` (set up key-based login; there is never a password prompt) and a connect timeout (`SSH_CONNECT_TIMEOUT`, default 10 s). A platform without a line in `tests/devices.env.example` makes `make test` fail.
 
-### Fully automated end-to-end test
+For each device `make test-device` checks that the device has `bash`, `tar`, `gzip` and `mktemp` (naming any that are missing), streams the test bundle to a temp dir on it, runs the `device` tests there against the pak installed in `Emus/<platform>/PSP.pak`, fetches the results and removes the temp dir. Environment variables such as `SDCARD_PATH`, `ROM_DIR`, `ROM`, `PSP_KEYS`, `EXIT_KEYS`, `BOOT_WAIT`, `UI_WAIT`, `KEY_GAP`, `CHORD_HOLD` and `KEEP` are forwarded when set (see the header of `tests/bats/e2e.bats`).
 
-`tests/device/e2e.sh` drives the real NextUI and PPSSPP on a TrimUI device with no one at the buttons: it injects button presses through the `TRIMUI Player1` evdev device, launches the first game in `Roms/*(PSP)` through NextUI's `/tmp/next` hand-off, and takes screenshots with the [Screenshot Monitor](https://github.com/josegonzalez/minui-screenshot-monitor-pak) pak's `bin/screenshot`. Screenshots are judged by the bundled `pngcolor` helper.
+### Debug bundle
 
-Requirements: root over SSH, this pak and the Screenshot Monitor pak installed, and a game in `Roms/*(PSP)`. CI publishes the `psp-device-tests` artifact (`psp-device-tests.tar.gz`) with the script, fixtures and the aarch64 helper:
+Every run writes `dist/test-report-<target>-<timestamp>.tar.gz` (target: `host` or the platform), whether it passed or failed: the TAP output, the JUnit XML, per-case logs and screenshots, `summary.md` (also shown in the CI job summary), host information (git SHA and dirty state, tool versions, make variables, timestamps, which devices were configured; the ssh address is never recorded) and, for devices, `uname -a`, `/etc/os-release`, BusyBox and bash versions, the NextUI version, `df`, the installed `pak.json` and `ppsspp.ini` and the `PSP.txt` log. What is collected is a list with one command per line in `tests/collectors/host.list` and `tests/collectors/device.list`; add a line to collect more. A collector that fails is noted in `collector-errors.txt` and never stops the bundle.
 
-```sh
-scp psp-device-tests.tar.gz root@<device>:/tmp/
-ssh root@<device> 'cd /tmp && tar xzf psp-device-tests.tar.gz && sh tests/device/e2e.sh'
-```
+### End-to-end test (device only)
 
-The script temporarily changes the recents and resume files of the test game and restores them on exit (its backup is kept on the SD card, so a run that was cut short is restored at the start of the next one). It restarts NextUI with SIGKILL, never SIGTERM, because NextUI treats SIGTERM as a power-off request. It expects these PPSSPP hotkeys: select+R1 saves a state, select+right moves to the next slot, select+start exits. See the header of `e2e.sh` for the settings (`PSP_KEYS`, `EXIT_KEYS`, wait times).
+`tests/bats/e2e.bats` drives the real NextUI and PPSSPP on a TrimUI device with no one at the buttons: it injects button presses through the `TRIMUI Player1` evdev device, launches the first game in `Roms/*(PSP)` through NextUI's `/tmp/next` hand-off, and takes screenshots with the [Screenshot Monitor](https://github.com/josegonzalez/minui-screenshot-monitor-pak) pak's `bin/screenshot`. Screenshots are judged by the bundled `pngcolor` helper.
 
-## Testing RetroAchievements on a device
+Requirements: root over ssh, this pak and the Screenshot Monitor pak installed, and a game in `Roms/*(PSP)`. Do not touch the device while it runs. The test temporarily changes the recents and resume files of the test game and restores them at the end (its backup is kept on the SD card, so a run that was cut short is restored at the start of the next one). It restarts NextUI with SIGKILL, never SIGTERM, because NextUI treats SIGTERM as a power-off request. It expects these PPSSPP hotkeys: select+R1 saves a state, select+right moves to the next slot, select+start exits. See the header of `e2e.bats` for the settings.
 
-`tests/device/ra.sh` runs the real `launch.sh` against a stub PPSSPP in a throw-away SD tree with a NextUI-style `minuisettings.txt`, and checks what PPSSPP would see at start-up (the `[Achievements]` section of `ppsspp.ini` and the token file): enabled in softcore and hardcore, disabled, not logged in, MinUI and older NextUI (PPSSPP left alone), the `no-ra-sync` and `no-config-changes` flags, usernames with special characters, older and CRLF ini files, token normalisation, that a custom RetroAchievements server set in PPSSPP is left alone, that a second launch rewrites nothing, that the token and password never reach the log (also with the `debug` flag), and that a failed ini write (full SD card) leaves `ppsspp.ini` unchanged. Over SSH:
+### CI
 
-```sh
-scp -r tests root@<device>:/mnt/SDCARD/Emus/tg5040/PSP.pak/
-ssh root@<device> 'sh /mnt/SDCARD/Emus/tg5040/PSP.pak/tests/device/ra.sh'
-```
+CI runs `make test` against the unpacked release, shows per-test results on the pull request (check run from the JUnit XML, using `dorny/test-reporter`), appends `summary.md` to the job summary and uploads the debug bundle. Pull requests from forks get a read-only token and cannot create the check run; the job summary and the artifact are the fallback. CI also runs the RetroAchievements cases in a BusyBox container, where every tool is a BusyBox applet like on the device.
 
-Logs are kept in `/tmp/psp-ra-test-out`. Set `TMP_ROOT=/mnt/SDCARD` to run the sandbox on the SD card's FAT file system instead of `/tmp`. The script is also in the `psp-device-tests` bundle.
+## Testing RetroAchievements
+
+`tests/ra.sh` runs the real `launch.sh` against a stub PPSSPP in a throw-away SD tree with a NextUI-style `minuisettings.txt`, and checks what PPSSPP would see at start-up (the `[Achievements]` section of `ppsspp.ini` and the token file): enabled in softcore and hardcore, disabled, not logged in, MinUI and older NextUI (PPSSPP left alone), the `no-ra-sync` and `no-config-changes` flags, usernames with special characters, older and CRLF ini files, token normalisation, that a custom RetroAchievements server set in PPSSPP is left alone, that a second launch rewrites nothing, that the token and password never reach the log (also with the `debug` flag), and that a failed ini write (full SD card) leaves `ppsspp.ini` unchanged. It is a POSIX `sh` script so that it can also run under BusyBox; `tests/bats/ra.bats` runs it as part of `make test` and `make test-device`. To run it by hand: `SRC_PAK=<pak> sh tests/ra.sh` (its header lists `PLATFORM`, `OUT_DIR`, `TMP_ROOT`, `LAUNCH_SHELL`, `KEEP`). Set `TMP_ROOT=/mnt/SDCARD` to run the sandbox on the SD card's FAT file system instead of `/tmp`.
 
 What needs a person and a real account (not automated):
 
