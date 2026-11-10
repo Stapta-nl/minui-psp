@@ -110,8 +110,9 @@ set_cpu_settings() {
 # converted to BMP with the bundled jpg2bmp.
 #
 # Like minarch, the image only ever comes from a save state: the newest state saved during
-# this launch, with its slot written to <rom file>.txt. No save state, no preview (NextUI
-# then shows "No Preview"). Resume handling is not changed by this.
+# this launch, with its slot written to <rom file>.txt. No save state, or no complete
+# thumbnail for it, no preview (NextUI then shows "No Preview"). Resume handling is not
+# changed by this.
 STATE_DIR="$SHARED_USERDATA_PATH/PSP-ppsspp"
 PREVIEW_ROM=""
 # Touched at launch: states saved afterwards have a newer mtime. Only the shell's own
@@ -156,37 +157,48 @@ write_game_switcher_preview() {
     PREVIEW_ROM=""
     [ -n "$rom_path" ] && [ -n "$SHARED_USERDATA_PATH" ] || return 0
 
-    # Thumbnails saved since launch. Only the launched game ran, so they all belong to it;
-    # take the newest (undo thumbnails excluded).
-    thumb=""
-    for jpg in "$STATE_DIR"/*.jpg; do
-        case "$jpg" in *.undo.jpg) continue ;; esac
-        [ -f "$jpg" ] || continue
+    # The newest save state written since launch decides the slot. Only the launched game
+    # ran, so they all belong to it. PPSSPP names states <DISC_ID>_<DISC_VERSION>_<slot>.ppst;
+    # undo backups (<...>_<slot>.undo.ppst, <...>_undo.ppst) have no plain slot number.
+    state=""
+    slot=""
+    for st in "$STATE_DIR"/*.ppst; do
+        [ -f "$st" ] || continue
         # shellcheck disable=SC3013 # -nt is supported by BusyBox ash and dash
-        [ "$jpg" -nt "$STATE_MARKER" ] || continue
+        [ "$st" -nt "$STATE_MARKER" ] || continue
+        st_slot="$(basename "$st" .ppst)"
+        st_slot="${st_slot##*_}"
+        case "$st_slot" in "" | *[!0-9]*) continue ;; esac
         # shellcheck disable=SC3013
-        if [ -z "$thumb" ] || [ "$jpg" -nt "$thumb" ]; then
-            thumb="$jpg"
+        if [ -z "$state" ] || [ "$st" -nt "$state" ]; then
+            state="$st"
+            slot="$st_slot"
         fi
     done
-    [ -n "$thumb" ] || return 0
-
-    # PPSSPP names states <DISC_ID>_<DISC_VERSION>_<slot>.ppst/.jpg
-    slot="$(basename "$thumb" .jpg)"
-    slot="${slot##*_}"
-    case "$slot" in "" | *[!0-9]*) return 0 ;; esac
+    [ -n "$state" ] || return 0
 
     rom_file="$(basename "$rom_path")"
     minui_dir="$SHARED_USERDATA_PATH/.minui/$(game_switcher_emu_tag "$rom_path")"
     mkdir -p "$minui_dir" || return 0
+    preview="$minui_dir/$rom_file.$slot.bmp"
+
+    # PPSSPP takes the thumbnail a frame after the save and writes it on a background task
+    # that nothing waits for when it exits. Exiting right after saving (e.g. "Save state" and
+    # "Exit" on one hotkey) leaves it missing or cut off; jpg2bmp rejects a cut-off file. Then
+    # the preview is removed rather than left showing an older state ("No Preview" instead).
+    thumb="${state%.ppst}.jpg"
+    # shellcheck disable=SC3013
+    if [ -f "$thumb" ] && [ "$thumb" -nt "$STATE_MARKER" ] && install_preview "$thumb" "$preview"; then
+        echo "Game switcher preview from save state: $thumb"
+    else
+        rm -f "$preview"
+        echo "Game switcher preview: no complete thumbnail for $state (PPSSPP exited before writing it), showing No Preview"
+    fi
 
     # Image first, then the slot file that makes NextUI look for it.
-    if install_preview "$thumb" "$minui_dir/$rom_file.$slot.bmp"; then
-        echo "Game switcher preview from save state: $thumb"
-        printf '%s' "$slot" >"$minui_dir/$rom_file.txt.tmp" &&
-            mv -f "$minui_dir/$rom_file.txt.tmp" "$minui_dir/$rom_file.txt"
-        sync
-    fi
+    printf '%s' "$slot" >"$minui_dir/$rom_file.txt.tmp" &&
+        mv -f "$minui_dir/$rom_file.txt.tmp" "$minui_dir/$rom_file.txt"
+    sync
 }
 
 main() {

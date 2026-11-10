@@ -6,6 +6,11 @@
  * a file NextUI's game switcher can load: the stock TrimUI libSDL2_image is
  * built without JPEG support, while BMP is decoded by SDL itself.
  *
+ * A truncated input is rejected rather than converted. stb_image decodes a JPEG cut off
+ * mid-file without complaint and fills the missing part with garbage, and PPSSPP writes its
+ * thumbnails on a background task that is killed when it exits right after saving (e.g. a
+ * "Save state" and "Exit" hotkey on the same button), leaving exactly such a file.
+ *
  * Usage: jpg2bmp <input> <output.bmp>
  */
 #define STB_IMAGE_IMPLEMENTATION
@@ -22,9 +27,49 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+
+/* Thumbnails are a few KB; a larger file is not one. */
+#define MAX_FILE_SIZE (16 * 1024 * 1024)
 
 static void put16(unsigned char *p, uint16_t v) { p[0] = v & 0xff; p[1] = v >> 8; }
 static void put32(unsigned char *p, uint32_t v) { put16(p, v & 0xffff); put16(p + 2, v >> 16); }
+
+/* Reads the whole file. Returns NULL (and prints why) on error. */
+static unsigned char *read_file(const char *path, size_t *size) {
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		perror(path);
+		return NULL;
+	}
+	unsigned char *buf = malloc(MAX_FILE_SIZE + 1);
+	size_t len = buf ? fread(buf, 1, MAX_FILE_SIZE + 1, f) : 0;
+	int err = !buf || ferror(f);
+	fclose(f);
+	if (err || len == 0 || len > MAX_FILE_SIZE) {
+		fprintf(stderr, "jpg2bmp: cannot read %s (empty, too big or read error)\n", path);
+		free(buf);
+		return NULL;
+	}
+	*size = len;
+	return buf;
+}
+
+/* True when the file ends the way a complete JPEG or PNG does. A JPEG ends with the EOI
+ * marker (FF D9; trailing zero padding is allowed), a PNG with the IEND chunk. FF D9 cannot
+ * appear inside entropy-coded JPEG data (an FF there is always followed by 00), so a file
+ * cut off mid-scan never passes. Other types are left to stb_image to reject. */
+static int is_complete(const unsigned char *b, size_t len) {
+	static const unsigned char png_sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+	if (len >= 2 && b[0] == 0xff && b[1] == 0xd8) {
+		while (len > 2 && b[len - 1] == 0x00) len--;
+		return len >= 4 && b[len - 2] == 0xff && b[len - 1] == 0xd9;
+	}
+	if (len >= 8 && memcmp(b, png_sig, 8) == 0) {
+		return len >= 8 + 12 && memcmp(b + len - 8, "IEND", 4) == 0;
+	}
+	return 1;
+}
 
 int main(int argc, char **argv) {
 	if (argc != 3) {
@@ -32,23 +77,35 @@ int main(int argc, char **argv) {
 		return 2;
 	}
 
+	size_t len;
+	unsigned char *data = read_file(argv[1], &len);
+	if (!data) return 1;
+	if (!is_complete(data, len)) {
+		fprintf(stderr, "jpg2bmp: %s is incomplete (truncated, %lu bytes)\n", argv[1], (unsigned long)len);
+		free(data);
+		return 1;
+	}
+
 	int w, h, n;
 	/* Check the size before decoding, so a huge image is rejected without allocating it. */
-	if (!stbi_info(argv[1], &w, &h, &n)) {
+	if (!stbi_info_from_memory(data, (int)len, &w, &h, &n)) {
 		fprintf(stderr, "jpg2bmp: cannot read %s: %s\n", argv[1], stbi_failure_reason());
+		free(data);
 		return 1;
 	}
 	if (w <= 0 || h <= 0 || w > MAX_DIM || h > MAX_DIM) {
 		fprintf(stderr, "jpg2bmp: %s is %dx%d, larger than %dx%d\n", argv[1], w, h, MAX_DIM, MAX_DIM);
+		free(data);
 		return 1;
 	}
 
-	unsigned char *px = stbi_load(argv[1], &w, &h, &n, 3);
+	unsigned char *px = stbi_load_from_memory(data, (int)len, &w, &h, &n, 3);
+	free(data);
 	if (!px) {
 		fprintf(stderr, "jpg2bmp: cannot decode %s: %s\n", argv[1], stbi_failure_reason());
 		return 1;
 	}
-	if (w <= 0 || h <= 0 || w > MAX_DIM || h > MAX_DIM) { /* file changed since stbi_info */
+	if (w <= 0 || h <= 0 || w > MAX_DIM || h > MAX_DIM) { /* should not happen: same buffer */
 		fprintf(stderr, "jpg2bmp: %s has an unsupported size\n", argv[1]);
 		stbi_image_free(px);
 		return 1;

@@ -109,6 +109,9 @@ printf '#!/bin/sh\nexit 0\n' >"$PAK/bin/show_message"
 
 # Fake PPSSPP: records its args, then runs $STUB/actions:
 #   save <fixture> <prefix> <slot>   write <prefix>_<slot>.jpg (+ .ppst) into the state dir
+#   savecut <fixture> <prefix> <slot> same, but the .jpg is cut off (exit during its write)
+#   savenoshot <prefix> <slot>        only the .ppst (exit before the thumbnail was taken)
+#   loadundo <prefix>                 write <prefix>_undo.ppst (PPSSPP's load-undo backup)
 #   sleep <n>                         wait n seconds (lets mtimes differ)
 #   hang                              wait until killed (like a running emulator)
 cat >"$PAK/PPSSPP/PPSSPPSDL_$PLATFORM" <<'EOF'
@@ -123,6 +126,15 @@ while read -r action a b c; do
         printf 'state' >"$STATES/${b}_${c}.ppst"
         touch "$STUB/saved"
         ;;
+    savecut)
+        head -c 700 "$FIX/$a.jpg" >"$STATES/${b}_${c}.jpg"
+        printf 'state' >"$STATES/${b}_${c}.ppst"
+        ;;
+    savenoshot)
+        rm -f "$STATES/${a}_${b}.jpg"
+        printf 'state' >"$STATES/${a}_${b}.ppst"
+        ;;
+    loadundo) printf 'state' >"$STATES/${a}_undo.ppst" ;;
     sleep) sleep "$a" ;;
     hang) exec sleep 300 ;;
     esac
@@ -214,7 +226,30 @@ echo "  info: $(uname -m)"
 printf 'not an image' >"$T/junk.jpg"
 check "converts a JPEG" "$PAK/bin/jpg2bmp" "$FIX/thumb1.jpg" "$T/out.bmp"
 check "rejects junk with non-zero exit" sh -c "! '$PAK/bin/jpg2bmp' '$T/junk.jpg' '$T/junk.bmp' 2>/dev/null"
+head -c 700 "$FIX/thumb1.jpg" >"$T/cut.jpg"
+check "rejects a cut-off JPEG" sh -c "! '$PAK/bin/jpg2bmp' '$T/cut.jpg' '$T/cut.bmp' 2>/dev/null"
+check "writes no BMP for it" test ! -e "$T/cut.bmp"
 check "no tmp files left behind" sh -c "[ -z \"\$(find '$MINUI' -name '*.tmp')\" ]"
+end
+
+begin "9 save + exit on one hotkey: cut-off thumbnail -> No Preview, not garbage"
+run_game "Game C.iso" "save thumb1 ULUS10041_1.00 2" "sleep 2" "savecut thumb2 ULUS10041_1.00 2"
+check "slot file holds 2" contains "$MINUI/Game C.iso.txt" '^2$'
+check "no preview .2 (old image removed)" test ! -e "$(preview "Game C.iso" 2)"
+check "log explains it" contains "$OUT_DIR/$CASE.log" 'no complete thumbnail'
+check "no tmp files left behind" sh -c "[ -z \"\$(find '$MINUI' -name '*.tmp')\" ]"
+end
+
+begin "10 newest state has no thumbnail -> its slot, not an older slot's image"
+run_game "Game C.iso" "save thumb1 ULUS10041_1.00 4" "sleep 2" "savenoshot ULUS10041_1.00 6"
+check "slot file holds 6" contains "$MINUI/Game C.iso.txt" '^6$'
+check "no preview .6" test ! -e "$(preview "Game C.iso" 6)"
+end
+
+begin "11 load-undo backup (auto-load at start) is not taken for a slot"
+run_game "Game C.iso" "save thumb2 ULUS10041_1.00 7" "sleep 2" "loadundo ULUS10041_1.00"
+check "slot file holds 7" contains "$MINUI/Game C.iso.txt" '^7$'
+check "preview .7 is converted thumb2" same "$(preview "Game C.iso" 7)" "$(conv thumb2)"
 end
 
 echo

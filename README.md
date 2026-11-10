@@ -43,6 +43,10 @@ Like the built-in emulators, the image NextUI's Game Switcher shows for a game c
 
 No save state means no image: NextUI shows "No Preview". Opening and resuming a game works as before.
 
+PPSSPP writes the thumbnail on a background task a moment after the state itself, and does not wait for it when it exits. If you exit right after saving (for example with "Save state" and "Exit App" bound to the same hotkey), the thumbnail can be missing or cut off. The pak then removes the old image for that slot and NextUI shows "No Preview", rather than a garbled image or one from an older state. The save state itself is not affected. To get an image, wait about a second between saving and exiting.
+
+To see what happened on your device, run `ssh root@<device> sh -s < tests/device/diagnose-preview.sh` from a checkout of this repository (read-only): it lists the states and thumbnails, says which thumbnails are incomplete, and shows the preview files and the pak log.
+
 ## PPSSPP Configuration
 
 The PPSSPP configuration directory is located at `/Emus/<PLATFORM>/PSP.pak/PPSSPP/.config/ppsspp/`. This directory contains:
