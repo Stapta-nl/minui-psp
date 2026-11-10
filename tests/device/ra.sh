@@ -198,12 +198,13 @@ host_unchanged() {
     [ "$(ach_section "$T/shipped.ini" | grep '^AchievementsHost')" = \
         "$(grep '^AchievementsHost' "$STUB/ach.ini")" ]
 }
-# Sets AchievementsHost in ppsspp.ini as PPSSPP would: replaces the line, or adds it.
+# Sets AchievementsHost in [Achievements] of ppsspp.ini, as if set by hand in PPSSPP:
+# drops any AchievementsHost line there (wherever it is) and adds one after the username.
 set_host_by_hand() {
     awk -v h="$1" '{ l = $0; sub(/\r$/, "", l) }
         l ~ /^[ \t]*\[/ { on = (l == "[Achievements]") }
-        on && l ~ /^AchievementsHost = / { print "AchievementsHost = " h; done = 1; next }
-        on && !done && l ~ /^AchievementsUserName = / { print; print "AchievementsHost = " h; done = 1; next }
+        on && l ~ /^AchievementsHost =/ { next }
+        on && l ~ /^AchievementsUserName = / { print; print "AchievementsHost = " h; next }
         1' "$INI" >"$INI.x" && mv "$INI.x" "$INI"
 }
 ach_count() { [ "$(grep -c "^$1 = " "$STUB/ach.ini")" = "$2" ]; }
@@ -387,7 +388,8 @@ check_enabled Player1 False
 check "AchievementsHost as in the shipped ini" host_unchanged
 set_host_by_hand "http://hand.example"
 run_game
-check "host set by hand in PPSSPP is kept" ach_is AchievementsHost "http://hand.example"
+check "one AchievementsHost line" ach_count AchievementsHost 1
+check "host set by hand in PPSSPP has its value" ach_is AchievementsHost "http://hand.example"
 settings raEnable=0
 run_game
 check "kept when disabling too" ach_is AchievementsHost "http://hand.example"
