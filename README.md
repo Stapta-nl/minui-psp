@@ -30,16 +30,38 @@ Note: The `<PLATFORM>` folder name is based on the name of your device. For exam
 
 ## Deep Sleep & Shutdown
 
-Deep sleep is supported on compatible devices. Click the power button to enter deep sleep. Click again to resume the game. To shut down, hold the power button for 2 seconds. **Note:** Shutdown does not save or resume the game and any unsaved progress will be lost. For more information and issues, see [MinUI Power Control](https://github.com/ben16w/minui-power-control).
+Deep sleep is supported on compatible devices. Click the power button to enter deep sleep. Click again to resume the game. To shut down, hold the power button for 2 seconds. For more information and issues, see [MinUI Power Control](https://github.com/ben16w/minui-power-control).
+
+If the device is shut down with the power button (hold for 2 seconds) while a game is running, it boots straight back into that game the next time it is turned on, the same way NextUI/MinUI auto-resume works for built-in emulators. Quitting the game to the menu as usual (via the PPSSPP menu) does not trigger this, and neither does a crash, a forced power-off of a frozen device or a flat battery: like the built-in emulators, the game is only relaunched after a normal shutdown.
+
+**What is resumed** depends on two PPSSPP settings (PPSSPP Settings > System > Save states):
+
+- **Save state on exit** (`SaveStateOnExit` in the `[General]` section of `ppsspp.ini`): PPSSPP saves a state (and its thumbnail) whenever the game ends: the Exit hotkey, Exit in the pause menu, and also when the power button shuts the device down. The slot is the auto-load slot if "Auto load savestate" names one, otherwise the current save state slot. This needs the PPSSPP build shipped with this pak.
+- **Auto load savestate** (`AutoLoadSaveState`, `2` = load the newest state): PPSSPP loads that state when the game starts, after a power-off resume and also when you open the game from the menu.
+
+New installs of the pak have both on (`SaveStateOnExit = True`, `AutoLoadSaveState = 2`), so after a power-off you continue at the exact moment you turned the device off. Your existing `ppsspp.ini` is kept on updates and the pak does not change these settings, so on an existing install turn "Save state on exit" on in PPSSPP's settings (or add `SaveStateOnExit = True` below `AutoLoadSaveState` in `/Emus/<PLATFORM>/PSP.pak/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini`). Both settings can also be changed per game in a game-specific PPSSPP config.
+
+With "Save state on exit" off, a power-off does not save a new state: the game is still relaunched, and PPSSPP loads the newest state you saved yourself (if "Auto load savestate" is on), so progress since that state or your last in-game save is lost. With "Auto load savestate" off, the game is relaunched from its start.
+
+Note that "Save state on exit" overwrites the slot it uses each time you leave a game. Use another slot for states you want to keep.
+
+**How it works:** `bin/poweroff` is a small shim that the power button's shutdown script runs instead of the system `poweroff` (`launch.sh` puts the pak's `bin` folder first in `PATH`). The shutdown script first tells PPSSPP to quit (SIGTERM), which makes PPSSPP save its state (it quits after at most 5 seconds, saved or not), then runs `poweroff`. The shim tells `launch.sh` that a power-off is requested and waits up to 15 seconds for the answer. Once PPSSPP has exited, `launch.sh` writes the auto-resume marker, then the Game Switcher image, and then tells the shim to go ahead, so all of it is on the card before the device turns off. If PPSSPP is still running 8 seconds after the shim's request (it should quit within about 7 seconds of the SIGTERM), `launch.sh` arms the marker and releases the shim anyway, and the Game Switcher image is skipped when the marker step was slow. The shim never waits when no PSP game is running, and then hands over to `/sbin/poweroff`. Files used in `/tmp` (all temporary, cleared on every boot):
+
+- `psp-poweroff-req`: created by the shim, a power-off was requested.
+- `psp-poweroff-ok`: created by `launch.sh`, ready to power off.
+- `psp-pak.pid`: pid of `launch.sh`, so the shim stops waiting if it is gone.
+- `psp-poweroff-shim.log`: what the shim did.
+
+**Limits:** `launch.sh` never returns to the menu while a power-off is pending; if the device has not turned off after a minute, the auto-resume marker is removed and you are back at the menu. The pak never loads a state itself (it does not pass `--state` to PPSSPP); it only relaunches the game. The resume is armed only by the power button; sleep, a crash or a dead battery do not resume. Only games located on the SD card are resumed. The pak log (`/.userdata/<PLATFORM>/logs/PSP.txt`) shows the global `SaveStateOnExit`/`AutoLoadSaveState` values at each launch.
 
 ## Saves & States
 
-- Save states are stored in the `/.userdata/shared/PSP-ppsspp/` directory.
+- Save states are stored in the `/.userdata/shared/PSP-ppsspp/` directory, named `<game ID>_<slot>.ppst` with a `.jpg` thumbnail. The state saved on exit is a normal save state in one of these slots.
 - Game saves are stored in the `/Saves/PSP/` directory.
 
 ## Game Switcher Image
 
-Like the built-in emulators, the image NextUI's Game Switcher shows for a game comes from a save state. When PPSSPP exits (or the device powers off while it runs), the pak takes the newest save state written during that session, converts its thumbnail with the bundled `jpg2bmp` and writes it to `/.userdata/shared/.minui/PSP/<rom file>.<slot>.bmp`, together with the slot number in `<rom file>.txt`.
+Like the built-in emulators, the image NextUI's Game Switcher shows for a game comes from a save state. When PPSSPP exits (or the device powers off while it runs), the pak takes the newest save state written during that session (including the state saved on exit), converts its thumbnail with the bundled `jpg2bmp` and writes it to `/.userdata/shared/.minui/PSP/<rom file>.<slot>.bmp`, together with the slot number in `<rom file>.txt`.
 
 No save state means no image: NextUI shows "No Preview". Opening and resuming a game works as before.
 
