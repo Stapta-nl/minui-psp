@@ -192,6 +192,20 @@ ach() {
         END { exit !f }' "$STUB/ach.ini"
 }
 ach_is() { v="$(ach "$1")" && [ "$v" = "$2" ]; }
+# AchievementsHost lines in the [Achievements] section of the shipped ini and of what
+# PPSSPP saw must be identical (both absent, or the same lines).
+host_unchanged() {
+    [ "$(ach_section "$T/shipped.ini" | grep '^AchievementsHost')" = \
+        "$(grep '^AchievementsHost' "$STUB/ach.ini")" ]
+}
+# Sets AchievementsHost in ppsspp.ini as PPSSPP would: replaces the line, or adds it.
+set_host_by_hand() {
+    awk -v h="$1" '{ l = $0; sub(/\r$/, "", l) }
+        l ~ /^[ \t]*\[/ { on = (l == "[Achievements]") }
+        on && l ~ /^AchievementsHost = / { print "AchievementsHost = " h; done = 1; next }
+        on && !done && l ~ /^AchievementsUserName = / { print; print "AchievementsHost = " h; done = 1; next }
+        1' "$INI" >"$INI.x" && mv "$INI.x" "$INI"
+}
 ach_count() { [ "$(grep -c "^$1 = " "$STUB/ach.ini")" = "$2" ]; }
 token_is() { [ -f "$STUB/token" ] && printf '%s' "$1" | cmp -s - "$STUB/token"; }
 token_absent() { [ ! -f "$STUB/token" ] && [ ! -f "$TOKEN" ]; }
@@ -368,8 +382,10 @@ fresh
 settings
 run_game
 check_enabled Player1 False
-check "no AchievementsHost added" lacks "$STUB/ach.ini" '^AchievementsHost'
-awk '/^AchievementsUserName = / { print; print "AchievementsHost = http://hand.example"; next } 1' "$INI" >"$INI.x" && mv "$INI.x" "$INI"
+# The shipped ini may or may not have the key (PPSSPP writes "AchievementsHost =" once it
+# has saved the ini, e.g. in a pak installed on a device): it must be as it was.
+check "AchievementsHost as in the shipped ini" host_unchanged
+set_host_by_hand "http://hand.example"
 run_game
 check "host set by hand in PPSSPP is kept" ach_is AchievementsHost "http://hand.example"
 settings raEnable=0
