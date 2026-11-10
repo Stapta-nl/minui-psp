@@ -18,6 +18,9 @@
 # ($SSH_CONNECT_TIMEOUT, default 10 s). The bundle is streamed through ssh instead of scp,
 # which needs an sftp server that small devices (dropbear) often lack.
 #
+# The pak is expected in Emus/<platform>/<PAK_NAME>.pak; PAK_NAME defaults to "name" in
+# pak.json (PSP) and is passed to the device.
+#
 # Forwarded to the device when set: SDCARD_PATH ROM_DIR ROM PSP_KEYS EXIT_KEYS BOOT_WAIT
 # UI_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT.
 
@@ -57,26 +60,77 @@ export TEST_STARTED
 export TEST_TARGET_INFO="$platform: $host_var is set (the address is not recorded)"
 export PLATFORM="$platform"
 
-# Replaces the device address in text that goes into the bundle.
+ssh_base=(ssh -o BatchMode=yes -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT:-10}" -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
+read -r -a ssh_extra <<<"$opts"
+rssh() { "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "$@"; }
+# Quotes a value for the remote shell.
+q() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+# Escapes a string for use in an extended regular expression.
+re_escape() { printf '%s' "$1" | sed 's/[][\.*^$|/(){}+?]/\\&/g'; }
+
+# The names redact() must hide: <PLATFORM>_HOST (user@host or an ssh_config alias) and what
+# ssh resolves it to (ssh -G connects to nothing): the real HostName and the user.
+redact_literals=()
+add_redact_literal() { [ -n "$1" ] && redact_literals+=("$1"); }
+add_redact_literal "$host"
+add_redact_literal "${host#*@}"
+if command -v ssh >/dev/null 2>&1; then
+    while read -r key value; do
+        case "$key" in
+        hostname | user) add_redact_literal "$value" ;;
+        esac
+    done < <("${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} -G "$host" 2>/dev/null </dev/null)
+fi
+
+# Masks the device address in text that goes into the bundle (stdin to stdout): the literal
+# names above, then, whatever their source, ssh's "connect to host X port N" style text and any
+# IPv4 or IPv6 address. Use it for everything in the bundle that came from ssh.
 redact() {
-    local pattern
-    pattern="$(printf '%s' "${host#*@}" | sed 's/[][\.*^$|/]/\\&/g')"
-    sed "s|$pattern|<device>|g"
+    local args=() lit
+    for lit in ${redact_literals[@]+"${redact_literals[@]}"}; do
+        args+=(-e "s|$(re_escape "$lit")|<device>|g")
+    done
+    sed -E ${args[@]+"${args[@]}"} \
+        -e "s/(connect to host )[^ ]+( port)/\1<device>\2/g" \
+        -e "s/(Could not resolve hostname )[^:]+:/\1<device>:/g" \
+        -e "s/(Permanently added ')[^']*'/\1<device>'/g" \
+        -e 's/[0-9]{1,3}(\.[0-9]{1,3}){3}/<ip>/g' \
+        -e 's/(^|[^0-9A-Fa-f:])[0-9A-Fa-f:]*::[0-9A-Fa-f:]*/\1<ip>/g' \
+        -e 's/(^|[^0-9A-Fa-f:])([0-9A-Fa-f]{1,4}:){5,7}[0-9A-Fa-f]{1,4}/\1<ip>/g'
 }
 
 remote_tmp=""
+run_pid=""
+finishing=0
+# Best-effort removal of the remote temp dir: BatchMode, a connect timeout and an overall
+# timeout (CLEANUP_TIMEOUT, default 20 s), so an interrupted run never hangs on it.
 cleanup() {
     case "$remote_tmp" in
-    /tmp/psp-tests.*) rssh "rm -rf '$remote_tmp'" >/dev/null 2>&1 ;;
+    /tmp/psp-tests.*)
+        if command -v timeout >/dev/null 2>&1; then
+            timeout -k 2 "${CLEANUP_TIMEOUT:-20}" "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "rm -rf '$remote_tmp'" >/dev/null 2>&1 </dev/null
+        else
+            rssh "rm -rf '$remote_tmp'" >/dev/null 2>&1 </dev/null
+        fi
+        ;;
     esac
 }
 
-# finish <status> [message]: writes the debug bundle and exits.
+# finish <status> [message]: removes the remote temp dir, writes the debug bundle and exits.
+# It runs once: later signals are ignored and the EXIT trap does nothing after it.
 finish() {
     local status="$1"
+    [ "$finishing" = 0 ] || exit "$status"
+    finishing=1
+    trap '' INT TERM HUP
+    trap - EXIT
     if [ -n "${2:-}" ]; then
         printf '%s\n' "$2" | redact >"$stage/error.txt"
         printf 'ERROR %s: %s\n' "$platform" "$2" | redact >&2
+    fi
+    if [ -f "$stage/console.log" ]; then
+        redact <"$stage/console.log" >"$stage/console.log.tmp" && mv "$stage/console.log.tmp" "$stage/console.log"
     fi
     TEST_FINISHED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     export TEST_FINISHED
@@ -85,11 +139,43 @@ finish() {
     exit "$status"
 }
 
-ssh_base=(ssh -o BatchMode=yes -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT:-10}" -o ServerAliveInterval=15 -o ServerAliveCountMax=4)
-read -r -a ssh_extra <<<"$opts"
-rssh() { "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "$@"; }
-# Quotes a value for the remote shell.
-q() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+# Stops the background ssh pipeline of a step (see run_step).
+# shellcheck disable=SC2317 # only called from the traps
+stop_run() {
+    [ -n "$run_pid" ] || return 0
+    command -v pkill >/dev/null 2>&1 && pkill -TERM -P "$run_pid" 2>/dev/null
+    kill -TERM "$run_pid" 2>/dev/null
+    run_pid=""
+}
+
+# on_signal <name> <exit status>: a Ctrl-C or kill still cleans up the device and writes the
+# bundle, which is marked as interrupted.
+# shellcheck disable=SC2317 # only called from the traps
+on_signal() {
+    trap '' INT TERM HUP
+    stop_run
+    printf '%s\n' "$1" >"$stage/interrupted.txt"
+    finish "$2" "the run was interrupted ($1)"
+}
+trap 'on_signal SIGINT 130' INT
+trap 'on_signal SIGTERM 143' TERM
+trap 'on_signal SIGHUP 129' HUP
+# Any other exit (an unexpected failure) is still cleaned up and bundled.
+trap 'finish "$?" "the run ended unexpectedly"' EXIT
+
+# run_step <stdin file> <command...>: runs a long ssh step in the background and waits for it,
+# because bash only runs a trap after a foreground command ends, which would delay a kill of
+# this script until the tests are over.
+run_step() {
+    local in="$1"
+    shift
+    "$@" <"$in" &
+    run_pid=$!
+    local rc=0
+    wait "$run_pid" || rc=$?
+    run_pid=""
+    return "$rc"
+}
 
 command -v ssh >/dev/null 2>&1 || finish 2 "ssh is not installed on this machine"
 [ -f dist/psp-device-tests.tar.gz ] || finish 2 "dist/psp-device-tests.tar.gz is missing (make test-bundle)"
@@ -109,7 +195,7 @@ remote_tmp="$(rssh 'mktemp -d /tmp/psp-tests.XXXXXX' 2>&1 </dev/null)" || finish
 case "$remote_tmp" in /tmp/psp-tests.*) ;; *) finish 3 "unexpected temp dir from the device: $remote_tmp" ;; esac
 
 echo "== $platform: copying the test bundle"
-rssh "cd '$remote_tmp' && gzip -dc | tar -xf -" <dist/psp-device-tests.tar.gz ||
+run_step dist/psp-device-tests.tar.gz rssh "cd '$remote_tmp' && gzip -dc | tar -xf -" ||
     finish 3 "copying the test bundle to the device failed"
 
 # Tests tagged platform:<name> run only on that platform; untagged device tests run everywhere.
@@ -121,7 +207,9 @@ while IFS= read -r p; do
 done < <(jq -r '.platforms[]' pak.json)
 
 sd="${SDCARD_PATH:-/mnt/SDCARD}"
-assignments="PLATFORM=$(q "$platform") SRC_PAK=$(q "$sd/Emus/$platform/PSP.pak") RESULT_DIR=$(q "$remote_tmp/result") DEVICE_COLLECT=1"
+pak_name="${PAK_NAME:-$(jq -r '.name // empty' pak.json 2>/dev/null)}"
+pak_name="${pak_name:-PSP}"
+assignments="PLATFORM=$(q "$platform") PAK_NAME=$(q "$pak_name") SRC_PAK=$(q "$sd/Emus/$platform/$pak_name.pak") RESULT_DIR=$(q "$remote_tmp/result") DEVICE_COLLECT=1"
 for v in SDCARD_PATH ROM_DIR ROM PSP_KEYS EXIT_KEYS BOOT_WAIT UI_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT; do
     if [ -n "${!v+x}" ]; then
         assignments="$assignments $v=$(q "${!v}")"
@@ -129,12 +217,21 @@ for v in SDCARD_PATH ROM_DIR ROM PSP_KEYS EXIT_KEYS BOOT_WAIT UI_WAIT KEY_GAP CH
 done
 
 echo "== $platform: running the device tests"
-rssh "cd '$remote_tmp' && $assignments bash tests/run-bats.sh --filter-tags $(q "$filter_platform") --filter-tags $(q "$filter_generic")" </dev/null |
-    tee "$stage/console.log"
-rc=${PIPESTATUS[0]}
+# shellcheck disable=SC2317 # called through run_step
+run_tests() {
+    rssh "cd '$remote_tmp' && $assignments bash tests/run-bats.sh --filter-tags $(q "$filter_platform") --filter-tags $(q "$filter_generic")" </dev/null |
+        tee "$stage/console.log"
+    return "${PIPESTATUS[0]}"
+}
+run_step /dev/null run_tests
+rc=$?
 
+# shellcheck disable=SC2317 # called through run_step
+fetch_results() {
+    rssh "cd '$remote_tmp/result' && tar -cf - ." </dev/null | tar -xf - -C "$stage"
+}
 echo "== $platform: fetching results"
-if ! rssh "cd '$remote_tmp/result' && tar -cf - ." </dev/null | tar -xf - -C "$stage"; then
+if ! run_step /dev/null fetch_results; then
     finish 3 "fetching the results from the device failed (exit status of the tests: $rc)"
 fi
 [ "$rc" != 255 ] || finish 3 "the ssh connection broke while the tests ran"

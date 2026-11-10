@@ -6,6 +6,9 @@
 #   <target>  "host" or a platform name; the run's files are in dist/test-out/<target>/
 # Environment: TEST_STARTED, TEST_FINISHED, MAKE_VARS, TEST_TARGET_INFO (see collectors/host.list)
 #
+# An interrupted run (run-host.sh, run-device.sh) leaves interrupted.txt in the stage dir;
+# the summary then says INTERRUPTED.
+#
 # Adds host/ (collectors/host.list) and summary.md to dist/test-out/<target>/. The summary is
 # also what CI appends to the job summary. A device's address is never written to the bundle.
 
@@ -26,7 +29,13 @@ if [ -f "$tap" ]; then
     failed="$(grep -c '^not ok ' "$tap" | tr -d ' ')"
     passed=$((passed - skipped))
 fi
-if [ "$status" = 0 ]; then verdict="PASSED"; else verdict="FAILED"; fi
+if [ -s "$stage/interrupted.txt" ]; then
+    verdict="INTERRUPTED"
+elif [ "$status" = 0 ]; then
+    verdict="PASSED"
+else
+    verdict="FAILED"
+fi
 sha="$(head -n 1 "$stage/host/git-sha.txt" 2>/dev/null)"
 dirty=""
 [ -s "$stage/host/git-dirty.txt" ] && dirty=" (uncommitted changes)"
@@ -42,6 +51,7 @@ bundle="dist/test-report-$target-$ts.tar.gz"
     echo "| Platform | ${PLATFORM:-$(jq -r '.platforms[0]' pak.json 2>/dev/null) (default)} |"
     echo "| Result | $passed passed, $failed failed, $skipped skipped |"
     echo "| Exit status | $status |"
+    [ -s "$stage/interrupted.txt" ] && echo "| Interrupted by | $(head -n 1 "$stage/interrupted.txt") |"
     echo "| Commit | ${sha:-unknown}$dirty |"
     echo "| Started | ${TEST_STARTED:-unknown} |"
     echo "| Finished | ${TEST_FINISHED:-unknown} |"
@@ -90,6 +100,10 @@ bundle="dist/test-report-$target-$ts.tar.gz"
     fi
 } >"$stage/summary.md"
 
-tar -czf "$bundle" -C dist/test-out "$target" || exit 2
+# Written under a temporary name, so an interrupt never leaves a truncated bundle behind.
+if ! tar -czf "$bundle.part" -C dist/test-out "$target" || ! mv "$bundle.part" "$bundle"; then
+    rm -f "$bundle.part"
+    exit 2
+fi
 echo "debug bundle: $bundle"
 echo "summary:      $stage/summary.md"
