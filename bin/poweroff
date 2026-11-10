@@ -19,13 +19,13 @@
 #   PSP_POWEROFF_TMP      directory of the files above   (default /tmp)
 #   PSP_POWEROFF_REAL     the real poweroff               (default /sbin/poweroff)
 #   PSP_POWEROFF_BUSYBOX  busybox fallback                (default /bin/busybox)
-#   PSP_POWEROFF_TIMEOUT  seconds to wait at most         (default 10)
+#   PSP_POWEROFF_TIMEOUT  seconds to wait at most         (default 15)
 
 TMP_DIR="${PSP_POWEROFF_TMP:-/tmp}"
 REAL_POWEROFF="${PSP_POWEROFF_REAL:-/sbin/poweroff}"
 BUSYBOX="${PSP_POWEROFF_BUSYBOX:-/bin/busybox}"
-TIMEOUT="${PSP_POWEROFF_TIMEOUT:-10}"
-case "$TIMEOUT" in "" | *[!0-9]*) TIMEOUT=10 ;; esac
+TIMEOUT="${PSP_POWEROFF_TIMEOUT:-15}"
+case "$TIMEOUT" in "" | *[!0-9]*) TIMEOUT=15 ;; esac
 
 REQ_FILE="$TMP_DIR/psp-poweroff-req"
 OK_FILE="$TMP_DIR/psp-poweroff-ok"

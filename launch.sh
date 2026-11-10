@@ -141,7 +141,7 @@ set_auto_resume() {
 
 # Power-off handshake with bin/poweroff (see that script). The power button's
 # shutdown script runs `poweroff` from our PATH; the shim creates
-# $POWEROFF_REQ and waits (at most ~10 s) for us to create $POWEROFF_OK, which
+# $POWEROFF_REQ and waits (at most ~15 s) for us to create $POWEROFF_OK, which
 # we do only once the auto-resume marker is on disk. $PAK_PID_FILE tells the
 # shim that we are alive.
 POWEROFF_REQ="/tmp/psp-poweroff-req"
