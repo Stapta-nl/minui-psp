@@ -34,12 +34,30 @@ Deep sleep is supported on compatible devices. Click the power button to enter d
 
 If the device is shut down with the power button (hold for 2 seconds) while a game is running, it boots straight back into that game the next time it is turned on, the same way NextUI/MinUI auto-resume works for built-in emulators. Quitting the game to the menu as usual (via the PPSSPP menu) does not trigger this, and neither does a crash, a forced power-off of a frozen device or a flat battery: like the built-in emulators, the game is only resumed after a normal shutdown.
 
-**Note:** Shutdown does not create a new save state. On resume, PPSSPP loads the most recent save state of the game (`AutoLoadSaveState`), so any progress since your last save state or in-game save will be lost. Make a save state before shutting down if you want to continue exactly where you left off.
+**What is resumed:**
+
+- With a PPSSPP build that can save a state when it is stopped (it contains the `PPSSPP_AUTORESUME_STATE` support; the pak detects this by itself), the exact moment of the power-off is saved to `/.userdata/shared/PSP-ppsspp/autoresume/<rom file>.ppst` and loaded again on the next boot. This file is only used for that one auto-resume: a normal start from the menu or Game Switcher never loads it, and it is deleted when the game is quit normally. If saving fails or takes too long, the game is still resumed, but from its newest regular save state.
+- With a PPSSPP build without that support, shutdown does not create a new save state. PPSSPP loads the most recent save state of the game (`AutoLoadSaveState`), so progress since your last save state or in-game save is lost. Make a save state before shutting down if you want to continue exactly where you left off.
+
+**How it works:** `bin/poweroff` is a small shim that the power button's shutdown script runs instead of the system `poweroff` (`launch.sh` puts the pak's `bin` folder first in `PATH`). It tells `launch.sh` that a power-off is requested and waits up to 10 seconds for the answer, so the auto-resume marker (and the state, if supported) is on the card before the device turns off. It never waits when no PSP game is running, and then hands over to `/sbin/poweroff`. Files used in `/tmp` (all temporary, cleared on every boot):
+
+- `psp-poweroff-req`: created by the shim, a power-off was requested.
+- `psp-poweroff-ok`: created by `launch.sh`, ready to power off.
+- `psp-pak.pid`: pid of `launch.sh`, so the shim stops waiting if it is gone.
+- `psp-poweroff-shim.log`: what the shim did.
+
+**Limits:** `launch.sh` never returns to the menu while a power-off is pending; if the device has not turned off after a minute, the auto-resume marker is removed and you are back at the menu. Only the pak's own files are touched, never your regular save states or slots. The resume is armed only by the power button; sleep, a crash or a dead battery do not resume. Only games located on the SD card are resumed.
 
 ## Saves & States
 
 - Save states are stored in the `/.userdata/shared/PSP-ppsspp/` directory.
 - Game saves are stored in the `/Saves/PSP/` directory.
+
+## Game Switcher Image
+
+Like the built-in emulators, the image NextUI's Game Switcher shows for a game comes from a save state. When PPSSPP exits (or the device powers off while it runs), the pak takes the newest save state written during that session, converts its thumbnail with the bundled `jpg2bmp` and writes it to `/.userdata/shared/.minui/PSP/<rom file>.<slot>.bmp`, together with the slot number in `<rom file>.txt`.
+
+No save state means no image: NextUI shows "No Preview". Opening and resuming a game works as before.
 
 ## PPSSPP Configuration
 
@@ -52,7 +70,23 @@ Note: The `<PLATFORM>` folder name is based on your device (e.g., `tg5040` for T
 
 ## Aspect Ratio
 
-The pak auto-sets the Aspect Ratio based on the device model. On Trimui Brick it uses `0.848000`, on other supported devices it uses `1.000000`. To disable automatic configuration changes, create a file named `no-config-changes` in `/.userdata/<PLATFORM>/PSP-ppsspp/`. This will prevent the pak from modifying aspect ratio and other configuration settings.
+The pak auto-sets the Aspect Ratio based on the device model. On Trimui Brick it uses `0.848000`, on other supported devices it uses `1.000000`. To disable automatic configuration changes, create a file named `no-config-changes` in `/.userdata/<PLATFORM>/PSP-ppsspp/`. This will prevent the pak from modifying aspect ratio and other configuration settings. If the aspect ratio or graphics backend setting is missing from the `[Graphics]` section of `ppsspp.ini`, the pak adds it.
+
+## RetroAchievements
+
+On NextUI, the pak copies the RetroAchievements settings from the NextUI Settings menu into PPSSPP every time a game is launched:
+
+- **Enabled and logged in** in NextUI: RetroAchievements are enabled in PPSSPP with the same username and login token. No separate login inside PPSSPP is needed. PPSSPP's Hardcore Mode is turned off, like in NextUI (see below).
+- **Disabled, or not logged in** in NextUI: RetroAchievements are disabled in PPSSPP, and the PPSSPP username and login token are removed.
+- **MinUI** (no NextUI settings file), or a NextUI version without RetroAchievements settings: PPSSPP's own RetroAchievements settings are left untouched.
+
+Notes:
+
+- NextUI's offline RetroAchievements mode (caching and replaying unlocks when Wi-Fi returns) is built into NextUI's own emulator frontend and is not available to standalone PPSSPP. PPSSPP connects to retroachievements.org directly, so Wi-Fi must be connected when the game starts. If the login fails at startup (no Wi-Fi), achievements stay off for that session: PPSSPP only retries the login from its game browser, not from the in-game menu that opens with the Menu button, and this pak never shows the game browser. If Wi-Fi drops during play, PPSSPP keeps retrying unlocks in the background, but unlocks not yet sent when you quit the game are lost.
+- Hardcore Mode: NextUI has a Hardcore Mode setting, but it is hidden from its Settings menu and off, so NextUI always plays in softcore. PPSSPP has Hardcore Mode on by default, so the pak turns it off to match. If a NextUI version shows the setting, the pak follows it. In Hardcore Mode, PPSSPP disables save states (unless "save states in hardcore mode" was turned on inside PPSSPP).
+- Per-game PPSSPP settings (game-specific configs created in PPSSPP) can override the RetroAchievements on/off and Hardcore Mode settings for that game; the pak only changes the global `ppsspp.ini`.
+- If PPSSPP reports the login token as expired, it deletes it; log in again in NextUI Settings > RetroAchievements to get a new one.
+- To manage RetroAchievements inside PPSSPP yourself, create a file named `no-ra-sync` in `/.userdata/<PLATFORM>/PSP-ppsspp/`. The `no-config-changes` file also disables this sync.
 
 ## Skip Buffer Effects
 
@@ -71,3 +105,46 @@ This option can be found under Settings > Graphics > Speed Hacks > Skip buffer e
 This project uses PPSSPP, which is open-source software. Please refer to the original PPSSPP [LICENSE.TXT](PPSSPP/LICENSE.TXT) file for more details.
 
 The project code which is not part of PPSSPP is licensed under the [MIT License](https://opensource.org/licenses/MIT). See the project [LICENSE](LICENSE) file for more details.
+
+## Testing the Game Switcher image on a device
+
+`tests/device/run.sh` runs the real `launch.sh` and `bin/jpg2bmp` against a stub PPSSPP in a throw-away SD tree, and checks the preview image and slot file (no save state, one state, the newest slot wins, other games unaffected), that the resume hand-off file is removed, and the SIGTERM (power-off) path. Over SSH:
+
+```sh
+scp -r tests root@<device>:/mnt/SDCARD/Emus/tg5040/PSP.pak/
+ssh root@<device> 'sh /mnt/SDCARD/Emus/tg5040/PSP.pak/tests/device/run.sh'
+```
+
+It prints PASS/FAIL per test and exits non-zero on failure. Logs are kept in `/tmp/psp-preview-test-out`. The real SD card is not modified.
+
+### Fully automated end-to-end test
+
+`tests/device/e2e.sh` drives the real NextUI and PPSSPP on a TrimUI device with no one at the buttons: it injects button presses through the `TRIMUI Player1` evdev device, launches the first game in `Roms/*(PSP)` through NextUI's `/tmp/next` hand-off, and takes screenshots with the [Screenshot Monitor](https://github.com/josegonzalez/minui-screenshot-monitor-pak) pak's `bin/screenshot`. Screenshots are judged by the bundled `pngcolor` helper.
+
+Requirements: root over SSH, this pak and the Screenshot Monitor pak installed, and a game in `Roms/*(PSP)`. CI publishes the `psp-device-tests` artifact (`psp-device-tests.tar.gz`) with the script, fixtures and the aarch64 helper:
+
+```sh
+scp psp-device-tests.tar.gz root@<device>:/tmp/
+ssh root@<device> 'cd /tmp && tar xzf psp-device-tests.tar.gz && sh tests/device/e2e.sh'
+```
+
+The script temporarily changes the recents and resume files of the test game and restores them on exit (its backup is kept on the SD card, so a run that was cut short is restored at the start of the next one). It restarts NextUI with SIGKILL, never SIGTERM, because NextUI treats SIGTERM as a power-off request. It expects these PPSSPP hotkeys: select+R1 saves a state, select+right moves to the next slot, select+start exits. See the header of `e2e.sh` for the settings (`PSP_KEYS`, `EXIT_KEYS`, wait times).
+
+## Testing RetroAchievements on a device
+
+`tests/device/ra.sh` runs the real `launch.sh` against a stub PPSSPP in a throw-away SD tree with a NextUI-style `minuisettings.txt`, and checks what PPSSPP would see at start-up (the `[Achievements]` section of `ppsspp.ini` and the token file): enabled in softcore and hardcore, disabled, not logged in, MinUI and older NextUI (PPSSPP left alone), the `no-ra-sync` and `no-config-changes` flags, usernames with special characters, older and CRLF ini files, token normalisation, that a custom RetroAchievements server set in PPSSPP is left alone, that a second launch rewrites nothing, that the token and password never reach the log (also with the `debug` flag), and that a failed ini write (full SD card) leaves `ppsspp.ini` unchanged. Over SSH:
+
+```sh
+scp -r tests root@<device>:/mnt/SDCARD/Emus/tg5040/PSP.pak/
+ssh root@<device> 'sh /mnt/SDCARD/Emus/tg5040/PSP.pak/tests/device/ra.sh'
+```
+
+Logs are kept in `/tmp/psp-ra-test-out`. Set `TMP_ROOT=/mnt/SDCARD` to run the sandbox on the SD card's FAT file system instead of `/tmp`. The script is also in the `psp-device-tests` bundle.
+
+What needs a person and a real account (not automated):
+
+1. **Login via NextUI only:** log out inside PPSSPP (or delete `PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp_retroachievements.dat`), log in under NextUI Settings > RetroAchievements, start a PSP game with Wi-Fi on. PPSSPP shows the RetroAchievements login message and the game's achievement count; the pak log (`.userdata/<PLATFORM>/logs/PSP.txt`) says `RetroAchievements: enabling for user ...`.
+2. **Unlock:** earn an easy achievement. The unlock pop-up appears in PPSSPP and the unlock shows on retroachievements.org.
+3. **Softcore:** after a launch, PPSSPP's Hardcore Mode is off, save states work, and the game shows as softcore on the site.
+4. **Disable:** turn RetroAchievements off in NextUI and start a game: no login message, and PPSSPP's Achievements settings show it disabled and logged out.
+5. **Wi-Fi off:** start a game with Wi-Fi off. The game runs normally, PPSSPP shows a login failure, and no achievements are active for that session. Turn Wi-Fi on and restart the game: login works again.
