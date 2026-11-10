@@ -102,16 +102,49 @@ lacks() { ! grep -q -- "$2" "$1"; }
 same() { cmp -s "$1" "$2"; }
 CR="$(printf '\r')"
 
-# Prints the [Achievements] section of ini $1 (CR kept, so CRLF can be checked).
-ach_section() {
-    awk '{ l = $0; sub(/\r$/, "", l) } l ~ /^[ \t]*\[/ { on = (l == "[Achievements]") } on' "$1"
+# Section-aware ini filter, written to $SECTION_AWK below. Headers are read the way
+# scripts/set_ini_values.awk reads them (CR, a BOM before the first header, blanks
+# around the brackets), so no check depends on where a section or a key is in the file.
+#   mode=in    print the lines of section s, header included (CR kept)
+#   mode=out   print every other line
+#   mode=host  replace the AchievementsHost lines of section s by one "AchievementsHost = h",
+#              right after the header
+section_program() {
+    cat <<'AWK'
+{
+    l = $0
+    sub(/\r$/, "", l)
+    if (NR == 1 && index(l, "[") > 1 && index(l, "[") <= 4)
+        l = substr(l, index(l, "["))
 }
+l ~ /^[ \t]*\[.*\][ \t]*$/ {
+    name = l
+    gsub(/^[ \t]*\[|\][ \t]*$/, "", name)
+    on = (name == s)
+    if (mode == "host") {
+        print
+        if (on)
+            print "AchievementsHost = " h
+        next
+    }
+}
+mode == "in" && on
+mode == "out" && !on
+mode == "host" && !(on && l ~ /^[ \t]*AchievementsHost[ \t]*=/)
+AWK
+}
+# section <in|out> <name> <file>
+section() { awk -v mode="$1" -v s="$2" -f "$SECTION_AWK" "$3"; }
+# Prints the [Achievements] section of ini $1 (CR kept, so CRLF can be checked).
+ach_section() { section in Achievements "$1"; }
 
 # --- sandbox -------------------------------------------------------------------------
 mkdir -p "$PAK/bin" "$SYSDIR" "$LOGS" "$ROMDIR" "$FLAGS" "$SHARED" "$STUB"
 cp "$SRC_PAK/launch.sh" "$SRC_PAK/pak.json" "$PAK/"
 cp -R "$SRC_PAK/scripts" "$PAK/"
 cp "$SRC_PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini" "$T/shipped.ini"
+SECTION_AWK="$T/section.awk"
+section_program >"$SECTION_AWK"
 for b in minui-power-control setalpha show_message jpg2bmp; do
     printf '#!/bin/sh\nexit 0\n' >"$PAK/bin/$b"
 done
@@ -120,7 +153,7 @@ done
 cat >"$PAK/PPSSPP/PPSSPPSDL_$PLATFORM" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$@" >"$STUB/args"
-awk '{ l = $0; sub(/\r$/, "", l) } l ~ /^[ \t]*\[/ { on = (l == "[Achievements]") } on' "$INI" >"$STUB/ach.ini"
+awk -v mode=in -v s=Achievements -f "$SECTION_AWK" "$INI" >"$STUB/ach.ini"
 ls -i "$INI" | awk '{ print $1 }' >"$STUB/ini.inode"
 rm -f "$STUB/token"
 if [ -f "$TOKEN" ]; then
@@ -135,7 +168,7 @@ chmod +x "$PAK/PPSSPP/PPSSPPSDL_$PLATFORM" "$PAK/bin/"*
 printf 'g' >"$ROMDIR/Game.iso"
 
 export PLATFORM DEVICE=brick SDCARD_PATH="$SD" USERDATA_PATH="$USERDATA" LOGS_PATH="$LOGS" \
-    SHARED_USERDATA_PATH="$SHARED" ROMS_PATH="$SD/Roms" STUB INI TOKEN
+    SHARED_USERDATA_PATH="$SHARED" ROMS_PATH="$SD/Roms" STUB INI TOKEN SECTION_AWK
 
 # Does this filesystem keep Unix permissions? (FAT does not.)
 touch "$T/perm" && chmod 600 "$T/perm"
@@ -195,17 +228,14 @@ ach_is() { v="$(ach "$1")" && [ "$v" = "$2" ]; }
 # AchievementsHost lines in the [Achievements] section of the shipped ini and of what
 # PPSSPP saw must be identical (both absent, or the same lines).
 host_unchanged() {
-    [ "$(ach_section "$T/shipped.ini" | grep '^AchievementsHost')" = \
-        "$(grep '^AchievementsHost' "$STUB/ach.ini")" ]
+    [ "$(ach_section "$T/shipped.ini" | grep '^[ 	]*AchievementsHost[ 	]*=')" = \
+        "$(grep '^[ 	]*AchievementsHost[ 	]*=' "$STUB/ach.ini")" ]
 }
 # Sets AchievementsHost in [Achievements] of ppsspp.ini, as if set by hand in PPSSPP:
-# drops any AchievementsHost line there (wherever it is) and adds one after the username.
+# whatever AchievementsHost lines the section has, wherever they are, become one.
 set_host_by_hand() {
-    awk -v h="$1" '{ l = $0; sub(/\r$/, "", l) }
-        l ~ /^[ \t]*\[/ { on = (l == "[Achievements]") }
-        on && l ~ /^AchievementsHost =/ { next }
-        on && l ~ /^AchievementsUserName = / { print; print "AchievementsHost = " h; next }
-        1' "$INI" >"$INI.x" && mv "$INI.x" "$INI"
+    awk -v mode=host -v s=Achievements -v h="$1" -f "$SECTION_AWK" "$INI" >"$INI.x" &&
+        mv "$INI.x" "$INI"
 }
 ach_count() { [ "$(grep -c "^$1 = " "$STUB/ach.ini")" = "$2" ]; }
 token_is() { [ -f "$STUB/token" ] && printf '%s' "$1" | cmp -s - "$STUB/token"; }
@@ -350,11 +380,13 @@ run_game
 check_enabled Player1 True
 check "AchievementsEnableRAIntegration untouched" ach_is AchievementsEnableRAIntegration False
 check "AchievementsEnable added once" ach_count AchievementsEnable 1
-awk '{ l = $0; sub(/\r$/, "", l) } l ~ /^\[/ { on = (l == "[Achievements]") } !on' "$T/shipped.ini" >"$INI"
+section out Achievements "$T/shipped.ini" >"$INI"
 run_game
 check_enabled Player1 True
-check "section added once" [ "$(grep -c '^\[Achievements\]' "$INI")" = 1 ]
-check "[Graphics] still there" contains "$INI" '^\[Graphics\]'
+ach_headers_once() { [ "$(ach_section "$INI" | grep -c 'Achievements\]')" = 1 ]; }
+check "section added once" ach_headers_once
+graphics_kept() { section in Graphics "$INI" | grep -q '^DisplayAspectRatio = '; }
+check "[Graphics] still there" graphics_kept
 end
 
 begin "11 CRLF ini keeps CRLF"
@@ -488,10 +520,12 @@ check "all other lines byte for byte the same" same "$T/a.rest" "$T/b.rest"
 grep -v '^DisplayAspectRatio = ' "$T/shipped.ini" >"$INI" # the shipped ini starts with a BOM
 run_game
 check_enabled Player1 True
-printf '\357\273\277[' >"$T/bom" # the device's BusyBox has no od
-bom_once() { head -c 4 "$INI" | cmp -s - "$T/bom"; }
-check "BOM kept, once" bom_once
-check "DisplayAspectRatio added in [Graphics]" sh -c "awk '/^\\[/ { on = (\$0 == \"[Graphics]\") } on' '$INI' | grep -q '^DisplayAspectRatio = '"
+# The first line is a section header (with the BOM, if the ini has one): it must be
+# byte for byte the same, so a BOM is neither lost nor doubled.
+first_line_kept() { [ "$(head -n 1 "$INI")" = "$(head -n 1 "$T/shipped.ini")" ]; }
+check "first line (and BOM, if any) kept" first_line_kept
+graphics_has_ratio() { section in Graphics "$INI" | grep -q '^DisplayAspectRatio = '; }
+check "DisplayAspectRatio added in [Graphics]" graphics_has_ratio
 end
 
 echo
