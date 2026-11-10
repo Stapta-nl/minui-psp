@@ -90,6 +90,15 @@ bundle="dist/test-report-$target-$ts.tar.gz"
             END { close_block() }
         ' "$tap"
     fi
+    # bats' own errors (e.g. a missing tool) explain a failed run without failed tests.
+    if [ "$status" != 0 ] && [ "$failed" = 0 ] && [ -s "$stage/stderr.log" ]; then
+        echo
+        echo "### Error output (last 20 lines of stderr.log)"
+        echo
+        echo '```'
+        tail -n 20 "$stage/stderr.log"
+        echo '```'
+    fi
     if [ -s "$stage/host/collector-errors.txt" ] || [ -s "$stage/device/collector-errors.txt" ]; then
         echo
         echo "### Collectors that failed (the bundle is complete otherwise)"

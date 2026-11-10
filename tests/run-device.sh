@@ -8,7 +8,7 @@
 #   not configured  : an error, or with --skip-unconfigured a message and exit 0
 #   configured but unreachable, tools missing, tests fail: exit non-zero
 #
-# Flow: check the device is reachable and has bash, tar, gzip and mktemp (any missing is
+# Flow: check the device is reachable and has bash, tar, gzip, mktemp, awk, sort, uniq and cut (any missing is
 # named); stream dist/psp-device-tests.tar.gz (make test-bundle) into a temp dir on the
 # device; run the bats tests tagged "device" (and for this platform) there; bring back the
 # JUnit report, logs, screenshots and device info; remove the temp dir. The debug bundle is
@@ -186,7 +186,7 @@ if ! err="$(rssh true 2>&1 </dev/null)"; then
 fi
 
 # shellcheck disable=SC2016 # runs on the device, $t must not expand here
-missing="$(rssh 'for t in bash tar gzip mktemp; do command -v "$t" >/dev/null 2>&1 || printf "%s " "$t"; done' 2>&1 </dev/null)" ||
+missing="$(rssh 'for t in bash tar gzip mktemp awk sort uniq cut; do command -v "$t" >/dev/null 2>&1 || printf "%s " "$t"; done' 2>&1 </dev/null)" ||
     finish 3 "checking the device's tools failed: $missing"
 missing="${missing% }"
 [ -z "$missing" ] || finish 3 "required tools missing on the device: $missing"

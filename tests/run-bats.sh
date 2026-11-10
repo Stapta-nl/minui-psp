@@ -21,6 +21,20 @@ BATS=tests/lib/bats-core/bin/bats
 }
 
 mkdir -p "$RESULT_DIR/junit" "$RESULT_DIR/logs"
+
+# bats needs nl, which some device firmwares (e.g. TinaLinux on the tg5040) lack.
+# Stand in with awk, which bats needs anyway; only used where nl is missing.
+if ! command -v nl >/dev/null 2>&1; then
+    shim_dir="$(mktemp -d "${TMPDIR:-/tmp}/bats-shim.XXXXXX")" || exit 2
+    trap 'rm -rf "$shim_dir"' EXIT
+    cat >"$shim_dir/nl" <<'SHIM'
+#!/bin/sh
+exec awk '{ printf "%6d\t%s\n", NR, $0 }' "$@"
+SHIM
+    chmod +x "$shim_dir/nl"
+    export PATH="$shim_dir:$PATH"
+    echo "run-bats.sh: nl not found, using an awk stand-in" >&2
+fi
 user_out_dir="${OUT_DIR:-}"
 export OUT_DIR="${OUT_DIR:-$RESULT_DIR/logs}"
 mkdir -p "$OUT_DIR"
