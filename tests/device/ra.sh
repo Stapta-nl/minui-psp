@@ -42,8 +42,8 @@ TOKEN="$SYSDIR/ppsspp_retroachievements.dat"
 SETTINGS="$SHARED/minuisettings.txt"
 
 # Secrets: they must reach the token file and nothing else (no log, no ini).
-RA_TOKEN="tok3nS3cr3tA1b2C3d4"
-RA_PASSWORD="pa55S3cr3tZ9y8"
+RA_TOKEN="fake-test-token"
+RA_PASSWORD="fake-test-password"
 
 missing=""
 for tool in mktemp cp mv rm mkdir cmp grep head tr sed cat awk ls wc find touch chmod cut; do
