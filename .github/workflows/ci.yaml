@@ -16,8 +16,20 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Run tests
+        run: make test
+
   build:
     name: build
+    needs: test
     runs-on: ubuntu-24.04-arm
 
     steps:
@@ -60,12 +72,12 @@ jobs:
           path: dist/psp-device-tests.tar.gz
 
       - name: Lint shell scripts
-        run: shellcheck -x launch.sh scripts/*.sh tests/device/run.sh tests/device/e2e.sh tests/device/ra.sh
+        run: make lint
 
       - name: Check release contents
         run: |
           zip="dist/${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip"
-          for f in launch.sh scripts/ini.sh scripts/set_ini_values.awk scripts/retroachievements.sh pak.json bin/jpg2bmp; do
+          for f in launch.sh scripts/ini.sh scripts/set_ini_values.awk scripts/retroachievements.sh pak.json bin/jpg2bmp bin/poweroff; do
             unzip -l "$zip" | grep -q " $f$" || { echo "missing from release: $f"; exit 1; }
           done
           if unzip -l "$zip" | grep -qE " (src|tests)/"; then
@@ -74,6 +86,7 @@ jobs:
           fi
           rm -rf "$RUNNER_TEMP/rel" && mkdir -p "$RUNNER_TEMP/rel"
           unzip -q "$zip" -d "$RUNNER_TEMP/rel"
+          [ -x "$RUNNER_TEMP/rel/bin/poweroff" ] || { echo "bin/poweroff is not executable in the release"; exit 1; }
           file "$RUNNER_TEMP/rel/bin/jpg2bmp" | grep -q "ARM aarch64"
 
       # Runs the real launch.sh and the shipped aarch64 jpg2bmp (this runner is arm64)
@@ -94,6 +107,18 @@ jobs:
           docker run --rm -v "$PWD:/repo:ro" -v "$RUNNER_TEMP:$RUNNER_TEMP" \
             -e SRC_PAK="$RUNNER_TEMP/rel" -e OUT_DIR="$RUNNER_TEMP/test-out/ra-busybox" \
             busybox:1.36.1 sh /repo/tests/device/ra.sh
+
+      # Runs the real launch.sh against a stub PPSSPP: power-off handshake, auto-resume marker, state file.
+      - name: Test auto-resume at power-off (dash)
+        timeout-minutes: 5
+        run: SRC_PAK="$RUNNER_TEMP/rel" OUT_DIR="$RUNNER_TEMP/test-out/autoresume-dash" sh tests/device/autoresume.sh
+
+      - name: Test auto-resume at power-off (BusyBox)
+        timeout-minutes: 5
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" -v "$RUNNER_TEMP:$RUNNER_TEMP" \
+            -e SRC_PAK="$RUNNER_TEMP/rel" -e OUT_DIR="$RUNNER_TEMP/test-out/autoresume-busybox" \
+            busybox:1.36.1 sh /repo/tests/device/autoresume.sh
 
       - name: Upload test logs
         if: failure()

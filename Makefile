@@ -10,6 +10,17 @@ STB_COMMIT := d14d46f6b44456eb88beac58cba833a4135d4c89
 # bin/jpg2bmp must be an aarch64 binary. CI builds natively on ubuntu-24.04-arm;
 # when building elsewhere pass a cross compiler, e.g. CC=aarch64-linux-gnu-gcc.
 
+# Off-device checks: syntax, shellcheck, poweroff shim protocol.
+SHELL_FILES := launch.sh bin/poweroff $(wildcard scripts/*.sh tests/*.sh tests/device/*.sh)
+
+lint:
+	for f in $(SHELL_FILES); do sh -n "$$f" || exit 1; done
+	shellcheck -x $(SHELL_FILES)
+
+test: lint
+	sh tests/poweroff_shim_test.sh
+	sh tests/device/autoresume.sh
+
 clean:
 	rm -f bin/minui-power-control bin/setalpha bin/jpg2bmp PPSSPP/PPSSPPSDL_tg5040 PPSSPP/PPSSPPSDL_tg5050 PPSSPP/libstdc++.so.6 src/stb_image.h tests/device/bin/pngcolor dist/psp-device-tests.tar.gz
 
