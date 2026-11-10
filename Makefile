@@ -145,7 +145,7 @@ test-bundle: $(BATS_DEPS) tests/bin/pngcolor
 	mkdir -p dist
 	tar -czf dist/psp-device-tests.tar.gz \
 		--exclude='tests/lib/*/test' --exclude='tests/lib/*/docs' --exclude='tests/lib/*/man' \
-		tests/bats tests/helpers tests/fixtures tests/lib tests/bin tests/ra.sh \
+		tests/bats tests/helpers tests/fixtures tests/lib tests/bin \
 		tests/run-bats.sh tests/collect.sh tests/collectors
 	ls -lah dist
 

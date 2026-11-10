@@ -101,21 +101,46 @@ jobs:
           path: dist/test-report-host-*.tar.gz
           if-no-files-found: warn
 
-      # The RetroAchievements cases also run under dash in `make test`; here every tool
-      # is a BusyBox applet like on the device.
-      - name: Test RetroAchievements sync (BusyBox)
-        timeout-minutes: 5
+      # launch.sh again, this time run by BusyBox sh (the shell on the devices) instead of dash.
+      # The tests themselves are bash; only launch.sh runs under LAUNCH_SHELL. Results and
+      # bundle get their own names so they do not collide with the run above.
+      # The first bundle is removed so the second upload holds only its own.
+      - name: Install BusyBox
+        if: ${{ !cancelled() }}
         run: |
-          docker run --rm -v "$PWD:/repo:ro" -v "$RUNNER_TEMP:$RUNNER_TEMP" \
-            -e SRC_PAK="$RUNNER_TEMP/rel" -e OUT_DIR="$RUNNER_TEMP/test-out/ra-busybox" \
-            busybox:1.36.1 sh /repo/tests/ra.sh
+          sudo apt-get update
+          sudo apt-get install -y busybox-static
+          rm -f dist/test-report-host-*.tar.gz
 
-      - name: Upload test logs
-        if: failure()
+      - name: Test (BusyBox sh)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: make test SRC_PAK="$RUNNER_TEMP/rel" RELEASE_ZIP="dist/${{ steps.pak-name.outputs.PAK_NAME }}.pak.zip" LAUNCH_SHELL="busybox sh"
+
+      - name: Test report (BusyBox sh)
+        if: always()
+        continue-on-error: true
+        uses: dorny/test-reporter@v2.0.0
+        with:
+          name: Tests (BusyBox sh)
+          path: dist/test-out/host/junit/report.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Test summary (BusyBox sh)
+        if: always()
+        run: |
+          if [ -f dist/test-out/host/summary.md ]; then
+            { echo "### launch.sh run by BusyBox sh"; cat dist/test-out/host/summary.md; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload test debug bundle (BusyBox sh)
+        if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: ra-busybox-test-logs
-          path: ${{ runner.temp }}/test-out
+          name: test-report-host-busybox
+          path: dist/test-report-host-*.tar.gz
+          if-no-files-found: warn
 
   test-release:
     name: test-release

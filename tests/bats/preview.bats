@@ -17,6 +17,7 @@
 #   JPG2BMP    jpg2bmp binary to use instead of $SRC_PAK/bin/jpg2bmp (host runs)
 #   PLATFORM   platform under test (default: the first one in pak.json)
 #   OUT_DIR    where logs are kept (default /tmp/psp-test-out; this file uses OUT_DIR/preview)
+#   LAUNCH_SHELL  shell that runs launch.sh (default sh; e.g. "busybox sh", bash)
 #   KEEP=1     keep the sandbox
 
 load '../helpers/common'
@@ -25,6 +26,7 @@ setup_file() {
     require_tools mktemp cp mv rm mkdir cmp grep head tr find sed cat sleep touch basename sync wc
 
     PLATFORM="$(psp_platform)"
+    LAUNCH_SHELL="${LAUNCH_SHELL:-sh}"
     SRC_PAK="$(psp_src_pak)"
     OUT="$OUT_DIR/preview"
     rm -rf "$OUT"
@@ -84,7 +86,7 @@ EOF
     mkdir -p "$USERDATA/PSP-ppsspp"
     touch "$USERDATA/PSP-ppsspp/debug" # trace logging, as with the debug flag on a device
 
-    export PLATFORM OUT T SD PAK USERDATA SHARED LOGS ROMS ROMDIR MINUI STATES STUB INI FIX
+    export PLATFORM LAUNCH_SHELL OUT T SD PAK USERDATA SHARED LOGS ROMS ROMDIR MINUI STATES STUB INI FIX
     export DEVICE=brick SDCARD_PATH="$SD" USERDATA_PATH="$USERDATA" LOGS_PATH="$LOGS" \
         SHARED_USERDATA_PATH="$SHARED" ROMS_PATH="$ROMS"
 }
@@ -130,7 +132,8 @@ run_game() {
     shift
     rm -f "$STUB/args" "$STUB/pid" "$STUB/saved"
     printf '%s\n' "$@" >"$STUB/actions"
-    sh "$PAK/launch.sh" "$ROMDIR/$rom" >"$T/launch.out" 2>&1
+    # shellcheck disable=SC2086 # LAUNCH_SHELL may be a command with arguments ("busybox sh")
+    $LAUNCH_SHELL "$PAK/launch.sh" "$ROMDIR/$rom" >"$T/launch.out" 2>&1
     cp "$LOGS/PSP.txt" "$(case_log)" 2>/dev/null
 }
 
@@ -184,7 +187,8 @@ previews_of() { find "$MINUI" -name "$1.*.bmp"; }
     rm -f "$STUB/args" "$STUB/pid" "$STUB/saved"
     printf '%s\n' "save thumb1 ULUS10041_1.00 3" "hang" >"$STUB/actions"
     # 3>&-: the background job must not hold bats' output descriptor open
-    sh "$PAK/launch.sh" "$ROMDIR/Game C.iso" >"$T/launch.out" 2>&1 3>&- &
+    # shellcheck disable=SC2086 # LAUNCH_SHELL may be a command with arguments ("busybox sh")
+    $LAUNCH_SHELL "$PAK/launch.sh" "$ROMDIR/Game C.iso" >"$T/launch.out" 2>&1 3>&- &
     local launch_pid=$! i=0
     while [ ! -f "$STUB/saved" ] && [ "$i" -lt 100 ]; do
         sleep 0.1 2>/dev/null || sleep 1

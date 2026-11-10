@@ -7,5 +7,5 @@ timestamps.txt | echo "started:  ${TEST_STARTED:-unknown}"; echo "finished: ${TE
 host-uname.txt | uname -srvm
 make-vars.txt | for v in ${MAKE_VARS:-}; do echo "$v"; done
 test-target.txt | echo "${TEST_TARGET_INFO:-host run (no device)}"
-env-overrides.txt | for v in SRC_PAK RELEASE_ZIP JPG2BMP PLATFORM OUT_DIR KEEP PSP_KEYS EXIT_KEYS BOOT_WAIT UI_WAIT KEY_GAP SDCARD_PATH ROM_DIR ROM; do eval "if [ -n \"\${$v+x}\" ]; then echo \"$v=\${$v}\"; fi"; done
+env-overrides.txt | for v in SRC_PAK RELEASE_ZIP JPG2BMP PLATFORM OUT_DIR KEEP LAUNCH_SHELL TMP_ROOT PSP_KEYS EXIT_KEYS BOOT_WAIT UI_WAIT KEY_GAP SDCARD_PATH ROM_DIR ROM; do eval "if [ -n \"\${$v+x}\" ]; then echo \"$v=\${$v}\"; fi"; done
 tool-versions.txt | bash --version | head -n 1; make --version | head -n 1; jq --version; git --version; file --version | head -n 1; shellcheck --version | sed -n 2p; unzip -v | head -n 1; gcc --version | head -n 1; tests/lib/bats-core/bin/bats --version
