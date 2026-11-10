@@ -3,9 +3,9 @@
 #
 # launch.sh puts $PAK_DIR/bin in front of /sbin in PATH, so the `poweroff` that
 # the power button's /tmp/selfgz*/shutdown script runs is this one. It gives
-# launch.sh time to write the auto-resume marker (and, with a PPSSPP build that
-# supports it, to finish saving the power-off save state), then hands over to
-# the real poweroff.
+# PPSSPP time to finish its "Save state on exit" (the shutdown script has just
+# sent it SIGTERM) and launch.sh time to write the auto-resume marker and the
+# Game Switcher preview, then hands over to the real poweroff.
 #
 # Protocol (all files in /tmp):
 #   psp-poweroff-req  created here: "a power-off is being requested"
@@ -14,6 +14,11 @@
 #                     answer, so we stop waiting
 #
 # The wait is bounded and never happens when no PSP session is running.
+# Budget for the 15 s default: PPSSPP quits at most 5 s after SIGTERM even if
+# its save is not done, then shuts down (a second or two, it also writes
+# ppsspp.ini); launch.sh then needs about a second (marker, preview, sync).
+# launch.sh usually answers well before that, and the wait ends early if
+# launch.sh is gone.
 #
 # Test overrides (production uses the defaults):
 #   PSP_POWEROFF_TMP      directory of the files above   (default /tmp)
@@ -91,7 +96,7 @@ for dir in $PATH; do
     [ "$dir" = "$self_dir" ] && continue
     [ "$(cd "$dir" 2>/dev/null && pwd)" = "$self_dir" ] && continue
     cand="$dir/$self_name"
-    [ -f "$cand" ] && [ -x "$cand" ] || continue
+    if [ ! -f "$cand" ] || [ ! -x "$cand" ]; then continue; fi
     # shellcheck disable=SC3013 # -ef is supported by BusyBox ash and dash
     [ "$cand" -ef "$0" ] 2>/dev/null && continue
     # shellcheck disable=SC2093 # exec is the point: the loop ends here

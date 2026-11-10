@@ -121,6 +121,12 @@ set_cpu_settings() {
 # a forced power-off or a dead battery never resumes. We follow the same
 # rule: the marker is written only once a power-off has been positively
 # detected, never while the game is running.
+#
+# The game itself is resumed by PPSSPP, not by us: with "Save state on exit"
+# ([General] SaveStateOnExit) on, PPSSPP saves a state when it is stopped,
+# also on SIGTERM (power-off), within 5 s; with "Auto load savestate"
+# ([General] AutoLoadSaveState, 2 = newest) it loads it again on the next
+# start. We never pass --state: the pak only decides whether to relaunch.
 AUTO_RESUME_PATH="$SHARED_USERDATA_PATH/.minui/auto_resume.txt"
 # Written by NextUI/MinUI on an auto-resume (slot 9) for minarch, which reads
 # and deletes it. PPSSPP never reads it, so we remove it ourselves, otherwise
@@ -143,25 +149,32 @@ set_auto_resume() {
 # shutdown script runs `poweroff` from our PATH; the shim creates
 # $POWEROFF_REQ and waits (at most ~15 s) for us to create $POWEROFF_OK, which
 # we do only once the auto-resume marker is on disk. $PAK_PID_FILE tells the
-# shim that we are alive.
+# shim that we are alive. By the time PPSSPP has exited (after its save on
+# exit) the request file exists, since the shutdown script signals PPSSPP and
+# then runs `poweroff`.
 POWEROFF_REQ="/tmp/psp-poweroff-req"
 POWEROFF_OK="/tmp/psp-poweroff-ok"
 PAK_PID_FILE="/tmp/psp-pak.pid"
 
-# Exact power-off state, only with a PPSSPP build that can save it on SIGTERM
-# (it contains the string PPSSPP_AUTORESUME_STATE). With such a build and the
-# variable set to an absolute path, SIGTERM makes PPSSPP save a state to
-# <path>.tmp, rename it to <path> and write <path>.done (or <path>.fail), then
-# exit. Only the pak's own files below $STATE_DIR/autoresume are touched.
-AUTORESUME_STATE=""
-
-ppsspp_supports_autoresume_state() {
-    grep -a -q PPSSPP_AUTORESUME_STATE "$EMU_DIR/${PPSSPP_BIN}_${PLATFORM}" 2>/dev/null
-}
-
-remove_autoresume_state_files() {
-    [ -n "$AUTORESUME_STATE" ] || return 0
-    rm -f "$AUTORESUME_STATE" "$AUTORESUME_STATE.tmp" "$AUTORESUME_STATE.done" "$AUTORESUME_STATE.fail"
+# Logs the global save-on-exit/auto-load settings (a per-game config of
+# PPSSPP may override them). Read only, for diagnosing resumes.
+log_resume_settings() {
+    [ -f "$PPSSPP_INI" ] || return 0
+    awk '
+        { sub(/\r$/, "") }
+        # The shipped ini starts with a UTF-8 BOM, so do not anchor at the start.
+        /\[[^]]*\]$/ { general = ($0 ~ /\[General\]$/); next }
+        general && /^(SaveStateOnExit|AutoLoadSaveState|StateSlot)[ \t]*=/ {
+            key = $0; sub(/[ \t]*=.*/, "", key)
+            val = $0; sub(/^[^=]*=[ \t]*/, "", val)
+            v[key] = val
+        }
+        END {
+            printf "PPSSPP settings: SaveStateOnExit=%s AutoLoadSaveState=%s StateSlot=%s\n",
+                ("SaveStateOnExit" in v ? v["SaveStateOnExit"] : "(unset, off)"),
+                ("AutoLoadSaveState" in v ? v["AutoLoadSaveState"] : "(unset, off)"),
+                ("StateSlot" in v ? v["StateSlot"] : "(unset)")
+        }' "$PPSSPP_INI"
 }
 
 # True if the device is powering off (rather than the user quitting PPSSPP).
@@ -193,21 +206,11 @@ shutdown_in_progress() {
 # Arm auto-resume, tell the poweroff shim it may go ahead, then wait for the
 # power-off to finish. We must not return to NextUI/MinUI here: on its next
 # start it would read (and delete) the marker before the device is off.
+# PPSSPP has already exited, so its save on exit (state and thumbnail) is
+# complete or was given up; the marker is armed either way, and PPSSPP then
+# loads the newest state it has for the game.
 arm_auto_resume_and_wait() {
     rom_path="$1"
-
-    # With a patched PPSSPP the exact state was saved on SIGTERM. Success is
-    # the .done file plus the state file; anything else is logged, and the
-    # stale state is dropped so it can never be resumed by mistake. The marker
-    # is armed either way: the newest existing save state then resumes.
-    if [ -n "$AUTORESUME_STATE" ]; then
-        if [ -f "$AUTORESUME_STATE.done" ] && [ -f "$AUTORESUME_STATE" ]; then
-            echo "Power-off state saved: $AUTORESUME_STATE"
-        else
-            echo "Power-off state NOT saved (no .done file); resuming from the newest save state instead."
-            remove_autoresume_state_files
-        fi
-    fi
 
     armed=0
     if set_auto_resume "$rom_path"; then
@@ -217,8 +220,10 @@ arm_auto_resume_and_wait() {
         echo "Auto-resume not armed ($rom_path is not on the SD card)."
     fi
     sync
-    # The marker is on the card: the shim may go ahead. (The preview, which
-    # can take a while, is written afterwards by cleanup().)
+    # The marker comes first, so a slow preview can never cost the resume.
+    # The preview (one small JPEG conversion, then sync) is quick, so it fits
+    # in the shim's window and is on the card before power is cut.
+    write_game_switcher_preview
     : >"$POWEROFF_OK"
     echo "Told the poweroff shim to go ahead."
     cleanup
@@ -236,7 +241,6 @@ arm_auto_resume_and_wait() {
     done
     echo "Device did not power off, removing auto-resume marker."
     rm -f "$AUTO_RESUME_PATH" "$POWEROFF_REQ" "$POWEROFF_OK"
-    remove_autoresume_state_files
     sync
 }
 
@@ -405,43 +409,24 @@ main() {
     rom_arg="$*"
     PREVIEW_ROM="$rom_arg"
 
-    # Power-off state: only with a PPSSPP build that supports it. A state file
-    # left over from an earlier session is never trusted: it is removed unless
-    # this is an auto-resume (slot 9), and then it is consumed by this launch.
-    resume_state=""
-    if ppsspp_supports_autoresume_state; then
-        mkdir -p "$STATE_DIR/autoresume"
-        AUTORESUME_STATE="$STATE_DIR/autoresume/$(basename "$rom_arg").ppst"
-        if [ "$resume_slot" = "9" ] && [ -f "$AUTORESUME_STATE" ]; then
-            resume_state="$AUTORESUME_STATE"
-            echo "Auto-resume: starting from $resume_state"
-        fi
-        rm -f "$AUTORESUME_STATE.tmp" "$AUTORESUME_STATE.done" "$AUTORESUME_STATE.fail"
-        [ -n "$resume_state" ] || rm -f "$AUTORESUME_STATE"
-        export PPSSPP_AUTORESUME_STATE="$AUTORESUME_STATE"
-    else
-        echo "PPSSPP has no power-off state support."
-    fi
+    # An auto-resume (slot 9) starts like any other launch: PPSSPP's own
+    # "Auto load savestate" loads the state it saved on exit.
+    [ "$resume_slot" = "9" ] && echo "Auto-resume launch: PPSSPP loads the game's save state itself."
+    log_resume_settings
 
     # Launch emulator
     minui-power-control "${PPSSPP_BIN}_${PLATFORM}" &
-    if [ -n "$resume_state" ]; then
-        "${PPSSPP_BIN}_${PLATFORM}" "$rom_arg" --state="$resume_state" --fullscreen --pause-menu-exit
-    else
-        "${PPSSPP_BIN}_${PLATFORM}" "$rom_arg" --fullscreen --pause-menu-exit
-    fi
+    "${PPSSPP_BIN}_${PLATFORM}" "$rom_arg" --fullscreen --pause-menu-exit
 
-    # PPSSPP exited. A SIGTERM from here on most likely comes from poweroff
-    # tearing everything down: finish the decision instead of dying halfway.
+    # PPSSPP exited (after its save on exit, if that is on). A SIGTERM from
+    # here on most likely comes from poweroff tearing everything down: finish
+    # the decision instead of dying halfway.
     trap "" INT TERM HUP QUIT
     if shutdown_in_progress; then
-        # Marker and ok first: the preview must not eat the shim's time budget.
+        # Marker, then preview, then ok (see arm_auto_resume_and_wait).
         arm_auto_resume_and_wait "$rom_arg"
-        write_game_switcher_preview
     else
         write_game_switcher_preview
-        # Normal quit or crash: a power-off state must not outlive its session.
-        remove_autoresume_state_files
     fi
     trap "exit 1" INT TERM HUP QUIT
 }

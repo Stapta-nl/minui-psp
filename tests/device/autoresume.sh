@@ -1,11 +1,14 @@
 #!/bin/sh
 # Test of the auto-resume-at-power-off logic in launch.sh and of the poweroff handshake.
 #
-# Runs the *real* launch.sh in a throw-away SD card tree against a stub PPSSPP
-# (with and without the PPSSPP_AUTORESUME_STATE capability string). The stub plays
-# the part of the power button: it creates /tmp/psp-poweroff-req like bin/poweroff
-# does. Nothing under the real SD card is touched. It does use the fixed /tmp paths
-# launch.sh uses (/tmp/psp-*, /tmp/resume_slot.txt, /tmp/stay_awake).
+# Runs the *real* launch.sh and the real bin/poweroff shim in a throw-away SD card tree
+# against a stub PPSSPP that behaves like PPSSPP with "Save state on exit": on SIGTERM
+# (and on a normal quit) it saves a state plus thumbnail to slot 0, taking a moment,
+# then exits. With the setting off ("nosave") it exits on SIGTERM without saving.
+# The test plays the power button's shutdown script: it starts `poweroff` (the shim,
+# through launch.sh's PATH order) and sends SIGTERM to PPSSPP. Nothing under the real
+# SD card is touched. It does use the fixed /tmp paths launch.sh uses (/tmp/psp-*,
+# /tmp/resume_slot.txt, /tmp/stay_awake).
 #
 # Usage: sh tests/device/autoresume.sh      (env: SRC_PAK, PLATFORM, OUT_DIR, KEEP=1)
 
@@ -36,7 +39,13 @@ ROMDIR="$SD/Roms/PlayStation Portable (PSP)"
 STATES="$SHARED/PSP-ppsspp"
 STUB="$T/stub"
 MARKER="$SHARED/.minui/auto_resume.txt"
-STATEFILE="$STATES/autoresume/Game B.iso.ppst"
+FIX="$HERE/fixtures"
+# PPSSPP names states <DISC_ID>_<DISC_VERSION>_<slot>; slot 0 is the shipped StateSlot.
+PREFIX="ULUS10041_1.00"
+EXIT_STATE="$STATES/${PREFIX}_0.ppst"
+EXIT_THUMB="$STATES/${PREFIX}_0.jpg"
+PREVIEW="$SHARED/.minui/PSP/Game B.iso.0.bmp"
+PREVIEW_SLOT="$SHARED/.minui/PSP/Game B.iso.txt"
 EMU="$PAK/PPSSPP/PPSSPPSDL_$PLATFORM"
 ROMFILE="$ROMDIR/Game B.iso"
 REQ=/tmp/psp-poweroff-req
@@ -55,7 +64,7 @@ finish() {
     for m in "$PAK/PPSSPP/.config/ppsspp/PSP/SAVEDATA" "$PAK/PPSSPP/.config/ppsspp/PSP/PPSSPP_STATE"; do
         umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
     done
-    rm -f "$REQ" "$OK" "$PIDFILE" /tmp/resume_slot.txt
+    rm -f "$REQ" "$OK" "$PIDFILE" /tmp/resume_slot.txt /tmp/psp-poweroff-shim.log
     if [ -n "$KEEP" ] || [ "$FAIL" -gt 0 ]; then echo "Logs kept in $OUT_DIR"; fi
     [ -n "$KEEP" ] || rm -rf "$T"
 }
@@ -91,6 +100,7 @@ lacks() { [ -f "$1" ] && ! grep -q -- "$2" "$1"; }
 absent() { [ ! -e "$1" ]; }
 present() { [ -e "$1" ]; }
 
+
 mkdir -p "$PAK/bin" "$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM" "$LOGS" "$ROMDIR" "$STATES" "$STUB"
 cp "$SRC_PAK/launch.sh" "$SRC_PAK/pak.json" "$PAK/"
 cp -R "$SRC_PAK/scripts" "$PAK/"
@@ -98,62 +108,73 @@ cp "$SRC_PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini" "$PAK/PPSSPP/.config/p
 printf '#!/bin/sh\nexit 0\n' >"$PAK/bin/minui-power-control"
 printf '#!/bin/sh\nexit 0\n' >"$PAK/bin/setalpha"
 printf '#!/bin/sh\nexit 0\n' >"$PAK/bin/show_message"
-printf '#!/bin/sh\nexit 0\n' >"$PAK/bin/jpg2bmp"
+# Stand-in converter: the "BMP" is a copy of the thumbnail (run.sh tests the real one).
+# shellcheck disable=SC2016 # $1/$2 belong to the generated script
+printf '#!/bin/sh\ncp "$1" "$2"\n' >"$PAK/bin/jpg2bmp"
 chmod +x "$PAK/bin/"*
 # The real shim, deliberately without the exec bit: launch.sh must set it.
 cp "$SRC_PAK/bin/poweroff" "$PAK/bin/poweroff"
 chmod -x "$PAK/bin/poweroff"
-# Fake system poweroff for the shim: records the marker as it is when poweroff runs.
+# Fake system poweroff for the shim: records what is on disk when poweroff runs.
 cat >"$T/fake-poweroff" <<FAKE
 #!/bin/sh
 cat "$MARKER" >"$STUB/marker_at_poweroff" 2>/dev/null
+[ -f "$EXIT_STATE" ] && [ -f "$EXIT_THUMB" ] && : >"$STUB/state_at_poweroff"
+[ -f "$PREVIEW" ] && [ -f "$PREVIEW_SLOT" ] && : >"$STUB/preview_at_poweroff"
 echo "\$*" >"$STUB/real-called"
 FAKE
 chmod +x "$T/fake-poweroff"
 export PSP_POWEROFF_REAL="$T/fake-poweroff"
 printf 'b' >"$ROMDIR/Game B.iso"
 
-# Fake PPSSPP. $1 of the actions file lines:
-#   poweroff   like the power button: create the request file (bin/poweroff does it)
-#   save       like the patched PPSSPP on SIGTERM: <state>.tmp -> <state>, then <state>.done
-#   savefail   write <state>.fail only
-write_stub() { # write_stub with|without
-    {
-        echo '#!/bin/sh'
-        [ "$1" = with ] && echo '# PPSSPP_AUTORESUME_STATE capability string'
-        cat <<'STUB_BODY'
+# Fake PPSSPP. $STUB/mode is "save" (Save state on exit on) or "nosave" (off).
+# Lines of $STUB/actions:
+#   save <slot>  the user saves a state to <slot>
+#   quit         Exit hotkey / pause-menu Exit: save on exit (mode save), then exit
+#   crash        exit with an error, nothing saved
+#   hang         run until killed; SIGTERM saves on exit (mode save, takes 1 s), then exits
+cat >"$EMU" <<'STUB_BODY'
+#!/bin/sh
 printf '%s\n' "$@" >"$STUB/args"
-# The name is split so this stub only carries the capability string when asked to.
-eval "S=\${PPSSPP_AUTORESUME_ST""ATE-unset}"
-echo "$S" >"$STUB/env"
+echo $$ >"$STUB/pid"
 cat /tmp/psp-pak.pid >"$STUB/pakpid" 2>/dev/null
-while read -r action; do
+mode="$(cat "$STUB/mode")"
+sleeper=""
+save_state() {
+    cp "$FIX/thumb1.jpg" "$STATES/${PREFIX}_$1.jpg"
+    printf 'state' >"$STATES/${PREFIX}_$1.ppst"
+}
+on_term() {
+    [ -n "$sleeper" ] && kill "$sleeper" 2>/dev/null
+    if [ "$mode" = save ]; then
+        sleep 1 # saving takes a moment; the shim must wait for it
+        save_state 0
+        : >"$STUB/saved_on_term"
+    fi
+    exit 0
+}
+trap on_term TERM
+sleep 2 # saves must be newer than launch.sh's launch marker (1 s mtime in BusyBox test)
+while read -r action a; do
     case "$action" in
-    poweroff) : >/tmp/psp-poweroff-req ;;
-    shim)
-        # the real bin/poweroff, found through PATH like the shutdown script does
-        poweroff -f &
-        i=0
-        while [ ! -e /tmp/psp-poweroff-req ] && [ "$i" -lt 100 ]; do
-            sleep 0.1 2>/dev/null || sleep 1
-            i=$((i + 1))
-        done
+    save) save_state "$a" ;;
+    quit)
+        [ "$mode" = save ] && save_state 0
+        exit 0
         ;;
-    save)
-        printf 'state' >"$S.tmp"
-        mv "$S.tmp" "$S"
-        : >"$S.done"
+    crash) exit 139 ;;
+    hang)
+        sleep 300 &
+        sleeper=$!
+        wait "$sleeper"
         ;;
-    savefail) : >"$S.fail" ;;
     esac
 done <"$STUB/actions"
 STUB_BODY
-    } >"$EMU"
-    chmod +x "$EMU"
-}
+chmod +x "$EMU"
 
 export PLATFORM DEVICE=brick SDCARD_PATH="$SD" USERDATA_PATH="$USERDATA" LOGS_PATH="$LOGS" \
-    SHARED_USERDATA_PATH="$SHARED" ROMS_PATH="$SD/Roms" STUB
+    SHARED_USERDATA_PATH="$SHARED" ROMS_PATH="$SD/Roms" STUB FIX STATES PREFIX
 mkdir -p "$USERDATA/PSP-ppsspp"
 touch "$USERDATA/PSP-ppsspp/debug"
 
@@ -166,22 +187,42 @@ wait_for() { # wait_for <file> : up to ~15 s
     [ -e "$1" ]
 }
 
-# run_game <stub: with|without> <resume slot or ""> <actions...>: runs launch.sh. A
-# power-off ends with launch.sh waiting for the device to die (poweroff would SIGKILL
-# it): wait for the "ok" file, check what the test wants, then SIGKILL it.
+# Plays the power button's shutdown script against the running stub:
+#   shim  run `poweroff -f` (the real shim, found through launch.sh's PATH) and SIGTERM PPSSPP
+#   req   only create the request file (as the shim does), then SIGTERM PPSSPP
+# The request file is waited for before the SIGTERM so the test is deterministic; on
+# the device PPSSPP's save on exit gives the shim the same head start.
+power_button() {
+    wait_for "$STUB/pid" || return 1
+    case "$1" in
+    shim)
+        PATH="$PAK/bin:$PATH" poweroff -f &
+        wait_for "$REQ"
+        ;;
+    req) : >"$REQ" ;;
+    esac
+    kill -TERM "$(cat "$STUB/pid")"
+}
+
+# run_game <mode> <resume slot or ""> <power button: shim|req|""> <actions...>: runs
+# launch.sh. A power-off ends with launch.sh waiting for the device to die (poweroff
+# would SIGKILL it): wait for the "ok" file, check what the test wants, then SIGKILL it.
 run_game() {
-    write_stub "$1"
+    printf '%s' "$1" >"$STUB/mode"
     slot="$2"
-    shift 2
-    rm -f "$STUB/args" "$STUB/env" "$STUB/pakpid" "$REQ" "$OK" "$MARKER" /tmp/resume_slot.txt
+    button="$3"
+    shift 3
+    rm -f "$STUB/args" "$STUB/pid" "$STUB/pakpid" "$STUB/saved_on_term" "$REQ" "$OK" "$MARKER" \
+        /tmp/resume_slot.txt "$STUB/real-called" "$STUB/marker_at_poweroff" \
+        "$STUB/state_at_poweroff" "$STUB/preview_at_poweroff" /tmp/psp-poweroff-shim.log
     printf '%s\n' "$@" >"$STUB/actions"
     [ -n "$slot" ] && printf '%s' "$slot" >/tmp/resume_slot.txt
-    rm -f "$STUB/real-called" "$STUB/marker_at_poweroff"
     LAUNCH_HUNG=""
+    MARKER_AT_OK=""
     sh "$PAK/launch.sh" "$ROMFILE" >"$T/launch.out" 2>&1 &
     LAUNCH_PID=$!
-    case " $* " in
-    *" poweroff "* | *" shim "*)
+    if [ -n "$button" ]; then
+        power_button "$button"
         if [ -n "$NOKILL" ]; then
             # launch.sh must return by itself (nothing armed, or the give-up path)
             i=0
@@ -194,11 +235,11 @@ run_game() {
         else
             wait_for "$OK"
             MARKER_AT_OK="$(cat "$MARKER" 2>/dev/null)"
+            [ "$button" = shim ] && wait_for "$STUB/real-called"
             sleep 1 # let cleanup() unmount before the "power cut"
             kill -KILL "$LAUNCH_PID" 2>/dev/null
         fi
-        ;;
-    esac
+    fi
     wait "$LAUNCH_PID" 2>/dev/null
     LAUNCH_PID=""
     cp "$LOGS/PSP.txt" "$OUT_DIR/$CASE.log" 2>/dev/null
@@ -206,97 +247,95 @@ run_game() {
 
 LOG="$OUT_DIR/current.log"
 use_log() { LOG="$OUT_DIR/$CASE.log"; }
+reset_states() { rm -rf "${STATES:?}"/* "$SHARED/.minui/PSP"; }
 EXPECT_MARKER="/Roms/PlayStation Portable (PSP)/Game B.iso"
 
-begin "1 old PPSSPP (no capability): power-off arms the marker, then answers the shim"
-run_game without "" poweroff
+begin "1 power button with save on exit: shim waits for the save, marker and preview before poweroff"
+reset_states
+run_game save "" shim hang
 use_log
+check "PPSSPP saved on SIGTERM" present "$STUB/saved_on_term"
 check "marker holds the ROM path when ok is given" test "$MARKER_AT_OK" = "$EXPECT_MARKER"
+check "shim reached the real poweroff" present "$STUB/real-called"
+check "real poweroff got the args" contains "$STUB/real-called" '^-f$'
+check "state and thumbnail on disk when poweroff ran" present "$STUB/state_at_poweroff"
+check "marker on disk when poweroff ran" contains "$STUB/marker_at_poweroff" "Game B.iso"
+check "preview on disk when poweroff ran" present "$STUB/preview_at_poweroff"
+check "preview is the save-on-exit thumbnail" cmp -s "$PREVIEW" "$FIX/thumb1.jpg"
+check "preview slot is 0" contains "$PREVIEW_SLOT" '^0$'
+check "shim waited for launch.sh's answer" contains /tmp/psp-poweroff-shim.log 'launch.sh is ready after'
 check "pid file held launch.sh pid while PPSSPP ran" test -s "$STUB/pakpid"
-check "no state env var passed" contains "$STUB/env" '^unset$'
 check "no --state argument" lacks "$STUB/args" '^--state='
-check "no autoresume dir created" absent "$STATES/autoresume"
+check "pause-menu exit passed" contains "$STUB/args" '^--pause-menu-exit$'
 check "log says power-off detected" contains "$LOG" 'Power-off detected: .*psp-poweroff-req'
+check "log order: marker, then preview" sh -c "grep -v '^+' '$LOG' | grep -E 'Auto-resume armed|Game switcher preview' | head -1 | grep -q 'Auto-resume armed'"
+check "log shows the shipped settings" contains "$LOG" 'SaveStateOnExit=True AutoLoadSaveState=2'
+check "no autoresume dir created" absent "$STATES/autoresume"
 end
 
-begin "2 patched PPSSPP saved the state: marker armed, state kept"
-run_game with "" save poweroff
+begin "2 save on exit off: marker still armed, no new state, older preview untouched"
+reset_states
+mkdir -p "$SHARED/.minui/PSP"
+printf 'old' >"$STATES/${PREFIX}_2.jpg"
+printf 'old' >"$STATES/${PREFIX}_2.ppst"
+printf 'oldbmp' >"$SHARED/.minui/PSP/Game B.iso.2.bmp"
+printf '2' >"$PREVIEW_SLOT"
+run_game nosave "" shim hang
 use_log
 check "marker armed at ok time" test "$MARKER_AT_OK" = "$EXPECT_MARKER"
-check "env var points at the state file" contains "$STUB/env" "^$STATEFILE\$"
-check "state file kept" present "$STATEFILE"
-check "done file present" present "$STATEFILE.done"
-check "log says state saved" contains "$LOG" 'Power-off state saved'
+check "marker on disk when poweroff ran" contains "$STUB/marker_at_poweroff" "Game B.iso"
+check "no save-on-exit state" absent "$EXIT_STATE"
+check "older state kept for auto-load" present "$STATES/${PREFIX}_2.ppst"
+check "old preview kept" contains "$SHARED/.minui/PSP/Game B.iso.2.bmp" '^oldbmp$'
+check "slot file unchanged" contains "$PREVIEW_SLOT" '^2$'
 end
 
-begin "3 patched PPSSPP failed to save: marker armed anyway, stale state dropped"
-mkdir -p "$STATES/autoresume"
-printf 'old' >"$STATEFILE"
-run_game with "" savefail poweroff
+begin "3 normal quit (Exit hotkey/menu) with save on exit: preview, no marker"
+reset_states
+run_game save 8 "" quit
 use_log
-check "marker armed at ok time" test "$MARKER_AT_OK" = "$EXPECT_MARKER"
-check "state file removed" absent "$STATEFILE"
-check "log says not saved" contains "$LOG" 'Power-off state NOT saved'
-end
-
-begin "4 patched PPSSPP, no .done file at all: same fallback"
-run_game with "" poweroff
-use_log
-check "marker armed at ok time" test "$MARKER_AT_OK" = "$EXPECT_MARKER"
-check "no state file" absent "$STATEFILE"
-check "log says not saved" contains "$LOG" 'Power-off state NOT saved'
-end
-
-begin "5 resume (slot 9) with a state file starts PPSSPP from it"
-mkdir -p "$STATES/autoresume"
-printf 'state' >"$STATEFILE"
-run_game with 9 "sleep"
-use_log
-check "--state passed" contains "$STUB/args" "^--state=$STATEFILE\$"
-check "slot file consumed" absent /tmp/resume_slot.txt
-check "no marker on a normal quit" absent "$MARKER"
-check "state removed after a normal quit" absent "$STATEFILE"
-end
-
-begin "6 normal open (slot 8) never uses the state file and drops it"
-mkdir -p "$STATES/autoresume"
-printf 'state' >"$STATEFILE"
-run_game with 8 "sleep"
-use_log
-check "no --state argument" lacks "$STUB/args" '^--state='
-check "state removed" absent "$STATEFILE"
 check "no marker" absent "$MARKER"
-check "shim files absent" absent "$OK"
-end
-
-begin "7 resume (slot 9) without a state file: plain launch"
-rm -f "$STATEFILE"
-run_game with 9 "sleep"
+check "ok file never created" absent "$OK"
+check "state saved on exit" present "$EXIT_STATE"
+check "preview from the save-on-exit state" cmp -s "$PREVIEW" "$FIX/thumb1.jpg"
+check "resume_slot.txt removed (minarch would pick it up)" absent /tmp/resume_slot.txt
 check "no --state argument" lacks "$STUB/args" '^--state='
 end
 
-begin "8 old PPSSPP never uses a leftover state file"
-mkdir -p "$STATES/autoresume"
-printf 'state' >"$STATEFILE"
-run_game without 9 "sleep"
+begin "4 auto-resume launch (slot 9): plain launch, PPSSPP auto-loads"
+reset_states
+printf 'state' >"$EXIT_STATE"
+run_game save 9 "" quit
+use_log
 check "no --state argument" lacks "$STUB/args" '^--state='
-check "user save-state dir untouched" present "$STATEFILE"
+check "slot file consumed" absent /tmp/resume_slot.txt
+check "no marker after a normal quit" absent "$MARKER"
+check "log says auto-resume launch" contains "$LOG" 'Auto-resume launch'
 end
 
-begin "9 stale request/ok files from an earlier boot are ignored"
+begin "5 crash: no marker"
+reset_states
+run_game save "" "" crash
+check "no marker" absent "$MARKER"
+check "no ok file" absent "$OK"
+end
+
+begin "6 stale request/ok files and marker from an earlier boot are ignored"
 : >"$REQ"
 : >"$OK"
-write_stub without
-printf 'sleep\n' >"$STUB/actions"
-sh "$PAK/launch.sh" "$ROMDIR/Game B.iso" >"$T/launch.out" 2>&1
+mkdir -p "$(dirname "$MARKER")"
+printf 'stale' >"$MARKER"
+printf 'save' >"$STUB/mode"
+printf 'quit\n' >"$STUB/actions"
+sh "$PAK/launch.sh" "$ROMFILE" >"$T/launch.out" 2>&1
 check "treated as a normal quit: no marker" absent "$MARKER"
 check "stale request removed" absent "$REQ"
 check "stale ok removed" absent "$OK"
 check "pid file removed on exit" absent "$PIDFILE"
 end
 
-begin "10 give-up path: device does not power off, marker removed, back to the menu"
-PSP_AUTORESUME_WAIT=2 NOKILL=1 run_game without "" poweroff
+begin "7 give-up path: device does not power off, marker removed, back to the menu"
+PSP_AUTORESUME_WAIT=2 NOKILL=1 run_game save "" req hang
 use_log
 check "launch.sh returned by itself" test -z "$LAUNCH_HUNG"
 check "marker removed again" absent "$MARKER"
@@ -304,25 +343,15 @@ check "req/ok removed" absent "$REQ"
 check "log says device did not power off" contains "$LOG" 'Device did not power off'
 end
 
-begin "11 ROM outside the SD card: nothing armed, no 60 s wait, shim released"
+begin "8 ROM outside the SD card: nothing armed, no 60 s wait, shim released"
 mkdir -p "$T/outside"
 printf 'o' >"$T/outside/Game O.iso"
-ROMFILE="$T/outside/Game O.iso" NOKILL=1 run_game without "" poweroff
+ROMFILE="$T/outside/Game O.iso" NOKILL=1 run_game save "" req hang
 use_log
 check "launch.sh returned by itself" test -z "$LAUNCH_HUNG"
 check "no marker" absent "$MARKER"
 check "shim released anyway" present "$OK"
 check "log says not armed" contains "$LOG" 'Auto-resume not armed'
-end
-
-begin "12 the real poweroff shim talks to launch.sh, marker is there when poweroff runs"
-run_game without "" shim
-use_log
-check "marker armed at ok time" test "$MARKER_AT_OK" = "$EXPECT_MARKER"
-check "shim reached the real poweroff" wait_for "$STUB/real-called"
-check "real poweroff got the args" contains "$STUB/real-called" '^-f$'
-check "marker was on disk when poweroff ran" contains "$STUB/marker_at_poweroff" "Game B.iso"
-check "log says power-off detected" contains "$LOG" 'Power-off detected: .*psp-poweroff-req'
 end
 
 echo

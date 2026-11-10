@@ -1,7 +1,9 @@
 PAK_NAME := $(shell jq -r .name pak.json)
 
 MINUI_POWER_CONTROL_VERSION := 1.1.0
-PPSSPP_RELEASE_URL := https://github.com/ben16w/PPSSPP-spruce/releases/download/beta-main
+# PPSSPP build with "Save state on exit" (Stapta-nl/ppsspp save-on-exit-v1.20.3).
+# Override on the command line, e.g. make build PPSSPP_RELEASE_URL=https://.../beta-main
+PPSSPP_RELEASE_URL ?= https://github.com/Stapta-nl/PPSSPP-spruce/releases/download/beta-save-on-exit
 SPRUCEOS_PSP_URL := https://raw.githubusercontent.com/spruceUI/spruceOS/main/Emu/PSP
 STB_COMMIT := d14d46f6b44456eb88beac58cba833a4135d4c89
 
