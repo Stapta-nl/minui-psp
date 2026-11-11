@@ -113,7 +113,8 @@ jobs:
       - name: Test auto-resume at power-off (BusyBox)
         timeout-minutes: 5
         run: |
-          docker run --rm -v "$PWD:/repo:ro" -v "$RUNNER_TEMP:$RUNNER_TEMP" \
+          # --privileged: launch.sh bind-mounts SAVEDATA/state, which needs CAP_SYS_ADMIN.
+          docker run --rm --privileged -v "$PWD:/repo:ro" -v "$RUNNER_TEMP:$RUNNER_TEMP" \
             -e SRC_PAK="$RUNNER_TEMP/rel" -e OUT_DIR="$RUNNER_TEMP/test-out/autoresume-busybox" \
             busybox:1.36.1 sh /repo/tests/device/autoresume.sh
 
