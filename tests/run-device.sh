@@ -250,9 +250,10 @@ if [ "$rc" -le 1 ]; then
     # shellcheck disable=SC2317 # called through run_step
     run_reboot() { bash tests/run-reboot.sh "$platform" "$stage"; }
     run_step /dev/null run_reboot || reboot_rc=$?
-    for f in "$stage/reboot-console.log" "$stage/reboot/output.tap" "$stage/reboot/stderr.log"; do
-        [ -f "$f" ] && redact <"$f" >"$f.tmp" && mv "$f.tmp" "$f"
-    done
+    # Every text file of the reboot run (console, TAP, JUnit XML, logs, evidence); not images.
+    while IFS= read -r f; do
+        redact <"$f" >"$f.tmp" && mv "$f.tmp" "$f"
+    done < <(find "$stage/reboot" "$stage/reboot-console.log" -type f \( -name '*.log' -o -name '*.tap' -o -name '*.xml' -o -name '*.txt' -o -name '*.shotname' -o -name exit-code \) 2>/dev/null)
 else
     echo "== $platform: not running the tests that reboot the device (the device tests failed with status $rc)"
 fi

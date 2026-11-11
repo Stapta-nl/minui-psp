@@ -40,12 +40,13 @@
 # Monitor pak is optional (evidence screenshots).
 #
 # The device is kept awake while the tests wait: every KEEPAWAKE_INTERVAL seconds a harmless
-# button tap is injected (KEEPAWAKE_KEY, default y); a device that looks asleep is woken with a
-# short power key tap instead. A device in DEEP sleep does not answer ssh, so it cannot be woken
+# button tap is injected (KEEPAWAKE_KEY, default l1); a device whose backlight node bl_power says
+# powered down (never on a guess) is woken with a short power key tap instead. A device in DEEP sleep does not answer ssh, so it cannot be woken
 # from here: prevention is what the tests rely on.
 #
 # Backup: recents, game_switcher, auto_resume, the slot file and previews of the test game, and
-# ppsspp.ini are backed up on the SD card (/.userdata/shared/.psp-reboot-backup) and restored at
+# ppsspp.ini, and a copy of every file in the save state folder (the tests overwrite a slot of the
+# test game), are backed up on the SD card (/.userdata/shared/.psp-reboot-backup) and restored at
 # the end; a run that is cut short is restored at the start of the next one. New save states
 # are deleted.
 #
@@ -94,6 +95,11 @@ refute_dev() { # refute_dev <script>: the script fails on the device (not an ssh
         echo "expected the device script to fail normally (status 1..123), got $status: $1" >&2
         return 1
     fi
+}
+
+# Arrays are not exported from setup_file into the tests, so the ssh setup runs for every test.
+setup() {
+    rb_ssh_setup
 }
 
 setup_file() {

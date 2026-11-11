@@ -1,4 +1,5 @@
 # shellcheck shell=bash
+# shellcheck disable=SC2016 # patterns that must stay literal
 # shellcheck disable=SC2034 # settings are read by the functions of e2e.bash, which is sourced next to this file
 # Device-side half of tests/bats/reboot.bats.
 #
@@ -9,7 +10,7 @@
 # Everything is bash and BusyBox friendly (no GNU only tools).
 #
 # Settings (env; the host passes them): SD (/mnt/SDCARD)  PLATFORM  PAK_NAME  ROM_DIR  ROM
-#   EXIT_KEYS (select+start)  UI_WAIT  CHORD_HOLD  KEEPAWAKE_KEY (y)  POWER_DEV_NAME  SLEEP_PROBE
+#   EXIT_KEYS (select+start)  UI_WAIT  CHORD_HOLD  KEEPAWAKE_KEY (l1)  POWER_DEV_NAME  SLEEP_PROBE
 # Test hooks (host unit tests only): RB_TMP (/tmp)  RB_REBOOT_CMD  RB_HARD_REBOOT_CMD  BOOT_ID_FILE
 
 # The files e2e.bash's backup/restore helpers use ($BAK/present, absent, states.before, marker,
@@ -91,6 +92,16 @@ rb_reboot_cmd() {
 }
 
 # --- preflight -------------------------------------------------------------------------
+# True if the shim reads PSP_POWEROFF_REAL and PSP_POWEROFF_TMP in a non-comment line
+# (bin/poweroff: REAL_POWEROFF="${PSP_POWEROFF_REAL:-/sbin/poweroff}").
+rb_shim_honours_override() {
+    local code
+    code="$(grep -v '^[[:space:]]*#' "$1" 2>/dev/null)"
+    case "$code" in *'${PSP_POWEROFF_REAL'*) ;; *) return 1 ;; esac
+    case "$code" in *'${PSP_POWEROFF_TMP'*) ;; *) return 1 ;; esac
+    case "$code" in *'exec "$REAL_POWEROFF"'*) ;; *) return 1 ;; esac
+}
+
 # Prints one "FAIL: ..." line per problem and returns 1 if there is any.
 rb_preflight() {
     local bad=0 tmp p
@@ -101,8 +112,12 @@ rb_preflight() {
     [ -f "$INI" ] || fail_ "$INI missing (start a game once so PPSSPP writes it)"
     [ -x "$PAK/bin/jpg2bmp" ] || fail_ "$PAK/bin/jpg2bmp missing (install a pak built by CI or make build)"
     [ -f "$PAK/bin/poweroff" ] || fail_ "$PAK/bin/poweroff (the shim) is missing: this pak has no auto-resume"
-    grep -q 'PSP_POWEROFF_REAL' "$PAK/bin/poweroff" 2>/dev/null ||
-        fail_ "the shim does not support PSP_POWEROFF_REAL: the test cannot turn the power-off into a reboot, so it must not run"
+    # The shim must USE the override in code (not just mention it in a comment). If it does not,
+    # nothing below may run: the probe would reach the real /sbin/poweroff.
+    if [ -f "$PAK/bin/poweroff" ] && ! rb_shim_honours_override "$PAK/bin/poweroff"; then
+        echo "FAIL: the shim does not use \${PSP_POWEROFF_REAL} and \${PSP_POWEROFF_TMP} in code: the test cannot turn the power-off into a reboot, so it must not run"
+        return 1
+    fi
     [ -f "$RB_TMP/nextui_exec" ] || fail_ "NextUI launcher not running ($RB_TMP/nextui_exec missing)"
     [ -c "${PAD:-}" ] || fail_ "TRIMUI Player1 input device not found"
     [ -d "${ROM_DIR:-}" ] || fail_ "no Roms/*(PSP) folder found (set ROM_DIR)"
@@ -114,7 +129,7 @@ rb_preflight() {
     case "$SD$BAK$ROM" in *"'"*) fail_ "paths with a single quote are not supported" ;; esac
     # The shim must call the program named in PSP_POWEROFF_REAL: prove it with a harmless one,
     # in a private temp dir so that no pid file makes the shim wait or touch the real ones.
-    if [ -f "$PAK/bin/poweroff" ] && tmp="$(mktemp -d "$RB_TMP/psp-probe.XXXXXX" 2>/dev/null)"; then
+    if [ "$bad" = 0 ] && tmp="$(mktemp -d "$RB_TMP/psp-probe.XXXXXX" 2>/dev/null)"; then
         printf '#!/bin/sh\necho "$*" >"%s/probe-called"\n' "$tmp" >"$tmp/fake"
         chmod +x "$tmp/fake"
         PSP_POWEROFF_TMP="$tmp" PSP_POWEROFF_REAL="$tmp/fake" sh "$PAK/bin/poweroff" --probe >/dev/null 2>&1 </dev/null
@@ -135,6 +150,7 @@ rb_backup() {
         echo "found the backup of an aborted run: restoring those files first"
         rb_stop_game
         restore_files
+        rb_restore_states
         rm -f "$BAK/active"
     fi
     rm -f "$BAK/present" "$BAK/absent" "$BAK/states.before" "$BAK/marker" "$BAK"/evidence-* "$BAK/wrapper.log" "$BAK/trigger.log"
@@ -144,7 +160,28 @@ rb_backup() {
     for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && stash "$f"; done
     mkdir -p "$STATE_DIR"
     ls -1 "$STATE_DIR" >"$BAK/states.before" 2>/dev/null
+    # The tests save states (a slot of the test game is overwritten), so keep copies of every
+    # existing state file and put them back in rb_restore.
+    rm -rf "$BAK/states"
+    mkdir -p "$BAK/states"
+    for f in "$STATE_DIR"/*; do
+        [ -f "$f" ] || continue
+        cp -p "$f" "$BAK/states/" || return 1
+    done
     sync
+}
+
+# Puts back the state files backed up by rb_backup that were changed or deleted.
+rb_restore_states() {
+    local f n rc=0
+    [ -d "$BAK/states" ] || return 0
+    for f in "$BAK/states"/*; do
+        [ -f "$f" ] || continue
+        n="$STATE_DIR/${f##*/}"
+        cmp -s "$f" "$n" 2>/dev/null || cp -p "$f" "$n" || rc=1
+    done
+    sync
+    return "$rc"
 }
 
 # Stops the emulator without saving anything, waits for NextUI to be back.
@@ -169,6 +206,8 @@ rb_restore() {
     rb_stop_game
     rm -f "$WRAPPER"
     restore_files
+    rb_restore_states
+    rm -rf "$BAK/states"
     rm -f "$BAK/active"
     kill_ui || true # NextUI starts again with the restored recents and without a marker
     return 0
@@ -282,15 +321,44 @@ rb_has_new_preview() {
     slot="$(rb_newest_new_slot)"
     [ -n "$slot" ] && rb_preview_exists "$slot"
 }
-# One line per state: the ls -l text (name, size, time). Lines of a snapshot taken earlier
-# are still found by rb_states_intact when nothing was changed or deleted.
+# A checksum of a file's content: md5sum, else cksum, else sha1sum, else only the size.
+rb_sum() {
+    local out
+    if out="$(md5sum "$1" 2>/dev/null)"; then :
+    elif out="$(cksum "$1" 2>/dev/null)"; then :
+    elif out="$(sha1sum "$1" 2>/dev/null)"; then :
+    else out="size-only"
+    fi
+    printf '%s' "${out%% *}"
+}
+# One line per state file (.ppst and .jpg, no undo copies): "<name> <size> <checksum>".
 rb_snapshot_states() {
     local f
-    for f in $(rb_all_states); do
-        ls -l --full-time "$f" 2>/dev/null || ls -l "$f"
+    for f in "$STATE_DIR"/*.ppst "$STATE_DIR"/*.jpg; do
+        [ -f "$f" ] || continue
+        case "$f" in *undo*) continue ;; esac
+        printf '%s %s %s\n' "${f##*/}" "$(wc -c <"$f" | tr -d ' ')" "$(rb_sum "$f")"
     done | sort
 }
-rb_save_snapshot() { rb_snapshot_states >"$BAK/evidence-states-before"; sync; }
+# Waits (up to ~30 s) until two reads one second apart are equal: PPSSPP may still be writing.
+rb_wait_states_stable() {
+    local a b n=0
+    a="$(rb_snapshot_states)"
+    while [ "$n" -lt 30 ]; do
+        sleep 1
+        b="$(rb_snapshot_states)"
+        [ "$a" = "$b" ] && return 0
+        a="$b"
+        n=$((n + 1))
+    done
+    echo "the state files kept changing for 30 s" >&2
+    return 1
+}
+rb_save_snapshot() {
+    rb_wait_states_stable || return 1
+    rb_snapshot_states >"$BAK/evidence-states-before"
+    sync
+}
 rb_states_intact() {
     local line now
     [ -s "$BAK/evidence-states-before" ] || { echo "no snapshot of the states" >&2; return 1; }
@@ -361,21 +429,21 @@ rb_hard_reboot() {
 # True if the screen looks off (backlight at 0 or powered down). SLEEP_PROBE (a command, true
 # when asleep) overrides this for devices where the sysfs guess is wrong.
 rb_asleep() {
-    local f v
+    local f v found=0
     if [ -n "${SLEEP_PROBE:-}" ]; then
         sh -c "$SLEEP_PROBE" >/dev/null 2>&1
         return
     fi
-    for f in /sys/class/backlight/*/bl_power; do
+    # One clear signal only: a backlight node that says "powered down" (bl_power != 0, the
+    # FB_BLANK values). A brightness of 0 proves nothing (it can be the user's setting), and
+    # without a bl_power node the answer is "awake": the power key is never tapped on a guess.
+    for f in "${RB_BACKLIGHT_DIR:-/sys/class/backlight}"/*/bl_power; do
         [ -r "$f" ] || continue
+        found=1
         read -r v <"$f"
         [ "$v" = 0 ] || return 0
     done
-    for f in /sys/class/backlight/*/brightness; do
-        [ -r "$f" ] || continue
-        read -r v <"$f"
-        [ "$v" = 0 ] && return 0
-    done
+    [ "$found" = 1 ] && return 1
     return 1
 }
 
@@ -401,7 +469,7 @@ rb_tick() {
     if rb_asleep; then
         rb_wake
     else
-        press "${KEEPAWAKE_KEY:-y}"
+        press "${KEEPAWAKE_KEY:-l1}"
     fi
 }
 

@@ -33,6 +33,10 @@ rb_ssh_setup() {
     RB_SSH+=("${extra[@]}")
 }
 
+# Arrays are not exported, so a bats test (its own subshell) does not see what setup_file set
+# up: every ssh call makes sure RB_SSH exists.
+rb_ssh_ready() { [ "${#RB_SSH[@]}" -gt 0 ] || rb_ssh_setup; }
+
 # Masks the device address in text (stdin to stdout).
 rb_scrub() {
     local host="${DEVICE_HOST//[[:space:]]/}" esc
@@ -48,6 +52,7 @@ rb_scrub() {
 # 124 on a timeout, 255 when ssh cannot connect. stdout is the script's, stderr is scrubbed.
 dev_run() {
     local limit="$1" script="$2" errf rc
+    rb_ssh_ready || { echo "DEVICE_HOST is not set" >&2; return 2; }
     errf="$(mktemp "${TMPDIR:-/tmp}/rb-ssh-err.XXXXXX")" || return 2
     timeout -k 3 "$limit" "${RB_SSH[@]}" "$DEVICE_HOST" "bash -c $(rb_q "$script")" </dev/null 2>"$errf"
     rc=$?
@@ -80,6 +85,7 @@ dev_ok() { dev_kit "$1" "$2" >/dev/null 2>&1; }
 # Streams the device-side functions to the device (needed after every boot).
 dev_install_kit() {
     local here="${BASH_SOURCE[0]%/*}" errf rc
+    rb_ssh_ready || { echo "DEVICE_HOST is not set" >&2; return 2; }
     errf="$(mktemp "${TMPDIR:-/tmp}/rb-ssh-err.XXXXXX")" || return 2
     cat "$here/e2e.bash" "$here/reboot-device.bash" |
         timeout -k 3 60 "${RB_SSH[@]}" "$DEVICE_HOST" "cat >$(rb_q "$RB_KIT_PATH.part") && mv $(rb_q "$RB_KIT_PATH.part") $(rb_q "$RB_KIT_PATH")" 2>"$errf"
@@ -151,5 +157,8 @@ await_reboot() {
     await "${REBOOT_DOWN_TIMEOUT:-90}" "the device to go down (reboot)" rb_went_down "$old" || { RB_TICK=$tick; return 1; }
     await "${REBOOT_UP_TIMEOUT:-300}" "the device to come back (ssh and a new boot id)" rb_is_back "$old" || { RB_TICK=$tick; return 1; }
     RB_TICK=$tick
-    await 60 "the kit to be installed after the reboot" dev_install_kit
+    await 60 "the kit to be installed after the reboot" dev_install_kit || return 1
+    # The SD card is mounted a little after ssh is up: the backup flag lives on it, and the
+    # evidence the power-off wrapper recorded too.
+    await 120 "the SD card to be mounted after the reboot" dev_ok 20 '[ -f "$BAK/active" ]'
 }

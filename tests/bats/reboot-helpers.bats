@@ -167,9 +167,20 @@ make_device() {
     assert_success
 }
 
+@test "await_reboot: also waits for the SD card (the backup flag) after the boot" {
+    export FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=3 REBOOT_DOWN_TIMEOUT=5 REBOOT_UP_TIMEOUT=10
+    rm -f "$BAK/active"
+    ( sleep 2; mkdir -p "$BAK"; : >"$BAK/active" ) 3>&- &
+    run await_reboot oldboot
+    assert_success
+    assert_file_exist "$BAK/active"
+}
+
 @test "await_reboot: down, then up with a new boot id, then the kit is installed again" {
     export FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=3 FAKE_SSH_NEWBOOT_AT=4
     export REBOOT_DOWN_TIMEOUT=5 REBOOT_UP_TIMEOUT=10
+    mkdir -p "$BAK"
+    : >"$BAK/active"
     run await_reboot oldboot
     assert_success
     assert_file_exist "$RB_KIT_PATH"
@@ -188,6 +199,24 @@ make_device() {
     run await_reboot oldboot
     assert_failure
     assert_output --partial "the device to come back"
+}
+
+@test "dev_run works inside a bats test when only setup_file ran rb_ssh_setup (arrays are not exported)" {
+    {
+        printf '%s\n' '#!/usr/bin/env bats'
+        printf "load '%s/helpers/common'\n" "$TESTS_DIR"
+        printf "load '%s/helpers/reboot'\n" "$TESTS_DIR"
+        printf '%s\n' 'setup_file() { rb_ssh_setup; }'
+        printf '%s\n' '@test "dev_run in a test" {' "    run dev_run 10 'echo hello'" '    assert_success' '    assert_output hello' '}'
+    } >"$T/probe.bats"
+    run env -i PATH="$PATH" HOME="${HOME:-/tmp}" DEVICE_HOST="$DEVICE_HOST" DEVICE_SSH_OPTS="$DEVICE_SSH_OPTS" \
+        FAKE_SSH_STATE="$FAKE_SSH_STATE" FAKE_SSH_LOG="$FAKE_SSH_LOG" bash "$TESTS_DIR/lib/bats-core/bin/bats" "$T/probe.bats"
+    assert_success
+}
+
+@test "reboot.bats sets the ssh command up for every test (setup), not only in setup_file" {
+    run awk '/^setup\(\) \{/{f=1} f&&/rb_ssh_setup/{ok=1} /^\}/{f=0} END{exit !ok}' "$TESTS_DIR/bats/reboot.bats"
+    assert_success
 }
 
 # --- device side: ini ----------------------------------------------------------------------
@@ -345,13 +374,64 @@ mess_up() {
     run rb_states_intact
     assert_failure
     assert_output --partial "state changed or gone"
+    printf 'cccc' >"$STATE_DIR/G_1.00_1.ppst" # same size, other content
+    run rb_states_intact
+    assert_failure
     printf 'bbbb' >"$STATE_DIR/G_1.00_1.ppst"
-    touch -d '2001-01-01 00:00:00' "$STATE_DIR/G_1.00_1.ppst"
+    run rb_states_intact
+    assert_success
+    printf 'thumb' >"$STATE_DIR/G_1.00_1.jpg"
+    rb_save_snapshot
+    printf 'thumX' >"$STATE_DIR/G_1.00_1.jpg" # the thumbnail counts too
     run rb_states_intact
     assert_failure
     rm -f "$BAK/evidence-states-before"
     run rb_states_intact
     assert_failure
+}
+
+@test "rb_wait_states_stable: waits for a state that is still being written" {
+    mkdir -p "$BAK"
+    printf 'a' >"$STATE_DIR/G_1.00_0.ppst"
+    ( sleep 0.5; printf 'aaaa' >"$STATE_DIR/G_1.00_0.ppst" ) 3>&- &
+    rb_save_snapshot
+    run cat "$BAK/evidence-states-before"
+    assert_output --partial "G_1.00_0.ppst 4 "
+}
+
+@test "rb_sum: gives a checksum of the content, whatever tool the device has" {
+    printf 'abc' >"$T/f1"
+    printf 'abd' >"$T/f2"
+    [ "$(rb_sum "$T/f1")" != "$(rb_sum "$T/f2")" ]
+    [ "$(rb_sum "$T/f1")" = "$(rb_sum "$T/f1")" ]
+}
+
+@test "rb_backup + rb_restore: existing save states are backed up and put back" {
+    seed_files
+    printf 'mine' >"$STATE_DIR/MY_1.00_0.ppst"
+    printf 'thumb' >"$STATE_DIR/MY_1.00_0.jpg"
+    rb_backup
+    printf 'overwritten by the test' >"$STATE_DIR/MY_1.00_0.ppst"
+    rm -f "$STATE_DIR/MY_1.00_0.jpg"
+    : >"$STATE_DIR/NEW_1.00_1.ppst"
+    rb_restore
+    run cat "$STATE_DIR/MY_1.00_0.ppst"
+    assert_output mine
+    run cat "$STATE_DIR/MY_1.00_0.jpg"
+    assert_output thumb
+    assert_file_not_exist "$STATE_DIR/NEW_1.00_1.ppst"
+    assert_file_not_exist "$BAK/states"
+}
+
+@test "rb_backup: the states of an aborted run are put back too" {
+    seed_files
+    printf 'mine' >"$STATE_DIR/MY_1.00_0.ppst"
+    rb_backup
+    printf 'overwritten' >"$STATE_DIR/MY_1.00_0.ppst"
+    run rb_backup
+    assert_success
+    run cat "$STATE_DIR/MY_1.00_0.ppst"
+    assert_output mine
 }
 
 # --- device side: the power-off wrapper with the real shim ---------------------------------------
@@ -477,6 +557,30 @@ mess_up() {
     [ ! -s "$PAD" ]
 }
 
+@test "rb_asleep: only bl_power != 0 counts; brightness 0 or no node never does" {
+    export RB_BACKLIGHT_DIR="$T/bl"
+    run rb_asleep
+    assert_failure # no node at all
+    mkdir -p "$T/bl/panel"
+    echo 0 >"$T/bl/panel/brightness"
+    run rb_asleep
+    assert_failure # brightness 0 is not evidence
+    echo 0 >"$T/bl/panel/bl_power"
+    run rb_asleep
+    assert_failure
+    echo 4 >"$T/bl/panel/bl_power"
+    run rb_asleep
+    assert_success
+}
+
+@test "rb_tick: with no backlight evidence it taps the pad and never the power key" {
+    export RB_BACKLIGHT_DIR="$T/none"
+    PAD="$T/pad"
+    : >"$PAD"
+    POWER_DEV_NAME='.*' CHORD_HOLD=0.1 rb_tick
+    [ -s "$PAD" ]
+}
+
 # --- the preflight -----------------------------------------------------------------------------
 @test "rb_preflight: a good tree passes (as root)" {
     [ "$(id -u)" = 0 ] || skip "needs root (the preflight checks it)"
@@ -486,18 +590,38 @@ mess_up() {
     assert_output ""
 }
 
-@test "rb_preflight: refuses a shim that does not honour PSP_POWEROFF_REAL (a real power-off would follow)" {
-    printf '#!/bin/sh\nexec /sbin/poweroff\n' >"$PAK/bin/poweroff"
+@test "rb_preflight: refuses a shim that ignores PSP_POWEROFF_REAL, and never runs it (it would power off)" {
+    printf '#!/bin/sh\ntouch "%s/shim-ran"\nexit 0\n' "$T" >"$PAK/bin/poweroff"
     RB_REBOOT_CMD=/bin/true run rb_preflight
     assert_failure
     assert_output --partial "PSP_POWEROFF_REAL"
+    assert_file_not_exist "$T/shim-ran"
 }
 
-@test "rb_preflight: a shim that names the override but does not call it is refused too" {
-    printf '#!/bin/sh\n# PSP_POWEROFF_REAL\nexit 0\n' >"$PAK/bin/poweroff"
+@test "rb_preflight: a shim that only mentions the override in a comment is refused without running it" {
+    printf '#!/bin/sh\n# ${PSP_POWEROFF_REAL:-x} ${PSP_POWEROFF_TMP:-y} exec "$REAL_POWEROFF"\ntouch "%s/shim-ran"\n' "$T" >"$PAK/bin/poweroff"
+    RB_REBOOT_CMD=/bin/true run rb_preflight
+    assert_failure
+    assert_output --partial "PSP_POWEROFF_REAL"
+    assert_file_not_exist "$T/shim-ran"
+}
+
+@test "rb_preflight: a shim that reads the override but never calls it fails the probe (nothing real is reached)" {
+    cat >"$PAK/bin/poweroff" <<'SHIM'
+#!/bin/sh
+TMP_DIR="${PSP_POWEROFF_TMP:-/tmp}"
+REAL_POWEROFF="${PSP_POWEROFF_REAL:-/sbin/poweroff}"
+exit 0
+exec "$REAL_POWEROFF" "$@"
+SHIM
     RB_REBOOT_CMD=/bin/true run rb_preflight
     assert_failure
     assert_output --partial "did not call PSP_POWEROFF_REAL"
+}
+
+@test "rb_preflight: the real shim passes the static check" {
+    run rb_shim_honours_override "$PAK/bin/poweroff"
+    assert_success
 }
 
 @test "rb_preflight: names every problem (missing pak, game, ini, ...)" {
