@@ -25,7 +25,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7.0.1
 
-      # lint, poweroff shim and auto-resume tests; the full suite (bats, aarch64 jpg2bmp) runs in build.
+      # lint and the auto-resume test; the full suite (bats, incl. the poweroff shim; aarch64 jpg2bmp) runs in build.
       - name: Run shell tests
         run: make test-shell
 

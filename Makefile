@@ -32,20 +32,20 @@ export $(DEVICE_VARS)
 # bin/jpg2bmp must be an aarch64 binary. CI builds natively on ubuntu-24.04-arm;
 # when building elsewhere pass a cross compiler, e.g. CC=aarch64-linux-gnu-gcc.
 
-# Off-device checks: syntax, shellcheck, poweroff shim protocol.
+# Off-device checks: syntax, shellcheck, the auto-resume test.
 # POSIX sh scripts (sh -n); the test runners tests/run-*.sh, bundle.sh and collect.sh are bash.
-SH_FILES := launch.sh bin/poweroff $(wildcard scripts/*.sh) tests/autoresume.sh tests/poweroff_shim_test.sh
+SH_FILES := launch.sh bin/poweroff $(wildcard scripts/*.sh) tests/autoresume.sh
 SHELL_FILES := $(SH_FILES) $(filter-out $(SH_FILES),$(wildcard tests/*.sh))
 
 lint:
 	for f in $(SH_FILES); do sh -n "$$f" || exit 1; done
 	shellcheck -x $(SHELL_FILES)
 
-# The poweroff shim protocol and the auto-resume logic (real launch.sh, stub PPSSPP).
-# Part of "make test" (see below); SRC_PAK from the command line is passed on to the script.
+# The auto-resume logic (real launch.sh, stub PPSSPP, real bind mounts; needs root or sudo).
+# Plain sh on purpose: CI also runs it under BusyBox in docker (see ci.yaml). The poweroff shim
+# protocol is tests/bats/poweroff.bats. Part of "make test"; SRC_PAK is passed on to the script.
 .PHONY: lint test-shell
 test-shell: lint
-	sh tests/poweroff_shim_test.sh
 	sh tests/autoresume.sh
 
 clean:
