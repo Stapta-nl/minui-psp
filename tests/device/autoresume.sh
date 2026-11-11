@@ -52,6 +52,18 @@ REQ=/tmp/psp-poweroff-req
 OK=/tmp/psp-poweroff-ok
 PIDFILE=/tmp/psp-pak.pid
 
+# launch.sh bind-mounts into the sandbox, which needs root. Unprivileged (e.g. the GitHub
+# runner), go through sudo; without it the mounts would silently fail, launch.sh would
+# (correctly) skip its umounts, and the teardown checks would test nothing.
+SUDO=""
+if [ "$(id -u)" != 0 ]; then
+    if ! sudo -n true 2>/dev/null; then
+        echo "autoresume.sh: needs root or passwordless sudo for launch.sh's bind mounts" >&2
+        exit 2
+    fi
+    SUDO="sudo -n"
+fi
+
 PASS=0
 FAIL=0
 rm -rf "$OUT_DIR"
@@ -63,7 +75,7 @@ drop_mounts() {
     for m in "$PAK/PPSSPP/.config/ppsspp/PSP/SAVEDATA" "$PAK/PPSSPP/.config/ppsspp/PSP/PPSSPP_STATE"; do
         n=0
         while grep -q " $m " /proc/self/mountinfo 2>/dev/null && [ "$n" -lt 10 ]; do
-            umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
+            $SUDO umount "$m" 2>/dev/null || $SUDO umount -l "$m" 2>/dev/null
             n=$((n + 1))
         done
     done
@@ -121,6 +133,10 @@ printf '#!/bin/sh\nexit 0\n' >"$PAK/bin/show_message"
 # Stand-in converter: the "BMP" is a copy of the thumbnail (run.sh tests the real one).
 # shellcheck disable=SC2016 # $1/$2 belong to the generated script
 printf '#!/bin/sh\ncp "$1" "$2"\n' >"$PAK/bin/jpg2bmp"
+if [ -n "$SUDO" ]; then
+    printf '#!/bin/sh\nexec sudo -n /bin/mount "$@"\n' >"$PAK/bin/mount"
+    printf '#!/bin/sh\nexec sudo -n /bin/umount "$@"\n' >"$PAK/bin/umount"
+fi
 chmod +x "$PAK/bin/"*
 # The real shim, deliberately without the exec bit: launch.sh must set it.
 cp "$SRC_PAK/bin/poweroff" "$PAK/bin/poweroff"
