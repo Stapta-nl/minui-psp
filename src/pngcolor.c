@@ -1,6 +1,6 @@
 /*
  * pngcolor: print the average "R G B" of the centre 40% x 40% of a PNG.
- * Used by tests/device/e2e.sh to check what a screenshot of the Game Switcher shows
+ * Used by tests/bats/e2e.bats to check what a screenshot of the Game Switcher shows
  * (the test fixtures are solid red / blue), without needing Python on the device.
  *
  * Usage: pngcolor <input.png>

@@ -10,10 +10,10 @@
 # SD card is touched. It does use the fixed /tmp paths launch.sh uses (/tmp/psp-*,
 # /tmp/resume_slot.txt, /tmp/stay_awake).
 #
-# Usage: sh tests/device/autoresume.sh      (env: SRC_PAK, PLATFORM, OUT_DIR, KEEP=1)
+# Usage: sh tests/autoresume.sh             (env: SRC_PAK, PLATFORM, OUT_DIR, KEEP=1)
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-SRC_PAK="${SRC_PAK:-$(cd "$HERE/../.." && pwd)}"
+SRC_PAK="${SRC_PAK:-$(cd "$HERE/.." && pwd)}"
 PLATFORM="${PLATFORM:-tg5040}"
 OUT_DIR="${OUT_DIR:-/tmp/psp-autoresume-test-out}"
 
