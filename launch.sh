@@ -331,6 +331,40 @@ shutdown_in_progress() {
     return 1
 }
 
+# minui-power-control's shutdown script draws "Powering off" (minui-presenter,
+# forever) before PPSSPP's save is known to be done. Like NextUI's minarch
+# cores, say "Quicksave created, powering off" instead, but only once a state
+# really was saved during this launch (newer than $STATE_MARKER). Best effort:
+# show_message runs in the background and is never waited for; it times out
+# by itself if the device does not power off. A state counts as saved if it is
+# newer than the launch, so a state the player saved by hand counts too when
+# save-on-exit is off (no cheap reliable way to tell the two apart here).
+show_quicksave_message() {
+    saved=""
+    for ppst in "$STATE_DIR"/*.ppst; do
+        case "$ppst" in *.undo.ppst) continue ;; esac
+        # shellcheck disable=SC3013 # -nt is supported by BusyBox ash and dash
+        if [ -f "$ppst" ] && [ "$ppst" -nt "$STATE_MARKER" ]; then
+            saved=1
+            break
+        fi
+    done
+    [ -n "$saved" ] || return 0
+    command -v show_message >/dev/null 2>&1 || return 0
+    # The shim creates the request file only after the shutdown script has
+    # started its "Powering off" presenter: wait for it (at most 2 s, then go
+    # on anyway) so that our killall below cannot come too early.
+    waited=0
+    while [ ! -f "$POWEROFF_REQ" ] && [ "$waited" -lt 4 ]; do
+        sleep 0.5 2>/dev/null || sleep 1
+        waited=$((waited + 1))
+    done
+    echo "Showing the quicksave message."
+    # Replace the "Powering off" screen instead of drawing over it.
+    killall minui-presenter >/dev/null 2>&1 || true
+    show_message "Quicksave created, powering off" 10 >/dev/null 2>&1 &
+}
+
 # Arm auto-resume, tell the poweroff shim it may go ahead, then wait for the
 # power-off to finish. We must not return to NextUI/MinUI here: on its next
 # start it would read (and delete) the marker before the device is off.
@@ -357,9 +391,10 @@ arm_auto_resume_and_wait() {
     case "$budget" in "" | *[!0-9]*) budget=3 ;; esac
     used=$(($(now) - ${PPSSPP_EXIT_TS:-0}))
     if [ -n "$PPSSPP_EXIT_TS" ] && [ "$used" -gt "$budget" ]; then
-        echo "Skipping the Game Switcher preview: ${used}s since PPSSPP exited."
+        echo "Skipping the Game Switcher preview and the quicksave message: ${used}s since PPSSPP exited."
         PREVIEW_ROM=""
     else
+        [ "$armed" = 1 ] && show_quicksave_message
         write_game_switcher_preview
     fi
     : >"$POWEROFF_OK"

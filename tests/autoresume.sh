@@ -129,7 +129,10 @@ cp -R "$SRC_PAK/scripts" "$PAK/"
 cp "$SRC_PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini" "$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
 printf '#!/bin/sh\nexit 0\n' >"$PAK/bin/minui-power-control"
 printf '#!/bin/sh\nexit 0\n' >"$PAK/bin/setalpha"
-printf '#!/bin/sh\nexit 0\n' >"$PAK/bin/show_message"
+# Stand-in for the platform's show_message: records what it was asked to show.
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/shown"\n' "$STUB" >"$PAK/bin/show_message"
+# Stand-in killall: records instead of killing (launch.sh replaces "Powering off").
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/killall"\n' "$STUB" >"$PAK/bin/killall"
 # Stand-in converter: the "BMP" is a copy of the thumbnail (run.sh tests the real one).
 # shellcheck disable=SC2016 # $1/$2 belong to the generated script
 printf '#!/bin/sh\ncp "$1" "$2"\n' >"$PAK/bin/jpg2bmp"
@@ -258,7 +261,7 @@ run_game() {
     shift 3
     rm -f "$STUB/args" "$STUB/pid" "$STUB/pakpid" "$STUB/saved_on_term" "$REQ" "$OK" "$MARKER" \
         /tmp/resume_slot.txt "$STUB/real-called" "$STUB/marker_at_poweroff" \
-        "$STUB/state_at_poweroff" "$STUB/preview_at_poweroff" /tmp/psp-poweroff-shim.log
+        "$STUB/state_at_poweroff" "$STUB/preview_at_poweroff" "$STUB/shown" "$STUB/killall" /tmp/psp-poweroff-shim.log
     printf '%s\n' "$@" >"$STUB/actions"
     [ -n "$slot" ] && printf '%s' "$slot" >/tmp/resume_slot.txt
     LAUNCH_HUNG=""
@@ -315,6 +318,10 @@ check "log says power-off detected" contains "$LOG" 'Power-off detected: .*psp-p
 check "log order: marker, then preview" sh -c "grep -v '^+' '$LOG' | grep -E 'Auto-resume armed|Game switcher preview' | head -1 | grep -q 'Auto-resume armed'"
 check "log shows the shipped settings" contains "$LOG" 'SaveStateOnExit=True AutoLoadSaveState=2'
 check "no autoresume dir created" absent "$STATES/autoresume"
+wait_for "$STUB/shown"
+check "quicksave message shown after the save" contains "$STUB/shown" '^Quicksave created, powering off 10$'
+check "quicksave message replaces the Powering off presenter" contains "$STUB/killall" '^minui-presenter$'
+check "log order: marker, message, preview, ok" sh -c "grep -v '^+' '$LOG' | grep -E 'Auto-resume armed|Showing the quicksave message|Game switcher preview|Told the poweroff shim' | cut -c1-14 | tr '\\n' '|' | grep -q 'Auto-resume ar|Showing the qu|Game switcher |Told the power|'"
 end
 
 begin "2 save on exit off: marker still armed, no new state, older preview untouched"
@@ -332,6 +339,8 @@ check "no save-on-exit state" absent "$EXIT_STATE"
 check "older state kept for auto-load" present "$STATES/${PREFIX}_2.ppst"
 check "old preview kept" contains "$SHARED/.minui/PSP/Game B.iso.2.bmp" '^oldbmp$'
 check "slot file unchanged" contains "$PREVIEW_SLOT" '^2$'
+check "no quicksave message (nothing was saved)" absent "$STUB/shown"
+check "presenter left alone (nothing was saved)" absent "$STUB/killall"
 end
 
 begin "3 normal quit (Exit hotkey/menu) with save on exit: preview, no marker"
@@ -340,6 +349,7 @@ run_game save 8 "" quit
 use_log
 check "no marker" absent "$MARKER"
 check "ok file never created" absent "$OK"
+check "no quicksave message on a normal quit" absent "$STUB/shown"
 check "state saved on exit" present "$EXIT_STATE"
 check "preview from the save-on-exit state" cmp -s "$PREVIEW" "$FIX/thumb1.jpg"
 check "resume_slot.txt removed (minarch would pick it up)" absent /tmp/resume_slot.txt
@@ -510,6 +520,15 @@ check "launch.sh ended by itself" test -z "$LAUNCH_HUNG"
 check "no marker" absent "$MARKER"
 check "stale request removed" absent "$REQ"
 check "log says stale" contains "$LOG" 'Ignoring a stale power-off request'
+end
+
+begin "16 power-off found only after the preview budget: no quicksave message"
+reset_states
+PSP_PREVIEW_BUDGET=0 PSP_SHUTDOWN_GRACE=6 run_game savesig "" late hang
+use_log
+check "marker armed" test "$MARKER_AT_OK" = "$EXPECT_MARKER"
+check "log: budget exhausted" contains "$LOG" 'Skipping the Game Switcher preview and the quicksave message'
+check "no quicksave message" absent "$STUB/shown"
 end
 
 echo
