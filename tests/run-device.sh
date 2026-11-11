@@ -23,6 +23,10 @@
 #
 # Forwarded to the device when set: SDCARD_PATH ROM_DIR ROM PSP_KEYS EXIT_KEYS BOOT_WAIT
 # UI_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT.
+#
+# Afterwards the tests tagged "reboot" (tests/bats/reboot.bats: they REBOOT the device) run on
+# this machine over ssh, see tests/run-reboot.sh; SKIP_REBOOT_TESTS=1 leaves them out. They
+# only run when the on-device tests passed or failed normally (exit status 0 or 1).
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 2
@@ -199,9 +203,11 @@ run_step dist/psp-device-tests.tar.gz rssh "cd '$remote_tmp' && gzip -dc | tar -
     finish 3 "copying the test bundle to the device failed"
 
 # Tests tagged platform:<name> run only on that platform; untagged device tests run everywhere.
-# Built from pak.json, so a new platform needs no change here.
-filter_platform="device,platform:$platform"
-filter_generic="device"
+# Built from pak.json, so a new platform needs no change here. Tests tagged "reboot" are left
+# out: they reboot the device, which would end this ssh session and bats with it, so they run
+# on this machine afterwards (tests/run-reboot.sh).
+filter_platform="device,!reboot,platform:$platform"
+filter_generic="device,!reboot"
 while IFS= read -r p; do
     filter_generic="$filter_generic,!platform:$p"
 done < <(jq -r '.platforms[]' pak.json)
@@ -235,4 +241,20 @@ if ! run_step /dev/null fetch_results; then
     finish 3 "fetching the results from the device failed (exit status of the tests: $rc)"
 fi
 [ "$rc" != 255 ] || finish 3 "the ssh connection broke while the tests ran"
+
+# The tests that reboot the device run from here, over ssh, with the same device settings;
+# the test bundle on the device is no longer needed (and /tmp does not survive a reboot).
+reboot_rc=0
+if [ "$rc" -le 1 ]; then
+    export DEVICE_HOST="$host" DEVICE_SSH_OPTS="$opts"
+    # shellcheck disable=SC2317 # called through run_step
+    run_reboot() { bash tests/run-reboot.sh "$platform" "$stage"; }
+    run_step /dev/null run_reboot || reboot_rc=$?
+    for f in "$stage/reboot-console.log" "$stage/reboot/output.tap" "$stage/reboot/stderr.log"; do
+        [ -f "$f" ] && redact <"$f" >"$f.tmp" && mv "$f.tmp" "$f"
+    done
+else
+    echo "== $platform: not running the tests that reboot the device (the device tests failed with status $rc)"
+fi
+[ "$rc" -ne 0 ] || rc="$reboot_rc"
 finish "$rc"
