@@ -129,7 +129,7 @@ rb_preflight() {
     case "$SD$BAK$ROM" in *"'"*) fail_ "paths with a single quote are not supported" ;; esac
     # The shim must call the program named in PSP_POWEROFF_REAL: prove it with a harmless one,
     # in a private temp dir so that no pid file makes the shim wait or touch the real ones.
-    if [ "$bad" = 0 ] && tmp="$(mktemp -d "$RB_TMP/psp-probe.XXXXXX" 2>/dev/null)"; then
+    if [ -f "$PAK/bin/poweroff" ] && tmp="$(mktemp -d "$RB_TMP/psp-probe.XXXXXX" 2>/dev/null)"; then
         printf '#!/bin/sh\necho "$*" >"%s/probe-called"\n' "$tmp" >"$tmp/fake"
         chmod +x "$tmp/fake"
         PSP_POWEROFF_TMP="$tmp" PSP_POWEROFF_REAL="$tmp/fake" sh "$PAK/bin/poweroff" --probe >/dev/null 2>&1 </dev/null
