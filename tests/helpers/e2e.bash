@@ -356,24 +356,60 @@ touch_marker() {
 # The lowest pid of the processes of that name ("" if none): pgrep lists them in pid order.
 first_pid() { pgrep "$1" 2>/dev/null | head -n 1; }
 
-# wait_ui_settled <stable s> <limit s>: NextUI is up, and it and its launcher are quiet: the SAME
-# nextui.elf process for <stable> consecutive polls (a NextUI that restarts, or that exits to
-# launch a game through /tmp/next, starts the count again) and no emulator. This is the "nothing
-# happened" signal for the absence checks (no auto-launch, no marker): an auto-resume acts
-# within a second or two of NextUI's start. Fails after <limit> s (the old fixed wait is the
-# backup) and says what it saw.
+# launch_sig <log file>: "<inode> <size> <first line>" of the pak log (PSP.txt), or "none". launch.sh
+# deletes PSP.txt and starts it again with its own command line on EVERY start (rm -f, then exec >>),
+# so a log with another inode, another first line or a SMALLER size than a reference taken before
+# is a new launch.sh run; appended text (a running game logging on) is not.
+launch_sig() {
+    local f="$1" ino first
+    [ -f "$f" ] || { echo none; return 0; }
+    # shellcheck disable=SC2012 # one known file; BusyBox stat may lack -c
+    ino="$(ls -i "$f" 2>/dev/null | awk '{ print $1 }')"
+    IFS= read -r first <"$f" || first=""
+    echo "$ino $(wc -c <"$f" | tr -d ' ') $first"
+}
+# launch_unchanged <reference sig> <log file>: true if no launch.sh ran since the reference was taken.
+launch_unchanged() {
+    local ref="$1" now ri rs rf ni ns nf
+    now="$(launch_sig "$2")"
+    [ "$ref" = "$now" ] && return 0
+    [ "$ref" = none ] || [ "$now" = none ] && return 1
+    ri="${ref%% *}" rs="${ref#* }" rf="${rs#* }" rs="${rs%% *}"
+    ni="${now%% *}" ns="${now#* }" nf="${ns#* }" ns="${ns%% *}"
+    [ "$ri" = "$ni" ] && [ "$rf" = "$nf" ] && [ "$ns" -ge "$rs" ]
+}
+
+# wait_ui_settled <quiet s> <limit s>: NextUI is up, and it and its launcher are quiet. Why this proves
+# "nothing launches by itself" (the absence checks of R1/R2/R6/R7: after a normal quit, a crash or a
+# forced reboot the device must come back to NextUI's menu and must NOT start the game: no auto-resume
+# marker is consumed and no PPSSPP appears): NextUI's main() calls autoResume() FIRST, before any
+# graphics or input init (nextui.c). With a marker it deletes it, queues the game in /tmp/next and
+# EXITS; without one it returns at once and NextUI goes on to its menu. So the decision is made within
+# moments of nextui.elf starting, and a nextui.elf that is the SAME process for <quiet> consecutive
+# polls has not exited to launch anything. Counted as quiet, per poll: the same nextui.elf pid, no
+# emulator process, no auto-resume marker ($AUTORESUME, if set: NextUI deletes it first thing, so it
+# still being there is a bug or a NextUI that has not run yet). If E2E_LAUNCH_REF is set (launch_sig of
+# the pak log before the event under test, log: E2E_LAUNCH_LOG, default $LOGS/PSP.txt) a rewritten log
+# (launch.sh ran) fails the wait AT ONCE: a positive "no launch" check next to the waiting. Fails
+# after <limit> s and says what it saw.
 wait_ui_settled() {
-    local stable="$1" limit="$2" n=0 ok=0 pid last="" game=""
+    local quiet="$1" limit="$2" n=0 ok=0 pid last="" game="" marker="" log="${E2E_LAUNCH_LOG:-${LOGS:-}/PSP.txt}"
     while :; do
         "${E2E_POLL_HOOK:-:}" || true
+        if [ -n "${E2E_LAUNCH_REF:-}" ] && ! launch_unchanged "$E2E_LAUNCH_REF" "$log"; then
+            echo "launch.sh was started (the pak log was rewritten: before: '$E2E_LAUNCH_REF', now: '$(launch_sig "$log")')" >&2
+            return 1
+        fi
         pid="$(first_pid nextui.elf)"
         game=""
+        marker=""
         pgrep PPSSPPSDL >/dev/null 2>&1 && game=1
-        if [ -n "$pid" ] && [ "$pid" = "$last" ] && [ -z "$game" ]; then ok=$((ok + 1)); else ok=0; fi
+        [ -n "${AUTORESUME:-}" ] && [ -e "$AUTORESUME" ] && marker=1
+        if [ -n "$pid" ] && [ "$pid" = "$last" ] && [ -z "$game" ] && [ -z "$marker" ]; then ok=$((ok + 1)); else ok=0; fi
         last="$pid"
-        [ "$ok" -ge "$stable" ] && return 0
+        [ "$ok" -ge "$quiet" ] && return 0
         if [ "$n" -ge "$limit" ]; then
-            echo "NextUI did not settle within ${limit}s (nextui.elf pid: ${pid:-none}${game:+, a game is running}; quiet polls: $ok of $stable)" >&2
+            echo "NextUI did not settle within ${limit}s (nextui.elf pid: ${pid:-none}${game:+, a game is running}${marker:+, the auto-resume marker exists}; quiet polls: $ok of $quiet)" >&2
             return 1
         fi
         sleep 1
@@ -398,20 +434,25 @@ rb_rom_running() {
     return 1
 }
 
-# wait_game_settled <stable s> <limit s>: the emulator runs the test ROM and has done so, as the
-# SAME process, for <stable> consecutive polls. There is no log line or file that says "PPSSPP can
-# take hotkeys now", so the settle count stays (see BOOT_SETTLE in the README), but what the old
-# fixed sleep could not do: a game that dies while starting ends the wait at once, with an error.
-# Waits up to <limit> s for the game to appear (the old fixed wait is the backup).
+# wait_game_settled <quiet s> <limit s>: the emulator runs the test ROM (its argv, from /proc: the
+# positive signal that the game was started) and has done so, as the SAME process, for <quiet>
+# consecutive polls. If minui-power-control's launch script has written /tmp/emulator_pid (it does so
+# once it has found the PPSSPP pid, and removes it at the end) that file must name this process before
+# a poll counts: an extra signal, never required, because not every power-control version writes it. A
+# game that dies while starting ends the wait at once. No log line or file says "PPSSPP takes hotkeys
+# now" (and the auto-load of a state leaves no file when there is no state), so the quiet time is a
+# fixed settle: see BOOT_SETTLE. Waits up to <limit> s for the game to appear.
 wait_game_settled() {
-    local stable="$1" limit="$2" n=0 ok=0 pid last="" seen=""
+    local quiet="$1" limit="$2" n=0 ok=0 pid last="" seen="" epid=""
     while :; do
         "${E2E_POLL_HOOK:-:}" || true
         pid=""
         rb_rom_running && pid="$(first_pid PPSSPPSDL)"
         if [ -n "$pid" ]; then
             seen=1
-            if [ "$pid" = "$last" ]; then ok=$((ok + 1)); else ok=0; fi
+            epid=""
+            [ -f "${E2E_EMULATOR_PID_FILE:-/tmp/emulator_pid}" ] && IFS= read -r epid <"${E2E_EMULATOR_PID_FILE:-/tmp/emulator_pid}"
+            if [ "$pid" = "$last" ] && { [ -z "$epid" ] || [ "$epid" = "$pid" ]; }; then ok=$((ok + 1)); else ok=0; fi
         else
             ok=0
             if [ -n "$seen" ]; then
@@ -420,9 +461,9 @@ wait_game_settled() {
             fi
         fi
         last="$pid"
-        [ "$ok" -ge "$stable" ] && return 0
+        [ "$ok" -ge "$quiet" ] && return 0
         if [ "$n" -ge "$limit" ]; then
-            echo "the game was not running steadily within ${limit}s (pid: ${pid:-none}; steady polls: $ok of $stable)" >&2
+            echo "the game was not running steadily within ${limit}s (pid: ${pid:-none}${epid:+, /tmp/emulator_pid: $epid}; steady polls: $ok of $quiet)" >&2
             return 1
         fi
         sleep 1
@@ -430,21 +471,43 @@ wait_game_settled() {
     done
 }
 
-# e2e_settle_count <override> <wait>: how many quiet polls (seconds) a settle waits for: the explicit
-# override (BOOT_SETTLE, UI_SETTLE, NOGAME_SETTLE) when it is a whole number, else the configured
-# fixed wait itself (BOOT_WAIT, UI_WAIT, NOGAME_WAIT; a fraction is cut to whole seconds). So the
-# old duration is the MINIMUM by default and a user who raises the WAIT gets at least that; only an
-# explicit *_SETTLE lowers it. The upper bound of a settle is that count plus the WAIT again.
-e2e_settle_count() {
-    local o="$1" w="${2%%.*}"
-    case "$w" in "" | *[!0-9]*) w=0 ;; esac
-    case "$o" in "" | *[!0-9]*) echo "$w" ;; *) echo "$o" ;; esac
-}
+# The default quiet times (seconds), chosen from the maintainer's observation that a game starts
+# (including its state load) within about 5 s, and from NextUI's source (autoResume() runs first thing
+# in main()); NOT measured by the tests. BOOT_SETTLE / UI_SETTLE / NOGAME_SETTLE override them (raise
+# or lower); BOOT_WAIT / UI_WAIT / NOGAME_WAIT are the upper bounds (and cap a default that is larger).
+E2E_DEFAULT_BOOT_SETTLE=6
+E2E_DEFAULT_UI_SETTLE=6
+E2E_DEFAULT_NOGAME_SETTLE=6
+
 # e2e_whole <n>: the whole seconds of a wait ("6.5" gives 6, junk gives 0).
 e2e_whole() {
     local w="${1%%.*}"
     case "$w" in "" | *[!0-9]*) w=0 ;; esac
     echo "$w"
+}
+# e2e_settle_count <override> <default> <wait>: the quiet time: the explicit override when it is a whole
+# number, else the default, but never more than the configured upper bound <wait>.
+e2e_settle_count() {
+    local o="$1" d="$2" w
+    w="$(e2e_whole "$3")"
+    case "$o" in "" | *[!0-9]*) [ "$d" -le "$w" ] && echo "$d" || echo "$w" ;; *) echo "$o" ;; esac
+}
+# game_settle / ui_settle / nogame_settle: the settles with their variables. The upper bound of a settle
+# is its quiet time plus the *_WAIT value (time for the game / NextUI to show up, then the quiet time).
+game_settle() {
+    local n
+    n="$(e2e_settle_count "${BOOT_SETTLE:-}" "$E2E_DEFAULT_BOOT_SETTLE" "${BOOT_WAIT:-20}")"
+    wait_game_settled "$n" "$((n + $(e2e_whole "${BOOT_WAIT:-20}")))"
+}
+ui_settle() {
+    local n
+    n="$(e2e_settle_count "${UI_SETTLE:-}" "$E2E_DEFAULT_UI_SETTLE" "${UI_WAIT:-6}")"
+    wait_ui_settled "$n" "$((n + $(e2e_whole "${UI_WAIT:-6}")))"
+}
+nogame_settle() {
+    local n
+    n="$(e2e_settle_count "${NOGAME_SETTLE:-}" "$E2E_DEFAULT_NOGAME_SETTLE" "${NOGAME_WAIT:-25}")"
+    wait_ui_settled "$n" "$((n + $(e2e_whole "${NOGAME_WAIT:-25}")))"
 }
 
 octal_byte() { printf '\\%03o' $(($1 & 255)); }
@@ -547,8 +610,8 @@ not_fixture() {
 seed_recent() { mkdir -p "$(dirname "$RECENT")" && printf '%s\n' "${ROM#"$SD"}" >"$RECENT"; }
 
 # restart_ui: kills NextUI and waits until the NEW process is up and settled (the same pid for
-# UI_SETTLE polls, default UI_WAIT: the old render delay is kept, no signal says "drawn"). The old process being gone is detected by its
-# pid, not by a fixed pause.
+# UI_SETTLE polls, default 6 s: the render delay of the old fixed wait is kept, because no signal says
+# "NextUI has drawn" that is verified on a device). The old process being gone is detected by its pid.
 restart_ui() {
     local old
     old="$(first_pid nextui.elf)"
@@ -559,19 +622,6 @@ restart_ui() {
     }
     ui_settle
 }
-# game_settle: the settle after a game start (BOOT_SETTLE, default BOOT_WAIT: the old duration).
-game_settle() {
-    local n
-    n="$(e2e_settle_count "${BOOT_SETTLE:-}" "$BOOT_WAIT")"
-    wait_game_settled "$n" "$((n + $(e2e_whole "$BOOT_WAIT")))"
-}
-# ui_settle: the settle after a NextUI start, with the default count and bound (see e2e_settle_count).
-ui_settle() {
-    local n
-    n="$(e2e_settle_count "${UI_SETTLE:-}" "$UI_WAIT")"
-    wait_ui_settled "$n" "$((n + $(e2e_whole "$UI_WAIT")))"
-}
-
 open_switcher() { # restarts NextUI directly into the Game Switcher
     printf unused >"$PERSIST"
     restart_ui

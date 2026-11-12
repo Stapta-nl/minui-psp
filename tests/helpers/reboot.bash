@@ -26,7 +26,7 @@
 # are only the time-outs after which a wait gives up.
 
 RB_KIT_PATH="${RB_KIT_PATH:-/tmp/psp-reboot-kit.sh}"
-RB_ENV_VARS="SD PLATFORM PAK_NAME ROM_DIR ROM SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS PSP_RUN_ID UI_WAIT CHORD_HOLD KEEPAWAKE_KEY KEEPAWAKE_INTERVAL POWER_DEV_NAME SLEEP_PROBE RB_TMP RB_OUT RB_REBOOT_CMD RB_HARD_REBOOT_CMD BOOT_ID_FILE"
+RB_ENV_VARS="SD PLATFORM PAK_NAME ROM_DIR ROM SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS PSP_RUN_ID UI_WAIT BOOT_WAIT NOGAME_WAIT BOOT_SETTLE UI_SETTLE NOGAME_SETTLE CHORD_HOLD KEEPAWAKE_KEY KEEPAWAKE_INTERVAL POWER_DEV_NAME SLEEP_PROBE RB_TMP RB_OUT RB_REBOOT_CMD RB_HARD_REBOOT_CMD BOOT_ID_FILE"
 
 # Quotes a value for the remote shell.
 rb_q() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
@@ -146,26 +146,24 @@ probe() { dev_ok "${RB_PROBE_TIMEOUT:-10}" "$1"; }
 # The settle checks run ON the device (a local one second loop: no ssh call per poll), keep the
 # device awake there, and give up after the old fixed duration (plus the count). See
 # wait_ui_settled / wait_game_settled in e2e.bash.
-# settle_ui <override> <wait>: NextUI up and quiet for <override> s (default: the old fixed <wait>, so
-# that duration is the minimum; see e2e_settle_count); settle_game likewise for the game. The bound
-# is that time plus <wait> again.
-settle_ui() {
-    local n w
-    n="$(e2e_settle_count "$1" "$2")"
-    w="$(e2e_whole "$2")"
-    dev_kit $((n + w + 30)) "wait_ui_settled $n $((n + w))"
+# The settles run ON the device (a local one second loop: no ssh call per poll; the keep-awake taps
+# are sent from there too) with the functions of e2e.bash, which read BOOT_SETTLE / BOOT_WAIT,
+# UI_SETTLE / UI_WAIT and NOGAME_SETTLE / NOGAME_WAIT (forwarded with the other settings). The device
+# decides the durations (defaults and what they mean: e2e.bash, README); the host only bounds the ssh
+# call. An optional argument is a launch reference (rb_launch_ref taken BEFORE the event under test):
+# a rewritten pak log (launch.sh ran) then fails the wait at once.
+rb_whole() { local w="${1%%.*}"; case "$w" in "" | *[!0-9]*) w=0 ;; esac; echo "$w"; }
+rb_settle_call() { # <function> <wait var value> <settle var value> <launch ref>
+    local limit=$(($(rb_whole "$2") * 2 + $(rb_whole "$3") + 60)) ref=""
+    [ -z "${4:-}" ] || ref="E2E_LAUNCH_REF=$(rb_q "$4"); export E2E_LAUNCH_REF;"
+    dev_kit "$limit" "$ref $1"
 }
-settle_game() {
-    local n w
-    n="$(e2e_settle_count "$1" "$2")"
-    w="$(e2e_whole "$2")"
-    dev_kit $((n + w + 30)) "wait_game_settled $n $((n + w))"
-}
-# The three cases the tests have (README: BOOT_SETTLE, UI_SETTLE, NOGAME_SETTLE; all default to the old waits).
-settle_boot() { settle_game "${BOOT_SETTLE:-}" "${BOOT_WAIT:-20}"; }
-settle_resumed() { settle_game "${UI_SETTLE:-}" "${UI_WAIT:-6}"; }
-settle_ui_short() { settle_ui "${UI_SETTLE:-}" "${UI_WAIT:-6}"; }
-settle_nogame() { settle_ui "${NOGAME_SETTLE:-}" "${NOGAME_WAIT:-25}"; }
+settle_boot() { rb_settle_call game_settle "${BOOT_WAIT:-20}" "${BOOT_SETTLE:-0}"; }
+settle_resumed() { rb_settle_call game_settle "${BOOT_WAIT:-20}" "${BOOT_SETTLE:-0}"; }
+settle_ui_short() { rb_settle_call ui_settle "${UI_WAIT:-6}" "${UI_SETTLE:-0}" "${1:-}"; }
+settle_nogame() { rb_settle_call nogame_settle "${NOGAME_WAIT:-25}" "${NOGAME_SETTLE:-0}" "${1:-}"; }
+# rb_launch_ref: the state of the pak log now (see launch_sig in e2e.bash), to be passed to a settle.
+rb_launch_ref() { dev_kit 30 'launch_sig "$LOGS/PSP.txt"'; }
 
 # dev_definite <timeout s> <script>: runs the script on the device and returns 0 (it succeeded) or 1
 # (it failed normally) ONLY for a definite answer. A timeout (124), an ssh failure (255) or a kit

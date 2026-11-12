@@ -378,37 +378,58 @@ FAKE
     [ "$(wc -l <"$T/hook.log")" -ge 3 ]
 }
 
-@test "e2e_settle_count: the old wait is the DEFAULT (a minimum); only an explicit override changes it" {
-    run e2e_settle_count "" 20
-    assert_output 20
-    run e2e_settle_count "" 40 # a user who raised BOOT_WAIT gets at least that
-    assert_output 40
-    run e2e_settle_count 10 20 # an explicit, lower SETTLE
-    assert_output 10
-    run e2e_settle_count 30 20
+@test "e2e_settle_count: the default (6 s), cut to the upper bound; an explicit override wins either way" {
+    run e2e_settle_count "" 6 20
+    assert_output 6
+    run e2e_settle_count "" 6 4 # a bound lower than the default cuts it
+    assert_output 4
+    run e2e_settle_count 2 6 20 # an explicit, lower SETTLE
+    assert_output 2
+    run e2e_settle_count 30 6 20 # an explicit, higher one (raise it for a slow device)
     assert_output 30
-    run e2e_settle_count "" 6.5
+    run e2e_settle_count x 6 20
     assert_output 6
-    run e2e_settle_count x 6
-    assert_output 6
-    run e2e_settle_count "" junk
+    run e2e_settle_count "" 6 junk
     assert_output 0
 }
 
-@test "the settle defaults are the old fixed waits: BOOT_WAIT 20, UI_WAIT 6, NOGAME_WAIT 25 (bound: that time again on top)" {
+@test "the settle defaults: 6 s quiet for the game start, NextUI and the absence check; the *_WAIT values are the bounds" {
     unset BOOT_SETTLE UI_SETTLE NOGAME_SETTLE BOOT_WAIT UI_WAIT NOGAME_WAIT
-    # shellcheck disable=SC2317 # replaces dev_kit: only the command that would run on the device is recorded
-    dev_kit() { echo "$2" >>"$FAKE_SSH_LOG"; }
-    : >"$FAKE_SSH_LOG"
-    settle_boot
-    settle_ui_short
-    NOGAME_WAIT=40 settle_nogame
-    grep -q 'wait_game_settled 20 40' "$FAKE_SSH_LOG"
-    grep -q 'wait_ui_settled 6 12' "$FAKE_SSH_LOG"
-    grep -q 'wait_ui_settled 40 80' "$FAKE_SSH_LOG"
-    : >"$FAKE_SSH_LOG"
-    BOOT_SETTLE=10 settle_boot
-    grep -q 'wait_game_settled 10 30' "$FAKE_SSH_LOG"
+    # shellcheck disable=SC2317 # replaces the wait itself: only its arguments are recorded
+    wait_game_settled() { echo "game $*" >>"$T/calls"; }
+    # shellcheck disable=SC2317
+    wait_ui_settled() { echo "ui $*" >>"$T/calls"; }
+    game_settle
+    ui_settle
+    nogame_settle
+    run cat "$T/calls"
+    assert_output "game 6 26
+ui 6 12
+ui 6 31"
+    : >"$T/calls"
+    BOOT_SETTLE=2 BOOT_WAIT=40 game_settle # lowered quiet time, raised bound
+    NOGAME_SETTLE=20 NOGAME_WAIT=25 nogame_settle # raised quiet time
+    BOOT_WAIT=3 game_settle # a bound below the default cuts it
+    run cat "$T/calls"
+    assert_output "game 2 42
+ui 20 45
+game 3 6"
+}
+
+@test "settle_* on the host: only loads reboot.bash (no e2e.bash there): the call is built and the settle variables are forwarded" {
+    # a fresh shell that has ONLY the host helpers, as reboot.bats has
+    run bash -c '
+        source "$1/helpers/reboot.bash"
+        dev_kit() { echo "limit=$1 script=$2"; }
+        BOOT_WAIT=20 settle_boot
+        UI_WAIT=6 UI_SETTLE=3 settle_ui_short "12 34 first line"
+        NOGAME_WAIT=25 settle_nogame
+        echo "$RB_ENV_VARS"' _ "$TESTS_DIR"
+    assert_success
+    assert_output --partial "limit=100 script= game_settle"
+    assert_output --partial "script=E2E_LAUNCH_REF='12 34 first line'; export E2E_LAUNCH_REF; ui_settle"
+    assert_output --partial "script= nogame_settle"
+    assert_output --partial "BOOT_SETTLE UI_SETTLE NOGAME_SETTLE"
 }
 
 @test "settle_ui / settle_game / settle_nogame: the verdict comes from the device (a game process, no game)" {
@@ -419,19 +440,89 @@ FAKE
     ( exec -a PPSSPPSDL_tg5040 bash -c 'sleep 60; :' "$ROM" ) 3>&- &
     local gp=$!
     echo "$gp" >"$FS/game.pid"
-    run settle_ui 1 5
+    UI_SETTLE=1 UI_WAIT=5 run settle_ui_short
     assert_failure # a game runs: NextUI is not "settled"
-    run settle_game 1 5
+    BOOT_SETTLE=1 BOOT_WAIT=5 run settle_boot
     assert_success
     kill "$gp" 2>/dev/null
     wait "$gp" 2>/dev/null || true
     rm -f "$FS/game.pid"
-    run settle_ui 1 5
+    UI_SETTLE=1 UI_WAIT=5 run settle_ui_short
     assert_success
     NOGAME_SETTLE=1 NOGAME_WAIT=5 run settle_nogame
     assert_success
     BOOT_SETTLE=1 BOOT_WAIT=2 run settle_boot
     assert_failure # no game
+}
+
+@test "launch_sig / launch_unchanged: a log that grew is not a launch; a rewritten one (inode, first line, smaller) is" {
+    local log="$T/PSP.txt"
+    run launch_sig "$T/none.txt"
+    assert_output none
+    printf '/pak/launch.sh /Roms/game.iso\nline 2\n' >"$log"
+    local ref
+    ref="$(launch_sig "$log")"
+    launch_unchanged "$ref" "$log"
+    printf 'more output of the running game\n' >>"$log" # appended: still the same launch
+    launch_unchanged "$ref" "$log"
+    printf '/pak/launch.sh /Roms/other.iso\nline 2\nmore output of the running game\n' >"$T/new.txt" # another first line
+    rm "$log"
+    cp "$T/new.txt" "$log"
+    run launch_unchanged "$ref" "$log"
+    assert_failure
+    rm "$log"
+    printf '/pak/launch.sh /Roms/game.iso\n' >"$log" # same first line, fewer bytes than before: rewritten
+    ref="12 99 /pak/launch.sh /Roms/game.iso"
+    run launch_unchanged "$ref" "$log"
+    assert_failure
+    run launch_unchanged none "$log" # there was no log, now there is one
+    assert_failure
+    rm "$log"
+    launch_unchanged none "$log"
+    run launch_unchanged "$ref" "$log" # a log that vanished is a change too (launch.sh deletes it first)
+    assert_failure
+}
+
+@test "wait_ui_settled: a launch since the reference fails at once; an auto-resume marker is never quiet; the log can grow" {
+    fake_settle_tools
+    echo 100 >"$FS/nextui.pid"
+    local log="$T/PSP.txt"
+    printf 'first\n' >"$log"
+    export E2E_LAUNCH_LOG="$log" E2E_LAUNCH_REF
+    E2E_LAUNCH_REF="$(launch_sig "$log")"
+    printf 'grows\n' >>"$log"
+    run wait_ui_settled 1 5
+    assert_success
+    rm "$log"
+    printf 'second\n' >"$log"
+    run wait_ui_settled 1 5
+    assert_failure
+    assert_output --partial "launch.sh was started"
+    unset E2E_LAUNCH_REF
+    mkdir -p "$(dirname "$AUTORESUME")"
+    : >"$AUTORESUME"
+    run wait_ui_settled 1 2
+    assert_failure
+    assert_output --partial "the auto-resume marker exists"
+    rm -f "$AUTORESUME"
+    run wait_ui_settled 1 5
+    assert_success
+}
+
+@test "wait_game_settled: /tmp/emulator_pid (when present) must name the game process; absent, it is not required" {
+    fake_settle_tools
+    echo 300 >"$FS/game.pid"
+    export E2E_EMULATOR_PID_FILE="$T/emulator_pid"
+    echo 999 >"$E2E_EMULATOR_PID_FILE" # another process: not attached to this game
+    run wait_game_settled 1 3
+    assert_failure
+    assert_output --partial "emulator_pid: 999"
+    echo 300 >"$E2E_EMULATOR_PID_FILE"
+    run wait_game_settled 1 5
+    assert_success
+    rm -f "$E2E_EMULATOR_PID_FILE"
+    run wait_game_settled 1 5
+    assert_success
 }
 
 @test "dev_definite: a timeout or ssh failure is unknown (retried, then 2), a definite no is 1, yes is 0" {

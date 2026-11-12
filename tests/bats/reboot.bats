@@ -59,12 +59,19 @@
 # and the timeouts and intervals listed in tests/helpers/reboot.bash.
 #
 # Waits are signals where a signal exists: a reboot is watched on the network (port closes, port opens,
-# ssh answers with a new boot_id; the time of each phase is logged), a game that dies while starting ends
-# its wait at once. The rest are quiet windows whose defaults are the old fixed durations (no signal
-# proves "PPSSPP takes hotkeys" or "NextUI would have auto-launched"): the same game pid for BOOT_SETTLE
-# (default BOOT_WAIT), the same nextui.elf with no game for NOGAME_SETTLE (default NOGAME_WAIT) or
-# UI_SETTLE (default UI_WAIT) seconds. So BOOT_WAIT, UI_WAIT and NOGAME_WAIT are minimum waits; the
-# REBOOT_* / RESUME_TIMEOUT values are only the upper bounds after which a wait gives up.
+# ssh answers with a new boot_id; the time of each phase is logged), a game start by the emulator
+# process running the ROM (and, if minui-power-control wrote it, /tmp/emulator_pid naming it).
+# "No auto-launch" (R1, R2, R6, R7) means: after a normal quit, a crash or a forced reboot the device
+# comes back to NextUI's normal menu and does NOT start the game by itself: no auto-resume marker is
+# consumed and no PPSSPP process appears. NextUI's main() runs autoResume() first (before any init): with
+# a marker it deletes it, queues the game and exits, without one it goes on to the menu. So the decision
+# is made right after nextui.elf starts, and the check is: the same nextui.elf for NOGAME_SETTLE seconds
+# (default 6) with no PPSSPP and no marker, and the pak log (PSP.txt, which launch.sh deletes and
+# recreates on every start) not rewritten since before the event (a positive "launch.sh did not run").
+# What has no signal keeps a quiet time chosen from the maintainer's observations (a game starts within
+# about 5 s, state load included), not measured here: BOOT_SETTLE 6, UI_SETTLE 6, NOGAME_SETTLE 6.
+# BOOT_WAIT (20), UI_WAIT (6), NOGAME_WAIT (25) and the REBOOT_* / RESUME_TIMEOUT values are only the
+# upper bounds after which a wait gives up; set a *_SETTLE to wait quietly for less or more.
 
 load '../helpers/common'
 load '../helpers/reboot'
@@ -199,7 +206,7 @@ teardown_file() {
     await 40 "the Game Switcher preview of the newest state" probe rb_has_new_preview
     assert_dev '[ "$(rb_slot_file_slot)" = "$(rb_newest_new_slot)" ]'
     refute_dev rb_marker_exists
-    settle_ui_short
+    settle_ui_short "$(rb_launch_ref)" # NextUI is back (launch.sh is over): it must not launch anything again
     refute_dev rb_marker_exists
     assert_dev rb_nextui_up
     fetch_log R1
@@ -208,9 +215,11 @@ teardown_file() {
 
 @test "R2 NextUI is up after a quit and after a restart and launches no game (no auto-launch)" {
     need_step r1-quit
+    local ref
+    ref="$(rb_launch_ref)"
     dev_kit 30 kill_ui # SIGKILL: NextUI starts again, and would run autoResume() if a marker existed
     await 90 "NextUI to be back" probe rb_nextui_up
-    settle_nogame
+    settle_nogame "$ref"
     assert_dev rb_nextui_up
     assert_dev rb_no_game
     refute_dev rb_marker_exists
@@ -264,16 +273,18 @@ teardown_file() {
     dev_kit 30 'killall -9 "PPSSPPSDL_$PLATFORM"'
     await 40 "PPSSPP to be gone" probe rb_no_game
     await 90 "NextUI to be back" probe rb_nextui_up
-    settle_nogame
+    settle_nogame "$(rb_launch_ref)"
     assert_dev rb_nextui_up
     assert_dev rb_no_game
     refute_dev rb_marker_exists
     run pak_log
     assert_success
     assert_output --partial "No power-off detected"
+    local ref
+    ref="$(rb_launch_ref)"
     dev_kit 30 kill_ui
     await 90 "NextUI to be back after its restart" probe rb_nextui_up
-    settle_nogame
+    settle_nogame "$ref"
     assert_dev rb_no_game
     fetch_log R6
 }
@@ -283,13 +294,14 @@ teardown_file() {
     dev_kit 30 rb_save_state
     await 30 "a state saved with the Save State hotkey (hotkeys: see the log)" probe rb_has_new_state
     dev_kit 30 rb_save_snapshot
-    local old
+    local old ref
     old="$(rb_boot_id)"
     [ -n "$old" ] || fail "could not read the device's boot id"
+    ref="$(rb_launch_ref)" # the pak log of this game: a launch after the boot would rewrite it
     dev_kit 30 rb_hard_reboot
     await_reboot "$old"
     await "${RESUME_TIMEOUT:-180}" "NextUI to be up after the boot" probe rb_nextui_up
-    settle_nogame
+    settle_nogame "$ref"
     assert_dev rb_nextui_up
     assert_dev rb_no_game
     refute_dev rb_marker_exists
@@ -305,7 +317,7 @@ teardown_file() {
     dev_kit 30 rb_quit_game
     await 40 "PPSSPP to exit" probe rb_no_game
     await 90 "NextUI to be back" probe rb_nextui_up
-    settle_ui_short
+    settle_ui_short "$(rb_launch_ref)"
     start_game False
     dev_kit 30 rb_save_snapshot # all states that exist now, none of them may change
     dev_kit 30 rb_install_wrapper
