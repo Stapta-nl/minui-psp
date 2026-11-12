@@ -81,7 +81,7 @@ sort -u "$tmp/ref" -o "$tmp/ref"
 grep -v '^#' "$list" | sed 's/^\([^ ]*\)  /\1\t/' >"$tmp/dev"
 cut -f 2- "$tmp/dev" | sort -u >"$tmp/devfiles"
 
-differs=() builtdiff=() missing=() extra=() notcmp=() compared=0
+differs=() builtdiff=() builtsame=() missing=() extra=() notcmp=() compared=0
 while IFS= read -r f; do
     ignored "$f" && continue
     [ -f "$ref/$f" ] || continue # tracked but deleted in the working tree
@@ -94,6 +94,8 @@ while IFS= read -r f; do
             # a build output (binary) of this machine or of the release download: another build
             # of the same source differs, so this is a note, not a warning
             if grep -qxF -- "$f" "$tmp/built"; then builtdiff+=("$f"); else differs+=("$f"); fi
+        else
+            case "$f" in PPSSPP/PPSSPPSDL_*) builtsame+=("$f") ;; esac
         fi
     fi
 done <"$tmp/ref"
@@ -116,6 +118,8 @@ print_notes() {
     for f in ${extra[@]+"${extra[@]}"}; do echo "  note: leftover file on the device, not part of this release (harmless unless the pak loads it): $f"; done
     for f in ${builtdiff[@]+"${builtdiff[@]}"}; do echo "  note: differs from $label; build output, may be a different build: $f$(build_note "$f")"; done
     for f in ${notcmp[@]+"${notcmp[@]}"}; do echo "  not compared (binary comes from a release download, none in $label): $f$(build_note "$f")"; done
+    # an identical checksum is the strongest statement, whatever text the device's grep found in the binary
+    for f in ${builtsame[@]+"${builtsame[@]}"}; do echo "  identical to $label: $f$(build_note "$f")"; done
 }
 if [ "${#differs[@]}" = 0 ] && [ "${#missing[@]}" = 0 ]; then
     echo "Pak under test: matches $label (all $((compared - ${#builtdiff[@]})) shipped files compared are identical${builtdiff[0]:+; ${#builtdiff[@]} build outputs differ, see below}${notcmp[0]:+; ${#notcmp[@]} not compared: they come from a release download}; user settings ignored${extra[0]:+; ${#extra[@]} leftover files, see pak/check.txt})"

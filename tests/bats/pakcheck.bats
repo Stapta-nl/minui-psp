@@ -197,6 +197,35 @@ check() { bash "$TESTS_DIR/pakcheck.sh" "$T/files.txt" "${1:-$REL}"; }
     assert_grep "$T/files.txt" '^# ppsspp build of PPSSPP/PPSSPPSDL_tg5040: unknown$'
 }
 
+@test "collector: a build of a fork or a modified tree (v1.20.3-5-gHASH-dirty, v1.20.3-saveonexit) is found; text inside another string is only approximate" {
+    local b="$DEV/PPSSPP/PPSSPPSDL_tg5040"
+    printf 'ELF\0libz v1.2.11 x\0v1.2.11\0v1.20.3-5-gabc1234-dirty\0' >"$b"
+    run sh "$TESTS_DIR/collectors/pak-files.sh" --build "$b"
+    assert_output "v1.20.3-5-gabc1234-dirty (also found: v1.2.11)"
+    printf 'ELF\0v1.20.3-saveonexit\0' >"$b"
+    run sh "$TESTS_DIR/collectors/pak-files.sh" --build "$b"
+    assert_output "v1.20.3-saveonexit"
+    printf 'ELF\0v1.1\0see PPSSPP v1.20.3-7-gdeadbee here\0' >"$b"
+    run sh "$TESTS_DIR/collectors/pak-files.sh" --build "$b"
+    assert_output "~v1.20.3-7-gdeadbee"
+}
+
+@test "an identical PPSSPP binary is said to be identical, with the build text, whatever the device's grep found" {
+    local co="$T/checkout"
+    mkdir -p "$co"
+    cp -R "$REL/." "$co/"
+    printf 'PPSSPP/PPSSPPSDL_tg5040\n' >"$co/.gitarchiveinclude"
+    git -C "$co" init -q
+    git -C "$co" add -A
+    printf 'ELF\0v1.20.3-5-gabcdef0\0rest' >"$co/PPSSPP/PPSSPPSDL_tg5040"
+    cp "$co/PPSSPP/PPSSPPSDL_tg5040" "$DEV/PPSSPP/PPSSPPSDL_tg5040"
+    list_device
+    sed -i 's|^# ppsspp build of PPSSPP/PPSSPPSDL_tg5040: .*|# ppsspp build of PPSSPP/PPSSPPSDL_tg5040: unknown|' "$T/files.txt"
+    run check "$co"
+    assert_success
+    assert_output --partial "identical to the release in $co: PPSSPP/PPSSPPSDL_tg5040 (build text on the device: unknown; in the release in $co: v1.20.3-5-gabcdef0)"
+}
+
 @test "collector: the build text of every PPSSPP binary in the pak is listed" {
     printf 'ELF\0v1.20.3\0' >"$DEV/PPSSPP/PPSSPPSDL_tg5050"
     list_device
