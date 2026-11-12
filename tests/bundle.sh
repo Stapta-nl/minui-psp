@@ -64,6 +64,15 @@ bundle="dist/test-report-$target-$ts.tar.gz"
     echo "| Started | ${TEST_STARTED:-unknown} |"
     echo "| Finished | ${TEST_FINISHED:-unknown} |"
     echo "| Debug bundle | \`$(basename "$bundle")\` |"
+    [ -s "$stage/pak/check.txt" ] && echo "| Pak under test | $(head -n 1 "$stage/pak/check.txt" | sed -e 's/^Pak under test: //' -e 's/|/\\|/g') |"
+    if grep -q '^WARNING' "$stage/pak/check.txt" 2>/dev/null; then
+        echo
+        echo "### WARNING: the pak on the device is not the pak under test"
+        echo
+        echo '```'
+        cat "$stage/pak/check.txt"
+        echo '```'
+    fi
     if [ -s "$stage/error.txt" ]; then
         echo
         echo "### Error"

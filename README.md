@@ -154,6 +154,14 @@ For each device `make test-device` checks that the device has `bash`, `tar`, `gz
 
 Every run writes `dist/test-report-<target>-<timestamp>.tar.gz` (target: `host` or the platform), whether it passed or failed: the TAP output, the JUnit XML, per-case logs and screenshots, `summary.md` (also shown in the CI job summary), host information (git SHA and dirty state, tool versions, make variables, timestamps, which devices were configured; the ssh address is never recorded) and, for devices, `uname -a`, `/etc/os-release`, BusyBox and bash versions, the NextUI version, `df`, the installed `pak.json` and `ppsspp.ini` and the `PSP.txt` log. What is collected is a list with one command per line in `tests/collectors/host.list` and `tests/collectors/device.list`; add a line to collect more. A collector that fails is noted in `collector-errors.txt` and never stops the bundle.
 
+### Which pak was tested
+
+A device that was not updated would make the report about an old pak, so `make test-device` first lists the installed pak (`tests/collectors/pak-files.sh`, run on the device: a checksum of every file except `PPSSPP/.config`, which is the user's data, plus the `pak.json` version and the version text found in the PPSSPP binary; it reads the binary, never runs it) and `tests/pakcheck.sh` compares that with this checkout (or `SRC_PAK`, an unpacked release) before any test runs. The result is printed at the start and is in `summary.md` (row **Pak under test**) and the bundle (`pak/files.txt`, `pak/check.txt`):
+
+- `Pak under test: matches this checkout (N files compared ...)`: every file of the release is the same on the device. Your own `ppsspp.ini` and `controls.ini` (`update_ignore` in `pak.json`) and everything under `PPSSPP/.config` are expected to differ and are ignored.
+- `WARNING: the pak installed on the device is NOT the one under test`, followed by one line per `differs`, `missing on the device` or `extra on the device` file: update the pak (see Updating) and run again. This is only a warning and the tests still run; `PAK_MISMATCH=fail` makes it stop the run instead.
+- Files the release gets from a download (the PPSSPP binaries, `bin/jpg2bmp`, ... see `.gitarchiveinclude`) are compared by checksum when they exist locally (after `make build`, or in the unpacked release); otherwise they are listed as `not compared (binary comes from a release download)` and the PPSSPP build text from the device is shown instead. Nothing is downloaded by the tests.
+
 ### End-to-end test (device only)
 
 `tests/bats/e2e.bats` drives the real NextUI and PPSSPP on a TrimUI device with no one at the buttons: it injects button presses through the `TRIMUI Player1` evdev device, launches the first game in `Roms/*(PSP)` through NextUI's `/tmp/next` hand-off, and takes screenshots with the [Screenshot Monitor](https://github.com/josegonzalez/minui-screenshot-monitor-pak) pak's `bin/screenshot`. Screenshots are judged by the bundled `pngcolor` helper.

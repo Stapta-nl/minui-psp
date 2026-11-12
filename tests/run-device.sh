@@ -21,8 +21,12 @@
 # The pak is expected in Emus/<platform>/<PAK_NAME>.pak; PAK_NAME defaults to "name" in
 # pak.json (PSP) and is passed to the device.
 #
+# Host side only: PAK_MISMATCH=fail (default warn).
 # Forwarded to the device when set: SDCARD_PATH ROM_DIR ROM PSP_KEYS SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS BOOT_WAIT
 # UI_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT.
+#
+# Before the tests it compares the installed pak with this checkout (or SRC_PAK) and warns if
+# they differ (tests/pakcheck.sh); PAK_MISMATCH=fail makes that fatal. The result is in the summary.
 #
 # Afterwards the tests tagged "reboot" (tests/bats/reboot.bats: they REBOOT the device) run on
 # this machine over ssh, see tests/run-reboot.sh; SKIP_REBOOT_TESTS=1 leaves them out. They
@@ -221,6 +225,24 @@ for v in SDCARD_PATH ROM_DIR ROM PSP_KEYS SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET
         assignments="$assignments $v=$(q "${!v}")"
     fi
 done
+
+# Which pak is installed? A device that was not updated would make the results about an old
+# pak: say so right away and in the summary. Only a warning (PAK_MISMATCH=fail makes it fatal).
+echo "== $platform: checking which pak is installed"
+mkdir -p "$stage/pak"
+# shellcheck disable=SC2016 # not expanded here: the command runs on the device
+if rssh "cd '$remote_tmp' && sh tests/collectors/pak-files.sh $(q "$sd/Emus/$platform/$pak_name.pak") $(q "$platform")" </dev/null 2>&1 | redact >"$stage/pak/files.txt" &&
+    [ "$(sed -n 's/^# error: //p' "$stage/pak/files.txt")" = "" ] && [ -s "$stage/pak/files.txt" ]; then
+    bash tests/pakcheck.sh "$stage/pak/files.txt" >"$stage/pak/check.txt" 2>&1
+    pak_rc=$?
+else
+    printf 'WARNING: the installed pak could not be read from the device (%s): is it installed in Emus/%s/%s.pak?\n' "$(head -n 1 "$stage/pak/files.txt" 2>/dev/null)" "$platform" "$pak_name" >"$stage/pak/check.txt"
+    pak_rc=1
+fi
+cat "$stage/pak/check.txt" >&2
+if [ "$pak_rc" != 0 ] && [ "${PAK_MISMATCH:-warn}" = fail ]; then
+    finish 3 "the pak on the device is not the one under test (PAK_MISMATCH=fail)"
+fi
 
 echo "== $platform: running the device tests"
 # shellcheck disable=SC2317 # called through run_step

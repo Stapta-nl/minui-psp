@@ -34,7 +34,7 @@ export $(DEVICE_VARS)
 
 # Off-device checks: syntax, shellcheck, the auto-resume test.
 # POSIX sh scripts (sh -n); the test runners tests/run-*.sh, bundle.sh and collect.sh are bash.
-SH_FILES := launch.sh bin/poweroff $(wildcard scripts/*.sh) tests/autoresume.sh
+SH_FILES := launch.sh bin/poweroff $(wildcard scripts/*.sh) tests/autoresume.sh tests/collectors/pak-files.sh
 SHELL_FILES := $(SH_FILES) $(filter-out $(SH_FILES),$(wildcard tests/*.sh))
 
 lint:
