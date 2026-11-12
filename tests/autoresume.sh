@@ -134,9 +134,34 @@ printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/shown"\n' "$STUB" >"$PAK/bin/show_
 # Stand-in killall: records instead of killing (launch.sh replaces "Powering off").
 printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/killall"\n' "$STUB" >"$PAK/bin/killall"
 # Stand-in for minui-presenter as started by the shutdown script (NOT on PATH, see the
-# "shutdown" power button): logs its start and its SIGTERM, then shows its message "forever".
+# "shutdown" power button). Without arguments it behaves like the real one (exit 1 before
+# touching the display). Otherwise it logs "start <path run> <args> others=<other live
+# presenters>", then shows its message "forever" and logs "term <pid>" on SIGTERM.
+# Switches (files in $STUB): preflight-fail (the no-argument run exits 127), qs-dies (a
+# "Quicksave" message exits at once), ignore-term (only the original, not the copy).
 mkdir -p "$T/selfgz" "$T/proc"
-printf '#!/bin/sh\nprintf "start %%s\\n" "$*" >>"%s/presenter.log"\ntrap '"'"'printf "term\\n" >>"%s/presenter.log"; exit 0'"'"' TERM\nwhile :; do sleep 0.2 2>/dev/null || sleep 1; done\n' "$STUB" "$STUB" >"$T/selfgz/minui-presenter"
+cat >"$T/selfgz/minui-presenter" <<'PRES_BODY'
+#!/bin/sh
+L="$STUB/presenter.log"
+if [ $# -eq 0 ]; then
+    echo "preflight $0" >>"$L"
+    [ -f "$STUB/preflight-fail" ] && exit 127
+    exit 1
+fi
+others=0
+for p in $(pgrep minui-presenter); do
+    [ "$p" = "$$" ] && continue
+    grep -q '^State:.*Z' "/proc/$p/status" 2>/dev/null || others=$((others + 1))
+done
+echo "start $0 $* others=$others" >>"$L"
+case "$*" in *Quicksave*) [ -f "$STUB/qs-dies" ] && exit 1 ;; esac
+if [ -f "$STUB/ignore-term" ] && [ "$0" != /tmp/psp-quicksave/minui-presenter ]; then
+    trap 'echo "term-ignored $$" >>"$L"' TERM
+else
+    trap 'echo "term $$" >>"$L"; exit 0' TERM
+fi
+while :; do sleep 0.2 2>/dev/null || sleep 1; done
+PRES_BODY
 chmod +x "$T/selfgz/minui-presenter"
 # Stand-in converter: the "BMP" is a copy of the thumbnail (run.sh tests the real one).
 # shellcheck disable=SC2016 # $1/$2 belong to the generated script
@@ -251,14 +276,32 @@ power_button() {
         # The real shutdown script: its minui-presenter ("Powering off") is already up when
         # the shim runs. Its binary is not on PATH (it lives in a temp dir that is deleted
         # when the emulator exits); launch.sh finds it through /proc/<pid>/exe, which the
-        # test's PSP_PROC_DIR points at the stub script.
+        # test's PSP_PROC_DIR points at the stub script. ZOMBIE_OLD=1 adds a second one that
+        # the fake /proc/<pid>/status calls a zombie.
         "$T/selfgz/minui-presenter" --message "Powering off" --timeout -1 &
         PRESENTER_PID=$!
         mkdir -p "$T/proc/$PRESENTER_PID"
         ln -sf "$T/selfgz/minui-presenter" "$T/proc/$PRESENTER_PID/exe"
         wait_for "$STUB/presenter.log"
+        if [ -n "$ZOMBIE_OLD" ]; then
+            "$T/selfgz/minui-presenter" --message "Zombie" --timeout -1 &
+            ZOMBIE_PID=$!
+            mkdir -p "$T/proc/$ZOMBIE_PID"
+            printf 'State:\tZ (zombie)\n' >"$T/proc/$ZOMBIE_PID/status"
+            ln -sf "$T/selfgz/minui-presenter" "$T/proc/$ZOMBIE_PID/exe"
+            sleep 1
+        fi
         PATH="$PAK/bin:$PATH" poweroff -f &
         wait_for "$REQ"
+        ;;
+    shutdownlate)
+        # like shutdown, but the shim's request comes late (after the sync)
+        "$T/selfgz/minui-presenter" --message "Powering off" --timeout -1 &
+        PRESENTER_PID=$!
+        mkdir -p "$T/proc/$PRESENTER_PID"
+        ln -sf "$T/selfgz/minui-presenter" "$T/proc/$PRESENTER_PID/exe"
+        wait_for "$STUB/presenter.log"
+        (sleep 4; date +%s >"$REQ") &
         ;;
     late)
         # the shutdown script SIGTERMs PPSSPP first; its `poweroff` (the shim,
@@ -540,33 +583,50 @@ check "stale request removed" absent "$REQ"
 check "log says stale" contains "$LOG" 'Ignoring a stale power-off request'
 end
 
-begin "16 power-off found only after the preview budget: preview skipped, quicksave message still shown"
+# Helpers for the presenter tests: the log of the stubs as one line, and cleanup.
+plog() { tr '\n' '|' <"$STUB/presenter.log" | sed 's/ others=[0-9]*//g'; }
+QSBIN=/tmp/psp-quicksave/minui-presenter
+presenter_cleanup() {
+    # shellcheck disable=SC2046 # a list of pids (the stubs, or none)
+    kill -KILL $(pgrep minui-presenter) 2>/dev/null
+    wait "$PRESENTER_PID" "$ZOMBIE_PID" 2>/dev/null # reap the stubs (a zombie would show up in pgrep)
+    PRESENTER_PID=""
+    ZOMBIE_PID=""
+    rm -rf /tmp/psp-quicksave "${T:?}/proc"/*
+    rm -f "$STUB/preflight-fail" "$STUB/qs-dies" "$STUB/ignore-term"
+}
+
+begin "16 power-off found only after the preview budget: preview skipped, quicksave message still shown by the presenter"
 reset_states
-PSP_PREVIEW_BUDGET=0 PSP_SHUTDOWN_GRACE=6 run_game savesig "" late hang
+PSP_PROC_DIR="$T/proc" PSP_PREVIEW_BUDGET=0 PSP_SHUTDOWN_GRACE=6 run_game savesig "" shutdownlate hang
 use_log
 check "marker armed" test "$MARKER_AT_OK" = "$EXPECT_MARKER"
 check "log: preview skipped" contains "$LOG" 'Skipping the Game Switcher preview: '
-check "quicksave message shown" contains "$LOG" 'Showing the quicksave message'
+check "log: quicksave message shown" contains "$LOG" 'Showing the quicksave message'
+check "log: it is the presenter branch, not show_message" lacks "$LOG" 'show_message, no usable'
+check "show_message not called" absent "$STUB/shown"
+presenter_cleanup
 end
 
 begin "17 real shutdown order: the Powering off presenter is stopped, then ours (a copy of its binary) is the last one started"
 reset_states
 PSP_PROC_DIR="$T/proc" run_game save "" shutdown hang
 use_log
-wait_for "$STUB/shown" # (it must never appear: the presenter is used, not show_message)
-check "presenters: Powering off started, stopped, then the quicksave message started" sh -c "tr '\\n' '|' <'$STUB/presenter.log' | grep -q '^start --message Powering off --timeout -1|term|start --message Quicksave created, powering off --timeout -1|\$'"
+check "presenters: old start, preflight of the copy, old stopped, copy started with the message" test "$(plog)" = "start $T/selfgz/minui-presenter --message Powering off --timeout -1|preflight $QSBIN|term $PRESENTER_PID|start $QSBIN --message Quicksave created, powering off --timeout -1|"
+check "no second presenter was alive when ours started" contains "$STUB/presenter.log" "^start $QSBIN --message Quicksave.* others=0\$"
 check "our presenter was not stopped again" sh -c "[ \$(grep -c '^term' '$STUB/presenter.log') = 1 ]"
 check "log: the copy of the running presenter is used" contains "$LOG" 'using the copy of the running presenter'
+check "log: preflight status logged" contains "$LOG" 'preflight of .*: exit status 1'
 check "log: the old presenter was seen" contains "$LOG" 'minui-presenter pids: [0-9]'
-check "log: the new presenter runs" contains "$LOG" 'Quicksave message: presenter [0-9]* is running'
+check "log: the new presenter runs" contains "$LOG" 'Quicksave message: presenter [0-9]* is running (0.3 s after the start)'
+check "log: held, then checked again" contains "$LOG" 'held for [0-9]* tenths'
+check "hold is at least half a second here (the preview is quick)" contains "$LOG" 'held for \(10\|[5-9]\) tenths'
 check "show_message not used when the presenter is there" absent "$STUB/shown"
 check "killall not used" absent "$STUB/killall"
 check "message shown before the shim was released" sh -c "grep -v '^+' '$LOG' | grep -E 'Showing the quicksave message|Told the poweroff shim' | cut -c1-14 | tr '\\n' '|' | grep -q 'Showing the qu|Told the power|'"
 check "shim still reached the real poweroff" present "$STUB/real-called"
-# shellcheck disable=SC2046 # a list of pids (the stubs, or none)
-kill -KILL $(pgrep minui-presenter) 2>/dev/null
-wait "$PRESENTER_PID" 2>/dev/null # reap the stub (a zombie would still show up in pgrep)
-rm -rf /tmp/psp-quicksave "$T/proc"/*
+check "our copy is still running when poweroff runs" sh -c "pgrep minui-presenter >/dev/null"
+presenter_cleanup
 end
 
 begin "18 no presenter and no show_message: nothing to show, and it says so"
@@ -575,8 +635,74 @@ mv "$PAK/bin/show_message" "$T/show_message.off"
 run_game save "" shim hang
 mv "$T/show_message.off" "$PAK/bin/show_message"
 use_log
-check "log: not shown" contains "$LOG" 'no minui-presenter to copy or run and no show_message'
+check "log: not shown" contains "$LOG" 'no usable minui-presenter and no show_message'
 check "marker still armed" test "$MARKER_AT_OK" = "$EXPECT_MARKER"
+end
+
+begin "19 cp fails: the copy is made with cat"
+reset_states
+printf '#!/bin/sh\nexit 1\n' >"$PAK/bin/cp"
+chmod +x "$PAK/bin/cp"
+PSP_PROC_DIR="$T/proc" run_game save "" shutdown hang
+rm -f "$PAK/bin/cp"
+use_log
+check "old presenter stopped, copy started" contains "$STUB/presenter.log" "^start $QSBIN --message Quicksave"
+check "log: the copy is used" contains "$LOG" 'using the copy of the running presenter'
+presenter_cleanup
+end
+
+begin "20 the copy fails its preflight: the old presenter is left alone"
+reset_states
+: >"$STUB/preflight-fail"
+PSP_PROC_DIR="$T/proc" run_game save "" shutdown hang
+use_log
+check "log: not usable" contains "$LOG" 'the copy of presenter [0-9]* is not usable'
+check "old presenter never stopped" lacks "$STUB/presenter.log" '^term'
+check "no second presenter started" test "$(grep -c '^start' "$STUB/presenter.log")" = 1
+check "log: preflight status 127" contains "$LOG" 'exit status 127'
+presenter_cleanup
+end
+
+begin "21 our presenter exits at once: a Powering off presenter is started in its place"
+reset_states
+: >"$STUB/qs-dies"
+PSP_PROC_DIR="$T/proc" run_game save "" shutdown hang
+use_log
+check "presenters: old, stopped, ours died, Powering off restored from the copy" test "$(plog)" = "start $T/selfgz/minui-presenter --message Powering off --timeout -1|preflight $QSBIN|term $PRESENTER_PID|start $QSBIN --message Quicksave created, powering off --timeout -1|start $QSBIN --message Powering off --timeout -1|"
+check "log: restoring" contains "$LOG" 'restoring the "Powering off" screen'
+check "the restored presenter is running" sh -c "pgrep minui-presenter >/dev/null"
+presenter_cleanup
+end
+
+begin "22 the old presenter ignores SIGTERM: SIGKILL, and never two presenters at once"
+reset_states
+: >"$STUB/ignore-term"
+PSP_PROC_DIR="$T/proc" run_game save "" shutdown hang
+use_log
+check "log: escalated to SIGKILL" contains "$LOG" 'sending SIGKILL'
+check "old presenter saw the SIGTERM" contains "$STUB/presenter.log" '^term-ignored'
+check "ours started with no other presenter alive" contains "$STUB/presenter.log" "^start $QSBIN --message Quicksave.* others=0\$"
+presenter_cleanup
+end
+
+begin "23 a zombie old presenter is ignored, the live one replaced"
+reset_states
+ZOMBIE_OLD=1 PSP_PROC_DIR="$T/proc" run_game save "" shutdown hang
+use_log
+check "log: only the live presenter listed" contains "$LOG" 'minui-presenter pids: [0-9]*, pgrep'
+check "the zombie-marked one was not sent SIGTERM" sh -c "[ \$(grep -c '^term' '$STUB/presenter.log') = 1 ]"
+check "ours started" contains "$STUB/presenter.log" "^start $QSBIN --message Quicksave"
+presenter_cleanup
+end
+
+begin "24 the 60 s give-up path stops the quicksave presenter and removes its directory"
+reset_states
+PSP_PROC_DIR="$T/proc" PSP_AUTORESUME_WAIT=3 NOKILL=1 run_game save "" shutdown hang
+use_log
+check "give-up path was taken" contains "$LOG" 'Device did not power off'
+check "our presenter is gone" sh -c "! pgrep minui-presenter >/dev/null"
+check "temporary directory removed" absent /tmp/psp-quicksave
+presenter_cleanup
 end
 
 echo

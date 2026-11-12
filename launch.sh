@@ -354,6 +354,26 @@ process_alive() {
     ! grep -q '^State:.*Z' "$PROC_DIR/$1/status" 2>/dev/null
 }
 
+# One 0.1 s step of a wait loop; NAP_T counts the tenths of a second really
+# slept (BusyBox without fractional sleep sleeps 1 s and counts 10), so loops
+# bounded by NAP_T keep their budget, like shutdown_in_progress() does.
+nap() {
+    if sleep 0.1 2>/dev/null; then
+        NAP_T=$((NAP_T + 1))
+    else
+        sleep 1
+        NAP_T=$((NAP_T + 10))
+    fi
+}
+
+# True if any of the pids in $1 is alive.
+any_alive() {
+    for aa_pid in $1; do
+        process_alive "$aa_pid" && return 0
+    done
+    return 1
+}
+
 # Stops our quicksave presenter (the device did not power off after all).
 stop_quicksave_message() {
     [ -z "$QS_PID" ] || kill -KILL "$QS_PID" 2>/dev/null # (we run with TERM ignored: scripts cannot undo that)
@@ -361,33 +381,120 @@ stop_quicksave_message() {
     rm -rf "$QS_DIR"
 }
 
-# Sets QS_BIN to a minui-presenter we can start (and says how in QS_HOW), or "".
+# Copies $1 to $2 (cp, then cat if cp fails); true if $2 is a non-empty executable.
+copy_executable() {
+    rm -f "$2" # a leftover that is still running would be "text file busy"
+    cp "$1" "$2" 2>/dev/null || cat "$1" >"$2" 2>/dev/null
+    [ -s "$2" ] && chmod +x "$2" 2>/dev/null && [ -x "$2" ]
+}
+
+# Runs presenter $1 once without arguments. minui-presenter validates its
+# arguments (parse_arguments: "No message or file provided", exit 1) before it
+# initialises the display, so this does not touch the screen; a binary that
+# cannot be run (126/127, a signal) fails. True if it ran and exited by itself.
+presenter_runs() {
+    "$1" >/dev/null 2>&1 &
+    pr_pid=$!
+    NAP_T=0
+    while kill -0 "$pr_pid" 2>/dev/null && [ "$NAP_T" -lt 20 ]; do nap; done
+    if kill -0 "$pr_pid" 2>/dev/null; then
+        kill -KILL "$pr_pid" 2>/dev/null
+        wait "$pr_pid" 2>/dev/null
+        echo "Quicksave message: $1 did not exit on its own within 2 s without arguments."
+        return 1
+    fi
+    wait "$pr_pid" 2>/dev/null
+    pr_status=$?
+    echo "Quicksave message: preflight of $1: exit status $pr_status."
+    [ "$pr_status" -ne 126 ] && [ "$pr_status" -ne 127 ] && [ "$pr_status" -lt 128 ]
+}
+
+# Sets QS_BIN to a minui-presenter that passed the preflight (QS_HOW says where
+# it comes from), or "". Nothing is stopped here.
 find_quicksave_presenter() {
     QS_BIN=""
     QS_HOW=""
     for qs_pid in $QS_OLD_PIDS; do
         [ -r "$PROC_DIR/$qs_pid/exe" ] || continue
         mkdir -p "$QS_DIR" 2>/dev/null || break
-        if cp "$PROC_DIR/$qs_pid/exe" "$QS_DIR/minui-presenter" 2>/dev/null &&
-            [ -s "$QS_DIR/minui-presenter" ] && chmod +x "$QS_DIR/minui-presenter" 2>/dev/null; then
+        if ! copy_executable "$PROC_DIR/$qs_pid/exe" "$QS_DIR/minui-presenter"; then
+            echo "Quicksave message: could not copy $PROC_DIR/$qs_pid/exe to $QS_DIR."
+            continue
+        fi
+        if presenter_runs "$QS_DIR/minui-presenter"; then
             QS_BIN="$QS_DIR/minui-presenter"
             QS_HOW="copy of the running presenter $qs_pid"
             return 0
         fi
+        echo "Quicksave message: the copy of presenter $qs_pid is not usable."
+        rm -f "$QS_DIR/minui-presenter"
     done
     if qs_cmd="$(command -v minui-presenter 2>/dev/null)" && [ -n "$qs_cmd" ]; then
-        QS_BIN="$qs_cmd"
-        QS_HOW="minui-presenter on PATH ($qs_cmd)"
+        if presenter_runs "$qs_cmd"; then
+            QS_BIN="$qs_cmd"
+            QS_HOW="minui-presenter on PATH ($qs_cmd)"
+        else
+            echo "Quicksave message: $qs_cmd is not usable."
+        fi
     fi
+}
+
+# Stops the presenters in $1 (SIGTERM, SIGKILL after 1 s) and waits until they are
+# gone: its shutdown must not clear the screen after ours has drawn, and two
+# presenters must never run at once. True if they are gone.
+stop_presenters() {
+    # shellcheck disable=SC2086 # a list of pids
+    kill $1 2>/dev/null
+    NAP_T=0
+    while any_alive "$1" && [ "$NAP_T" -lt 10 ]; do nap; done
+    if any_alive "$1"; then
+        echo "Quicksave message: still running after SIGTERM ($1), sending SIGKILL."
+        # shellcheck disable=SC2086
+        kill -KILL $1 2>/dev/null
+        NAP_T=0
+        while any_alive "$1" && [ "$NAP_T" -lt 10 ]; do nap; done
+    fi
+    if any_alive "$1"; then
+        echo "Quicksave message: $1 survived SIGKILL."
+        return 1
+    fi
+    return 0
+}
+
+# Starts $QS_BIN with message $1 as QS_PID.
+start_quicksave_presenter() {
+    "$QS_BIN" --message "$1" --timeout -1 >/dev/null 2>&1 &
+    QS_PID=$!
+    QS_TS="$(now)"
+    echo "Quicksave message: started presenter $QS_PID with \"$1\" at $QS_TS."
+}
+
+# Checks our presenter is alive; if it died (the screen would be blank or stale)
+# starts a "Powering off" one in its place, so the screen never stays empty.
+check_quicksave_presenter() {
+    [ -n "$QS_PID" ] || return 0
+    if process_alive "$QS_PID"; then
+        echo "Quicksave message: presenter $QS_PID is running ($1)."
+        return 0
+    fi
+    echo "Quicksave message: presenter $QS_PID is gone ($1); restoring the \"Powering off\" screen."
+    start_quicksave_presenter "Powering off"
+    NAP_T=0
+    while [ "$NAP_T" -lt 3 ]; do nap; done
+    process_alive "$QS_PID" || {
+        echo "Quicksave message: the restored presenter $QS_PID is gone too."
+        QS_PID=""
+    }
 }
 
 # Like NextUI's minarch, say "Quicksave created, powering off" instead of
 # "Powering off", but only once a state really was saved during this launch
-# (newer than $STATE_MARKER). Best effort and in the background; the log says
-# every step (what was found, what ran) so a device run shows what happened.
-# A state counts as saved if it is newer than the launch, so a state the
-# player saved by hand counts too when save-on-exit is off (no cheap reliable
-# way to tell the two apart here).
+# (newer than $STATE_MARKER). Best effort; the log says every step (what was
+# found, what ran) so a device run shows what happened. A state counts as
+# saved if it is newer than the launch, so a state the player saved by hand
+# counts too when save-on-exit is off (no cheap reliable way to tell the two
+# apart here). The old presenter is only stopped once the replacement has
+# passed a preflight, and a "Powering off" presenter is restored if ours dies.
 show_quicksave_message() {
     saved=""
     for ppst in "$STATE_DIR"/*.ppst; do
@@ -406,11 +513,8 @@ show_quicksave_message() {
     # The shim creates the request file only after the shutdown script has
     # started its "Powering off" presenter: wait for it (at most 2 s, then go
     # on anyway) so that we cannot come before that presenter.
-    waited=0
-    while [ ! -f "$POWEROFF_REQ" ] && [ "$waited" -lt 4 ]; do
-        sleep 0.5 2>/dev/null || sleep 1
-        waited=$((waited + 1))
-    done
+    NAP_T=0
+    while [ ! -f "$POWEROFF_REQ" ] && [ "$NAP_T" -lt 20 ]; do nap; done
     QS_OLD_PIDS=""
     for qs_pid in $(pgrep minui-presenter 2>/dev/null); do
         process_alive "$qs_pid" && QS_OLD_PIDS="${QS_OLD_PIDS:+$QS_OLD_PIDS }$qs_pid"
@@ -419,44 +523,47 @@ show_quicksave_message() {
     find_quicksave_presenter
     if [ -n "$QS_BIN" ]; then
         echo "Showing the quicksave message (using the $QS_HOW)."
-        if [ -n "$QS_OLD_PIDS" ]; then
-            # shellcheck disable=SC2086 # a list of pids
-            kill $QS_OLD_PIDS 2>/dev/null
-            # Wait (at most 1 s) until the old presenter is gone: its shutdown
-            # must not clear the screen after ours has drawn.
-            gone=0
-            while [ "$gone" -lt 10 ]; do
-                alive=""
-                for qs_pid in $QS_OLD_PIDS; do
-                    process_alive "$qs_pid" && alive=1
-                done
-                [ -n "$alive" ] || break
-                sleep 0.1 2>/dev/null || sleep 1
-                gone=$((gone + 1))
-            done
-            echo "Quicksave message: stopped the presenter(s) $QS_OLD_PIDS (${alive:+still running after 1 s, }checked ${gone}x)."
+        if [ -n "$QS_OLD_PIDS" ] && ! stop_presenters "$QS_OLD_PIDS"; then
+            echo "Quicksave message: not starting a second presenter."
+            return 0
         fi
-        "$QS_BIN" --message "$QS_MSG" --timeout -1 >/dev/null 2>&1 &
-        QS_PID=$!
-        sleep 0.3 2>/dev/null || sleep 1
-        if kill -0 "$QS_PID" 2>/dev/null; then
-            echo "Quicksave message: presenter $QS_PID is running (started at $(now))."
-        else
-            echo "Quicksave message: presenter $QS_PID exited at once; the screen shows whatever was there."
-            QS_PID=""
-        fi
+        [ -z "$QS_OLD_PIDS" ] || echo "Quicksave message: stopped the presenter(s) $QS_OLD_PIDS."
+        start_quicksave_presenter "$QS_MSG"
+        NAP_T=0
+        while [ "$NAP_T" -lt 3 ]; do nap; done
+        check_quicksave_presenter "0.3 s after the start"
         return 0
     fi
-    # No presenter binary to be found: use a platform show_message, if any.
+    # No usable presenter binary: a platform show_message, if there is one.
     if command -v show_message >/dev/null 2>&1; then
-        echo "Showing the quicksave message (show_message, no minui-presenter found)."
+        echo "Showing the quicksave message (show_message, no usable minui-presenter found)."
         killall minui-presenter >/dev/null 2>&1
         echo "Quicksave message: killall exit status $?"
         show_message "$QS_MSG" 10 >/dev/null 2>&1 &
     else
-        echo "Quicksave message: no minui-presenter to copy or run and no show_message: not shown."
+        echo "Quicksave message: no usable minui-presenter and no show_message: not shown."
     fi
     return 0
+}
+
+# Called just before the shim is released: poweroff kills everything as soon as
+# it runs, so keep the message visible for about a second in total, counting
+# what happened since it started (the clock is in whole seconds: coarse), and
+# check once more that it is still up.
+finish_quicksave_message() {
+    [ -n "$QS_PID" ] || return 0
+    elapsed=$(($(now) - QS_TS))
+    if [ "$elapsed" -ge 2 ]; then
+        hold=0
+    elif [ "$elapsed" -ge 1 ]; then
+        hold=5
+    else
+        hold=10
+    fi
+    NAP_T=0
+    while [ "$NAP_T" -lt "$hold" ]; do nap; done
+    echo "Quicksave message: held for ${NAP_T} tenths of a second ($elapsed s since the start)."
+    check_quicksave_presenter "before the power-off is released"
 }
 
 # Arm auto-resume, tell the poweroff shim it may go ahead, then wait for the
@@ -491,8 +598,7 @@ arm_auto_resume_and_wait() {
     # The message is cheap (a background process), so it does not depend on the budget.
     [ "$armed" = 1 ] && show_quicksave_message
     write_game_switcher_preview
-    # Let the message be seen: poweroff kills everything as soon as it runs.
-    [ -z "$QS_PID" ] || sleep 1
+    finish_quicksave_message
     : >"$POWEROFF_OK"
     echo "Told the poweroff shim to go ahead."
     # Marker, states and preview are synced and PPSSPP is gone: release the
@@ -649,12 +755,14 @@ main() {
         set_cpu_settings 4 performance 1992000 2160000
     fi
 
+    # chmod first: a zip that dropped the exec bit would otherwise fail the check below.
+    chmod +x "$PAK_DIR/bin/minui-power-control" 2>/dev/null
     if ! command -v minui-power-control >/dev/null 2>&1; then
-        show_message "Minui-power-control not found." 3
+        # (show_message only exists inside minui-power-control's own scripts)
+        echo "minui-power-control not found in $PAK_DIR/bin."
         exit 1
     fi
 
-    chmod +x "$PAK_DIR/bin/minui-power-control"
     # Without the exec bit the poweroff shim is skipped and the marker may be written too late.
     chmod +x "$PAK_DIR/bin/poweroff" 2>/dev/null
 
