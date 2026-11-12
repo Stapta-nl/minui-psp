@@ -477,7 +477,7 @@ FAKE
     # the port is open again at once but the boot id never changes: no reboot; then it closes for real
     run await_reboot oldboot
     assert_failure
-    RB_OLD_ID=oldboot RB_UP_N=0 RB_T_PORT=5
+    export RB_OLD_ID=oldboot RB_UP_N=0 RB_T_PORT=5
     export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=100
     echo 0 >"$FAKE_PORT_STATE"
     rb_up_check || true
