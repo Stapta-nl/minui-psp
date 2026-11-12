@@ -38,12 +38,16 @@
 #              an unbound hotkey is then a preflight failure.
 #   EXIT_KEYS  how the emulator is quit (default: the Exit App hotkey; "" kills PPSSPP instead).
 #   BOOT_WAIT (20)  UI_WAIT (6)  KEY_GAP (0.5)  CHORD_HOLD (0.3)
-#   BOOT_SETTLE (10)  UI_SETTLE (4): the waits are signals, not sleeps: after a game start the test
-#              polls (every second) until PPSSPP has run the ROM as the same process for BOOT_SETTLE
-#              seconds (a game that dies ends the wait at once); after a NextUI start until the same
-#              nextui.elf has been up for UI_SETTLE seconds with no game. BOOT_WAIT and UI_WAIT are
-#              the upper bounds (and cap the settle counts). KEY_GAP and CHORD_HOLD are spacing of the
-#              injected key presses: no signal exists for them, so they stay fixed.
+#   BOOT_SETTLE, UI_SETTLE (default: the value of BOOT_WAIT / UI_WAIT)  how long the waits are quiet:
+#              after a game start the test polls (every second) until PPSSPP has run the ROM as the
+#              SAME process for BOOT_SETTLE seconds (a game that dies ends the wait at once); after a
+#              NextUI start until the same nextui.elf has been up for UI_SETTLE seconds. No signal
+#              exists for "PPSSPP takes hotkeys" or "NextUI has drawn", so by default these are
+#              the old fixed durations and BOOT_WAIT / UI_WAIT are minimum waits (raise them for a
+#              slow device); only an explicit *_SETTLE lowers them, once verified on the device.
+#              The upper bound of each wait is that time plus BOOT_WAIT / UI_WAIT again.
+#              KEY_GAP and CHORD_HOLD are spacing of the injected key presses: no signal exists
+#              for them, so they stay fixed.
 #
 # The save states made by the test (new files in /.userdata/shared/PSP-ppsspp) are deleted
 # at the end. A state that already existed in slot 0 or 1 of the test game is overwritten.
@@ -65,8 +69,6 @@ setup_file() {
     OUT="$OUT_DIR/e2e"
     BOOT_WAIT="${BOOT_WAIT:-20}"
     UI_WAIT="${UI_WAIT:-6}"
-    BOOT_SETTLE="${BOOT_SETTLE:-10}"
-    UI_SETTLE="${UI_SETTLE:-4}"
     KEY_GAP="${KEY_GAP:-0.5}"
     STATE_DIR="$SD/.userdata/shared/PSP-ppsspp"
     PNGCOLOR="$TESTS_DIR/bin/pngcolor"
@@ -209,7 +211,7 @@ teardown_file() {
     printf "'%s/launch.sh' '%s'\n" "$PAK" "$ROM" >/tmp/next
     kill_ui # the launcher loop then runs /tmp/next
     wait_for 60 running PPSSPPSDL || fail "PPSSPP did not start within 60 s"
-    wait_game_settled "$(e2e_settle_count "${BOOT_SETTLE:-10}" "$BOOT_WAIT")" "$BOOT_WAIT" || fail "the game did not settle (see above)"
+    game_settle || fail "the game did not settle (see above)"
 
     shot e2-game
     have_shot e2-game
@@ -241,7 +243,7 @@ teardown_file() {
     running PPSSPPSDL && killall PPSSPPSDL_"$PLATFORM" 2>/dev/null
     wait_for 30 not_running PPSSPPSDL || fail "PPSSPP was still running 30 s after it was killed"
     wait_for 90 running nextui.elf || fail "NextUI did not come back within 90 s"
-    wait_ui_settled "$(e2e_settle_count "${UI_SETTLE:-4}" "$UI_WAIT")" "$((${UI_WAIT%%.*} + 4))" || fail "NextUI did not settle after the game"
+    ui_settle || fail "NextUI did not settle after the game"
     ls -l --full-time "$STATE_DIR" >"$OUT/e2-states.txt" 2>/dev/null || ls -l "$STATE_DIR" >"$OUT/e2-states.txt" 2>&1
     cp "$LOGS/PSP.txt" "$OUT/e2-PSP.log" 2>/dev/null
     [ "$exit_ok" = 1 ] || fail "PPSSPP did not exit on the Exit hotkey ($EXIT_KEYS) and had to be killed. Hotkeys used:

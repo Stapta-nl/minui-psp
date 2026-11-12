@@ -189,8 +189,10 @@ make_device() {
     local start=$SECONDS n=0
     # shellcheck disable=SC2317 # called through await
     third() { n=$((n + 1)); [ "$n" -ge 3 ]; }
-    await 30 "the third poll" third
-    [ $((SECONDS - start)) -le 4 ]
+    await 60 "the third poll" third
+    [ "$n" = 3 ]
+    # three polls at 1 s: two sleeps; a generous upper bound, it only shows that the default is not 3 s or more per poll
+    [ $((SECONDS - start)) -lt 9 ]
 }
 
 # --- the reboot: down, then up, each detected and timed ----------------------------------------
@@ -219,11 +221,11 @@ make_device() {
     export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20
     mkdir -p "$BAK"
     : >"$BAK/active"
-    local start=$SECONDS
     run await_reboot oldboot
     assert_success
-    [ $((SECONDS - start)) -le 5 ]
-    assert_output --partial "down (ssh port closed) after 0s"
+    # (no wall-clock assertion: the port probe and the ssh fake are counted, not timed)
+    [ "$(cat "$FAKE_PORT_STATE")" -ge 1 ]
+    assert_output --partial "down (ssh port closed) after"
 }
 
 @test "await_reboot: also waits for the SD card (the backup flag) after the boot" {
@@ -326,10 +328,11 @@ FAKE
 @test "wait_ui_settled: returns after N quiet polls, early (not after the old fixed wait)" {
     fake_settle_tools
     echo 100 >"$FS/nextui.pid"
-    local start=$SECONDS
-    run wait_ui_settled 2 30
+    hook() { echo x >>"$T/hook.log"; }
+    E2E_POLL_HOOK=hook run wait_ui_settled 2 60
     assert_success
-    [ $((SECONDS - start)) -le 5 ]
+    # early: 3 polls (2 quiet ones), not the 60 of the limit
+    [ "$(wc -l <"$T/hook.log")" -le 5 ]
 }
 
 @test "wait_ui_settled: a NextUI that restarts (new pid) or exits to launch a game is not settled; the limit is the backup" {
@@ -356,13 +359,11 @@ FAKE
     echo 300 >"$FS/game.pid"
     run wait_game_settled 2 30
     assert_success
-    ( sleep 1; rm -f "$FS/game.pid" ) &
-    local start=$SECONDS
-    run wait_game_settled 10 30
+    hook() { echo x >>"$T/hook.log"; [ "$(wc -l <"$T/hook.log")" -lt 3 ] || rm -f "$FS/game.pid"; }
+    E2E_POLL_HOOK=hook run wait_game_settled 100 300
     assert_failure
     assert_output --partial "exited or was restarted"
-    [ $((SECONDS - start)) -le 6 ]
-    wait
+    [ "$(wc -l <"$T/hook.log")" -le 6 ] # ended at once, not after 100 polls
     rm -f "$FS/game.pid"
     run wait_game_settled 1 2
     assert_failure
@@ -377,33 +378,129 @@ FAKE
     [ "$(wc -l <"$T/hook.log")" -ge 3 ]
 }
 
-@test "e2e_settle_count: the wanted count, capped by the old fixed wait (a lowered UI_WAIT wins), junk is 0" {
-    run e2e_settle_count 10 20
+@test "e2e_settle_count: the old wait is the DEFAULT (a minimum); only an explicit override changes it" {
+    run e2e_settle_count "" 20
+    assert_output 20
+    run e2e_settle_count "" 40 # a user who raised BOOT_WAIT gets at least that
+    assert_output 40
+    run e2e_settle_count 10 20 # an explicit, lower SETTLE
     assert_output 10
-    run e2e_settle_count 10 6
+    run e2e_settle_count 30 20
+    assert_output 30
+    run e2e_settle_count "" 6.5
     assert_output 6
-    run e2e_settle_count 4 6.5
-    assert_output 4
     run e2e_settle_count x 6
+    assert_output 6
+    run e2e_settle_count "" junk
     assert_output 0
 }
 
-@test "settle_ui / settle_game / settle_nogame: run the wait on the device through the kit, with the old wait as the bound" {
+@test "the settle defaults are the old fixed waits: BOOT_WAIT 20, UI_WAIT 6, NOGAME_WAIT 25 (bound: that time again on top)" {
+    unset BOOT_SETTLE UI_SETTLE NOGAME_SETTLE BOOT_WAIT UI_WAIT NOGAME_WAIT
+    # shellcheck disable=SC2317 # replaces dev_kit: only the command that would run on the device is recorded
+    dev_kit() { echo "$2" >>"$FAKE_SSH_LOG"; }
+    : >"$FAKE_SSH_LOG"
+    settle_boot
+    settle_ui_short
+    NOGAME_WAIT=40 settle_nogame
+    grep -q 'wait_game_settled 20 40' "$FAKE_SSH_LOG"
+    grep -q 'wait_ui_settled 6 12' "$FAKE_SSH_LOG"
+    grep -q 'wait_ui_settled 40 80' "$FAKE_SSH_LOG"
+    : >"$FAKE_SSH_LOG"
+    BOOT_SETTLE=10 settle_boot
+    grep -q 'wait_game_settled 10 30' "$FAKE_SSH_LOG"
+}
+
+@test "settle_ui / settle_game / settle_nogame: the verdict comes from the device (a game process, no game)" {
     fake_settle_tools
     echo 100 >"$FS/nextui.pid"
-    echo 300 >"$FS/game.pid"
     dev_install_kit
-    # the device here is this machine: the fake pgrep is in PATH of the fake ssh
+    # a real process with the emulator's argv: argv0 PPSSPPSDL_tg5040 and the ROM as an argument
+    ( exec -a PPSSPPSDL_tg5040 bash -c 'sleep 60; :' "$ROM" ) 3>&- &
+    local gp=$!
+    echo "$gp" >"$FS/game.pid"
     run settle_ui 1 5
-    assert_failure # a game is running: NextUI is not "settled"
+    assert_failure # a game runs: NextUI is not "settled"
+    run settle_game 1 5
+    assert_success
+    kill "$gp" 2>/dev/null
+    wait "$gp" 2>/dev/null || true
     rm -f "$FS/game.pid"
     run settle_ui 1 5
     assert_success
     NOGAME_SETTLE=1 NOGAME_WAIT=5 run settle_nogame
     assert_success
-    grep -q 'wait_ui_settled 1 6' "$FAKE_SSH_LOG"
-    run settle_game 1 5 # (the game check reads /proc here: only the call is checked)
-    grep -q 'wait_game_settled 1 5' "$FAKE_SSH_LOG"
+    BOOT_SETTLE=1 BOOT_WAIT=2 run settle_boot
+    assert_failure # no game
+}
+
+@test "dev_definite: a timeout or ssh failure is unknown (retried, then 2), a definite no is 1, yes is 0" {
+    export RB_DEFINITE_TRIES=3
+    dev_install_kit
+    run dev_definite 10 true
+    assert_success
+    run dev_definite 10 false
+    assert_failure 1
+    export FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=100000
+    run dev_definite 10 false
+    assert_failure 2
+    assert_output --partial "no definite answer"
+    unset FAKE_SSH_DOWN_FROM FAKE_SSH_DOWN_TO
+    run dev_definite 1 'exec sleep 20' # a timeout is unknown too
+    assert_failure 2
+}
+
+@test "ensure_game never starts a game over one it could not see: an unreachable device is a failure, not 'not running'" {
+    run awk '/^ensure_game\(\) \{/{f=1} f{print} /^\}/{f=0}' "$TESTS_DIR/bats/reboot.bats"
+    assert_output --partial "dev_definite"
+    refute_output --partial "! probe rb_rom_running"
+}
+
+@test "await_reboot: a WRONG port probe (never open) with working ssh: found by the new boot id, which signal is logged" {
+    export RB_PORT_PROBE=false FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    run await_reboot oldboot
+    assert_success
+    assert_output --partial "reboot: back via: ssh with a new boot_id (the port probe never saw the port open"
+}
+
+@test "await_reboot: a wrong port probe and ssh that answers the OLD id is still not a reboot" {
+    export RB_PORT_PROBE=false REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=2
+    run await_reboot oldboot
+    assert_failure
+    assert_output --partial "the device to come back"
+}
+
+@test "await_reboot: a false 'down' (port closed for a moment) does not leave a misleading port time" {
+    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=3
+    # the port is open again at once but the boot id never changes: no reboot; then it closes for real
+    run await_reboot oldboot
+    assert_failure
+    RB_OLD_ID=oldboot RB_UP_N=0 RB_T_PORT=5
+    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=100
+    echo 0 >"$FAKE_PORT_STATE"
+    rb_up_check || true
+    [ -z "$RB_T_PORT" ]
+}
+
+@test "rb_net_setup: no /dev/tcp in bash selects nc (else ping), and the probes call them with short limits" {
+    unset RB_PORT_PROBE
+    printf '#!/bin/sh\necho "bash: /dev/tcp/127.0.0.1/9: No such file or directory" >&2\nexit 1\n' >"$T/bin/nobash"
+    chmod +x "$T/bin/nobash"
+    printf '#!/bin/sh\necho "$*" >"%s/nc.args"\n' "$T" >"$T/bin/nc"
+    printf '#!/bin/sh\necho "$*" >"%s/ping.args"\n' "$T" >"$T/bin/ping"
+    chmod +x "$T/bin/nc" "$T/bin/ping"
+    RB_BASH="$T/bin/nobash" rb_net_setup
+    [ "$RB_NET_VIA" = nc ]
+    rb_port_open
+    grep -q -- '-z -w 2 brick.example 2222' "$T/nc.args"
+    rm "$T/bin/nc"
+    PATH="$T/bin:/usr/bin:/bin" RB_BASH="$T/bin/nobash" rb_net_setup
+    command -v nc >/dev/null 2>&1 && skip "a system nc exists: the ping branch cannot be selected here"
+    [ "$RB_NET_VIA" = ping ]
+    rb_port_open
+    grep -q -- '-c1 -W1 brick.example' "$T/ping.args"
 }
 
 @test "touch_marker: returns once the clock moved past the marker, so a later write is newer" {

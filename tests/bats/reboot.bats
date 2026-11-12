@@ -58,12 +58,13 @@
 # SET_HOTKEYS, SAVE_KEYS, EXIT_KEYS, BOOT_WAIT (20), UI_WAIT (6), NOGAME_WAIT (25),
 # and the timeouts and intervals listed in tests/helpers/reboot.bash.
 #
-# Waits are signals, not sleeps: a reboot is watched on the network (port closes, port opens, ssh
-# answers with a new boot_id; the time of each phase is logged), a game start by the process
-# running the ROM steadily (BOOT_SETTLE, 10 s: the same pid for that long, a game that dies ends
-# the wait at once), "NextUI did nothing" (no auto-launch) by the same nextui.elf staying up with no
-# game for NOGAME_SETTLE (10 s) / UI_SETTLE (4 s) polls. BOOT_WAIT, UI_WAIT, NOGAME_WAIT and the
-# REBOOT_* / RESUME_TIMEOUT values are the upper bounds after which a wait gives up.
+# Waits are signals where a signal exists: a reboot is watched on the network (port closes, port opens,
+# ssh answers with a new boot_id; the time of each phase is logged), a game that dies while starting ends
+# its wait at once. The rest are quiet windows whose defaults are the old fixed durations (no signal
+# proves "PPSSPP takes hotkeys" or "NextUI would have auto-launched"): the same game pid for BOOT_SETTLE
+# (default BOOT_WAIT), the same nextui.elf with no game for NOGAME_SETTLE (default NOGAME_WAIT) or
+# UI_SETTLE (default UI_WAIT) seconds. So BOOT_WAIT, UI_WAIT and NOGAME_WAIT are minimum waits; the
+# REBOOT_* / RESUME_TIMEOUT values are only the upper bounds after which a wait gives up.
 
 load '../helpers/common'
 load '../helpers/reboot'
@@ -93,7 +94,14 @@ start_game() {
 
 # The game runs (a case that follows an auto-resume keeps it), else start it.
 ensure_game() {
-    if ! probe rb_rom_running; then start_game "$1"; fi
+    # A timeout or an ssh failure is "unknown", never "not running": starting a game over a running one would be wrong.
+    local rc=0
+    dev_definite "${RB_PROBE_TIMEOUT:-10}" rb_rom_running || rc=$?
+    case "$rc" in
+    0) ;;
+    1) start_game "$1" ;;
+    *) fail "could not tell whether the game is running (the device does not answer)" ;;
+    esac
 }
 
 assert_dev() { # assert_dev <script>: the script succeeds on the device

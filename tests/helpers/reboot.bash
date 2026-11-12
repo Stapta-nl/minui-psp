@@ -146,24 +146,46 @@ probe() { dev_ok "${RB_PROBE_TIMEOUT:-10}" "$1"; }
 # The settle checks run ON the device (a local one second loop: no ssh call per poll), keep the
 # device awake there, and give up after the old fixed duration (plus the count). See
 # wait_ui_settled / wait_game_settled in e2e.bash.
-# settle_ui <stable s> <old wait s>: NextUI up and quiet. settle_game likewise for the game.
+# settle_ui <override> <wait>: NextUI up and quiet for <override> s (default: the old fixed <wait>, so
+# that duration is the minimum; see e2e_settle_count); settle_game likewise for the game. The bound
+# is that time plus <wait> again.
 settle_ui() {
-    local n limit
+    local n w
     n="$(e2e_settle_count "$1" "$2")"
-    limit=$((${2%%.*} + n))
-    dev_kit $((limit + 30)) "wait_ui_settled $n $limit"
+    w="$(e2e_whole "$2")"
+    dev_kit $((n + w + 30)) "wait_ui_settled $n $((n + w))"
 }
 settle_game() {
-    local n limit
+    local n w
     n="$(e2e_settle_count "$1" "$2")"
-    limit=${2%%.*}
-    dev_kit $((limit + 30)) "wait_game_settled $n $limit"
+    w="$(e2e_whole "$2")"
+    dev_kit $((n + w + 30)) "wait_game_settled $n $((n + w))"
 }
-# The same with the defaults of the three cases the tests have (README: BOOT_SETTLE, UI_SETTLE, NOGAME_SETTLE).
-settle_boot() { settle_game "${BOOT_SETTLE:-10}" "${BOOT_WAIT:-20}"; }
-settle_resumed() { settle_game "${UI_SETTLE:-4}" "${UI_WAIT:-6}"; }
-settle_ui_short() { settle_ui "${UI_SETTLE:-4}" "${UI_WAIT:-6}"; }
-settle_nogame() { settle_ui "${NOGAME_SETTLE:-10}" "${NOGAME_WAIT:-25}"; }
+# The three cases the tests have (README: BOOT_SETTLE, UI_SETTLE, NOGAME_SETTLE; all default to the old waits).
+settle_boot() { settle_game "${BOOT_SETTLE:-}" "${BOOT_WAIT:-20}"; }
+settle_resumed() { settle_game "${UI_SETTLE:-}" "${UI_WAIT:-6}"; }
+settle_ui_short() { settle_ui "${UI_SETTLE:-}" "${UI_WAIT:-6}"; }
+settle_nogame() { settle_ui "${NOGAME_SETTLE:-}" "${NOGAME_WAIT:-25}"; }
+
+# dev_definite <timeout s> <script>: runs the script on the device and returns 0 (it succeeded) or 1
+# (it failed normally) ONLY for a definite answer. A timeout (124), an ssh failure (255) or a kit
+# that did not load (97/98) is "unknown": it is retried (RB_DEFINITE_TRIES, 20, every POLL_INTERVAL)
+# and after that returns 2. For decisions that must not be taken on a guess.
+dev_definite() {
+    local rc i=0
+    while :; do
+        dev_kit "$1" "$2" >/dev/null 2>&1
+        rc=$?
+        case "$rc" in
+        0) return 0 ;;
+        124 | 255 | 97 | 98 | 2 | 127) ;;
+        *) return 1 ;;
+        esac
+        i=$((i + 1))
+        [ "$i" -lt "${RB_DEFINITE_TRIES:-20}" ] || { echo "no definite answer from the device (ssh status $rc) after $i tries: $2" >&2; return 2; }
+        sleep "${POLL_INTERVAL:-1}"
+    done
+}
 
 # --- reboots -------------------------------------------------------------------------------
 rb_boot_id() { dev_run "${RB_PROBE_TIMEOUT:-10}" 'cat "${BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"' 2>/dev/null; }
@@ -207,7 +229,7 @@ rb_net_setup() {
     RB_NET_PORT="${port:-22}"
     if [ -n "$proxy" ]; then
         RB_NET_VIA=ssh
-    elif bash -c 'exec 3<>/dev/tcp/127.0.0.1/9' 2>&1 | grep -qi 'no such file\|not supported'; then
+    elif "${RB_BASH:-bash}" -c 'exec 3<>/dev/tcp/127.0.0.1/9' 2>&1 | grep -qi 'no such file\|not supported'; then
         if command -v nc >/dev/null 2>&1; then RB_NET_VIA=nc; else RB_NET_VIA=ping; fi
     else
         RB_NET_VIA=tcp
@@ -243,13 +265,24 @@ rb_down_check() {
     [ $((RB_DOWN_N % 5)) -eq 0 ] || return 1
     rb_went_down "$RB_OLD_ID"
 }
-# Up: the port is open (the time is noted), AND ssh answers with a boot id that is not the old one.
-# A port that is open while ssh does not answer yet, or answers with the OLD id (the device did not
-# go down after all, or is still shutting down), is not "back".
+# Up: ssh answers with a boot id that is not the old one. Normally this is tried once the port probe
+# sees the port open (the time is noted; a port seen closed again clears it, so a false "down" does not
+# leave a misleading time). A port probe that is WRONG (a tunnel or LocalForward, filtered ICMP in the
+# ping fallback) must not make the run fail while ssh works: while the probe says closed, the boot id
+# is tried every 3rd poll as well. Either way only a NEW boot id counts; RB_UP_VIA records which
+# signal succeeded. A port that is open while ssh does not answer yet, or answers with the OLD id (the
+# device did not go down after all, or is still shutting down), is not "back".
 rb_up_check() {
-    rb_port_open || return 1
-    [ -n "$RB_T_PORT" ] || RB_T_PORT=$SECONDS
-    rb_is_back "$RB_OLD_ID"
+    RB_UP_N=$((RB_UP_N + 1))
+    if rb_port_open; then
+        [ -n "$RB_T_PORT" ] || RB_T_PORT=$SECONDS
+        rb_is_back "$RB_OLD_ID" && { RB_UP_VIA="port open, then ssh with a new boot_id"; return 0; }
+        return 1
+    fi
+    RB_T_PORT=""
+    [ $((RB_UP_N % 3)) -eq 0 ] || return 1
+    rb_is_back "$RB_OLD_ID" && { RB_UP_VIA="ssh with a new boot_id (the port probe never saw the port open: check the probe, RB_PORT_PROBE)"; return 0; }
+    return 1
 }
 
 # rb_phase_note <what> <seconds> <backup timeout>: a line for the log, with a warning when a phase
@@ -269,7 +302,7 @@ rb_phase_note() {
 await_reboot() {
     local old="$1" tick="${RB_TICK:-1}" t0=$SECONDS t_down t_up t_kit t_sd
     RB_TICK=0
-    RB_OLD_ID="$old" RB_DOWN_N=0 RB_T_PORT=""
+    RB_OLD_ID="$old" RB_DOWN_N=0 RB_UP_N=0 RB_T_PORT="" RB_UP_VIA=""
     rb_net_setup
     rb_log "reboot: triggered, watching $RB_NET_DESC"
     await "${REBOOT_DOWN_TIMEOUT:-90}" "the device to go down (reboot)" rb_down_check || { RB_TICK=$tick; rb_log "reboot: the device was not seen going down after $((SECONDS - t0))s"; return 1; }
@@ -278,7 +311,8 @@ await_reboot() {
     await "${REBOOT_UP_TIMEOUT:-300}" "the device to come back (ssh port open, ssh answering with a new boot_id)" rb_up_check || { RB_TICK=$tick; rb_log "reboot: the device did not come back within $((SECONDS - t0 - t_down))s of going down (ssh port open: $([ -n "$RB_T_PORT" ] && echo yes || echo no); new boot_id: no)"; return 1; }
     t_up=$((SECONDS - t0 - t_down))
     RB_TICK=$tick
-    rb_phase_note "back (port open ${RB_T_PORT:+$((RB_T_PORT - t0 - t_down))}s, then ssh with a new boot_id) ${t_up}s after going down; total" "$((SECONDS - t0))" "$((${REBOOT_DOWN_TIMEOUT:-90} + ${REBOOT_UP_TIMEOUT:-300}))"
+    rb_log "reboot: back via: $RB_UP_VIA"
+    rb_phase_note "back (${RB_T_PORT:+port open $((RB_T_PORT - t0 - t_down))s after going down, }ssh with a new boot_id) ${t_up}s after going down; total" "$((SECONDS - t0))" "$((${REBOOT_DOWN_TIMEOUT:-90} + ${REBOOT_UP_TIMEOUT:-300}))"
     await 60 "the kit to be installed after the reboot" dev_install_kit || return 1
     t_kit=$((SECONDS - t0))
     # The SD card is mounted a little after ssh is up: the backup flag lives on it, and the

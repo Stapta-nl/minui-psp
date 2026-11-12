@@ -353,7 +353,7 @@ touch_marker() {
     return 1
 }
 
-# The pid of the newest process of that name ("" if none).
+# The lowest pid of the processes of that name ("" if none): pgrep lists them in pid order.
 first_pid() { pgrep "$1" 2>/dev/null | head -n 1; }
 
 # wait_ui_settled <stable s> <limit s>: NextUI is up, and it and its launcher are quiet: the SAME
@@ -430,13 +430,21 @@ wait_game_settled() {
     done
 }
 
-# e2e_settle_count <wanted> <old fixed wait>: how many quiet polls to ask for: the wanted count,
-# never more than the old fixed wait that this replaces (a user who lowered UI_WAIT gets less).
+# e2e_settle_count <override> <wait>: how many quiet polls (seconds) a settle waits for: the explicit
+# override (BOOT_SETTLE, UI_SETTLE, NOGAME_SETTLE) when it is a whole number, else the configured
+# fixed wait itself (BOOT_WAIT, UI_WAIT, NOGAME_WAIT; a fraction is cut to whole seconds). So the
+# old duration is the MINIMUM by default and a user who raises the WAIT gets at least that; only an
+# explicit *_SETTLE lowers it. The upper bound of a settle is that count plus the WAIT again.
 e2e_settle_count() {
-    local w="${1%%.*}" cap="${2%%.*}"
+    local o="$1" w="${2%%.*}"
     case "$w" in "" | *[!0-9]*) w=0 ;; esac
-    case "$cap" in "" | *[!0-9]*) cap="$w" ;; esac
-    [ "$w" -le "$cap" ] && echo "$w" || echo "$cap"
+    case "$o" in "" | *[!0-9]*) echo "$w" ;; *) echo "$o" ;; esac
+}
+# e2e_whole <n>: the whole seconds of a wait ("6.5" gives 6, junk gives 0).
+e2e_whole() {
+    local w="${1%%.*}"
+    case "$w" in "" | *[!0-9]*) w=0 ;; esac
+    echo "$w"
 }
 
 octal_byte() { printf '\\%03o' $(($1 & 255)); }
@@ -496,9 +504,10 @@ colour() { "$PNGCOLOR" "$1" 2>/dev/null; } # prints "R G B"
 # $OUT/<label>.png and the name the pak gave it in $OUT/<label>.shotname.
 shot() {
     local before newest
-    # The pak names files by the second: only wait if the previous shot was taken in this very second.
-    while [ "$(date +%s)" = "$(cat "$OUT/.lastshot" 2>/dev/null)" ]; do sleep 0.1; done # poll step
-    date +%s >"$OUT/.lastshot" 2>/dev/null
+    # The pak names files by the second, and the screen needs a moment to show what the last key
+    # did: no signal exists for "drawn" (a frame-stable check would need two screenshots), so the
+    # fixed second stays.
+    sleep 1
     before="$(ls "$SHOTDIR" 2>/dev/null)"
     SDCARD_PATH="$SD" PATH="$MON/bin/$PLATFORM:$MON/bin:$PATH" sh "$MON/bin/screenshot" >"$OUT/$1.shot.log" 2>&1
     # shellcheck disable=SC2012 # names come from the screenshot pak (date based), ls -t is fine
@@ -537,8 +546,8 @@ not_fixture() {
 # An absolute path is not found and NextUI drops it, rewriting recent.txt empty.
 seed_recent() { mkdir -p "$(dirname "$RECENT")" && printf '%s\n' "${ROM#"$SD"}" >"$RECENT"; }
 
-# restart_ui: kills NextUI and waits until the NEW process is up and settled (same pid for
-# UI_SETTLE polls, at most UI_WAIT more seconds). The old process being gone is detected by its
+# restart_ui: kills NextUI and waits until the NEW process is up and settled (the same pid for
+# UI_SETTLE polls, default UI_WAIT: the old render delay is kept, no signal says "drawn"). The old process being gone is detected by its
 # pid, not by a fixed pause.
 restart_ui() {
     local old
@@ -548,7 +557,19 @@ restart_ui() {
         echo "NextUI did not come back within 40 s of being restarted" >&2
         return 1
     }
-    wait_ui_settled "$(e2e_settle_count "${UI_SETTLE:-4}" "$UI_WAIT")" "$((${UI_WAIT%%.*} + 4))"
+    ui_settle
+}
+# game_settle: the settle after a game start (BOOT_SETTLE, default BOOT_WAIT: the old duration).
+game_settle() {
+    local n
+    n="$(e2e_settle_count "${BOOT_SETTLE:-}" "$BOOT_WAIT")"
+    wait_game_settled "$n" "$((n + $(e2e_whole "$BOOT_WAIT")))"
+}
+# ui_settle: the settle after a NextUI start, with the default count and bound (see e2e_settle_count).
+ui_settle() {
+    local n
+    n="$(e2e_settle_count "${UI_SETTLE:-}" "$UI_WAIT")"
+    wait_ui_settled "$n" "$((n + $(e2e_whole "$UI_WAIT")))"
 }
 
 open_switcher() { # restarts NextUI directly into the Game Switcher
