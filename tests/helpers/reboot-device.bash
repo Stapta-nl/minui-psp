@@ -308,12 +308,18 @@ rb_expected_marker() { printf '%s' "${ROM#"$SD"}"; }
 
 # --- save states -----------------------------------------------------------------------
 # The states PPSSPP wrote (.ppst, not the undo copies); "new" = newer than the marker file.
+# ONE definition of "a real state": every undo copy PPSSPP writes has "undo" in its name
+# (<game>_<slot>.undo.ppst, load_undo.ppst, *.undo.jpg). load_undo.ppst is written at the start
+# of a game that auto-loads a state, so it is newer than the marker without any state being saved.
+RB_STATE_FIND="-name *.ppst ! -name *undo*"
 rb_all_states() {
-    find "$STATE_DIR" -name '*.ppst' ! -name '*.undo.ppst' ! -name '*_undo.ppst' 2>/dev/null
+    # shellcheck disable=SC2086 # the expression is split on purpose (globs are quoted by find's own parsing: set -f)
+    ( set -f; find "$STATE_DIR" $RB_STATE_FIND 2>/dev/null )
 }
 rb_new_states() {
     [ -f "$BAK/marker" ] || return 0
-    find "$STATE_DIR" -name '*.ppst' ! -name '*.undo.ppst' ! -name '*_undo.ppst' -newer "$BAK/marker" 2>/dev/null
+    # shellcheck disable=SC2086
+    ( set -f; find "$STATE_DIR" $RB_STATE_FIND -newer "$BAK/marker" 2>/dev/null )
 }
 # The slot of the newest new state ("" if none): <game>_<version>_<slot>.ppst
 rb_newest_new_slot() {
@@ -400,7 +406,7 @@ echo "poweroff replaced by reboot: called with '\$*' at \$(date)" >>"\$B/wrapper
 echo "\$*" >"\$B/evidence-called"
 [ -f '$AUTORESUME' ] && cp '$AUTORESUME' "\$B/evidence-marker"
 cp '$LOGS/PSP.txt' "\$B/evidence-PSP.txt" 2>/dev/null
-find '$STATE_DIR' -name '*.ppst' -newer "\$B/marker" >"\$B/evidence-new-states" 2>/dev/null
+( set -f; find '$STATE_DIR' $RB_STATE_FIND -newer "\$B/marker" ) >"\$B/evidence-new-states" 2>/dev/null
 sync
 exec $reboot_cmd
 WRAP

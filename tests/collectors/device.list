@@ -12,5 +12,5 @@ pak.json | cat "$SD/Emus/$PLATFORM/${PAK_NAME:-PSP}.pak/pak.json"
 ppsspp.ini | sed -E 's/^([^=]*([Tt][Oo][Kk][Ee][Nn]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Uu][Ss][Ee][Rr][Nn][Aa][Mm][Ee])[^=]*=).*/\1<hidden>/' "$SD/Emus/$PLATFORM/${PAK_NAME:-PSP}.pak/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
 PSP.txt | cat "$SD/.userdata/$PLATFORM/logs/PSP.txt"
 controls.ini | cat "$SD/Emus/$PLATFORM/${PAK_NAME:-PSP}.pak/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini"
-minuisettings.txt | sed -E 's/^([^=]*([Tt][Oo][Kk][Ee][Nn]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Uu][Ss][Ee][Rr]|[Aa][Uu][Tt][Hh])[^=]*=).*/\1<hidden>/' "$SD/.userdata/shared/minuisettings.txt"
-minui-state.txt | ls -l "$SD/.userdata/shared/.minui"; echo; cat "$SD/.userdata/shared/.minui/game_switcher.txt" 2>&1
+minuisettings.txt | sed -E 's/^([^=]*([Tt][Oo][Kk][Ee][Nn]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Uu][Ss][Ee][Rr]|[Aa][Uu][Tt][Hh])[^=]*=).*/\1<hidden>/' "$SD/.userdata/shared/minuisettings.txt" 2>/dev/null || echo "(no minuisettings.txt)"
+minui-state.txt | ls -l "$SD/.userdata/shared/.minui" 2>&1; echo; cat "$SD/.userdata/shared/.minui/game_switcher.txt" 2>/dev/null || echo "(no game_switcher.txt)"; exit 0

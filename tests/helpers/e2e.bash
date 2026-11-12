@@ -186,7 +186,7 @@ is_image() {
 }
 
 # The newest save state thumbnail made since the test marked its start ("" if none).
-new_state_thumbs() { find "$STATE_DIR" -name '*.jpg' ! -name '*.undo.jpg' -newer "$BAK/marker"; }
+new_state_thumbs() { find "$STATE_DIR" -name '*.jpg' ! -name '*undo*' -newer "$BAK/marker"; }
 newest_state_thumb() {
     local thumbs
     thumbs="$(new_state_thumbs)"

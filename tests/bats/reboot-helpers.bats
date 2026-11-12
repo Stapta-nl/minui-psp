@@ -354,6 +354,38 @@ mess_up() {
     assert_output 3
 }
 
+@test "new states: PPSSPP's undo copies (load_undo.ppst, save_undo.ppst, *.undo.*) are never states" {
+    mkdir -p "$BAK"
+    touch -d '2020-01-01 00:00:00' "$BAK/marker"
+    : >"$STATE_DIR/load_undo.ppst" # written at game start when a state is auto-loaded
+    : >"$STATE_DIR/save_undo.ppst"
+    : >"$STATE_DIR/G_1.00_0.undo.ppst"
+    : >"$STATE_DIR/G_1.00_0.undo.jpg"
+    run rb_new_states
+    assert_output ""
+    run rb_has_new_state
+    assert_failure
+    run rb_all_states
+    assert_output ""
+    : >"$STATE_DIR/G_1.00_2.ppst"
+    run rb_has_new_state
+    assert_success
+    run rb_new_states
+    assert_output "$STATE_DIR/G_1.00_2.ppst"
+}
+
+@test "state snapshot: undo copies are not part of it (a load_undo.ppst appearing is not a change)" {
+    mkdir -p "$BAK"
+    printf 'aaa' >"$STATE_DIR/G_1.00_0.ppst"
+    rb_save_snapshot
+    printf 'x' >"$STATE_DIR/load_undo.ppst"
+    printf 'y' >"$STATE_DIR/save_undo.ppst"
+    run rb_states_intact
+    assert_success
+    run cat "$BAK/evidence-states-before"
+    refute_output --partial undo
+}
+
 @test "new states: without a marker nothing is new" {
     : >"$STATE_DIR/G_1.00_3.ppst"
     rm -f "$BAK/marker"
@@ -448,6 +480,9 @@ mess_up() {
     touch "$BAK/marker"
     sleep 2
     : >"$STATE_DIR/NEW_1.00_5.ppst"
+    : >"$STATE_DIR/load_undo.ppst" # PPSSPP's undo copies are no saved states
+    : >"$STATE_DIR/save_undo.ppst"
+    : >"$STATE_DIR/NEW_1.00_5.undo.ppst"
     printf '/Roms/Sony PSP (PSP)/game.iso' >"$AUTORESUME"
     printf 'Auto-resume armed for x\n' >"$LOGS/PSP.txt"
     run env PSP_POWEROFF_TMP="$RB_TMP" PSP_POWEROFF_REAL="$WRAPPER" PSP_POWEROFF_TIMEOUT=2 sh "$PAK/bin/poweroff"
