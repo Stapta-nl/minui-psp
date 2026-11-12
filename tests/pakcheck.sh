@@ -47,6 +47,7 @@ ignored() {
 
 # The reference: what the release contains.
 : >"$tmp/downloaded"
+: >"$tmp/built"
 if [ -e "$ref/.git" ]; then
     # a checkout: git archive's content = tracked files minus export-ignore (.gitattributes) ...
     git -C "$ref" ls-files | grep -v -E '^(\.github/|\.git[a-z]*$|Makefile$|src/|tests/|dist/)' >"$tmp/ref"
@@ -54,7 +55,7 @@ if [ -e "$ref/.git" ]; then
     if [ -f "$ref/.gitarchiveinclude" ]; then
         while IFS= read -r f; do
             [ -n "$f" ] || continue
-            if [ -f "$ref/$f" ]; then echo "$f" >>"$tmp/ref"; else echo "$f" >>"$tmp/downloaded"; fi
+            if [ -f "$ref/$f" ]; then echo "$f" >>"$tmp/ref"; echo "$f" >>"$tmp/built"; else echo "$f" >>"$tmp/downloaded"; fi
         done <"$ref/.gitarchiveinclude"
     fi
 else
@@ -65,7 +66,7 @@ sort -u "$tmp/ref" -o "$tmp/ref"
 grep -v '^#' "$list" | sed 's/^\([^ ]*\)  /\1\t/' >"$tmp/dev"
 cut -f 2- "$tmp/dev" | sort -u >"$tmp/devfiles"
 
-differs=() missing=() extra=() notcmp=() compared=0
+differs=() builtdiff=() missing=() extra=() notcmp=() compared=0
 while IFS= read -r f; do
     ignored "$f" && continue
     [ -f "$ref/$f" ] || continue # tracked but deleted in the working tree
@@ -74,7 +75,11 @@ while IFS= read -r f; do
         missing+=("$f")
     else
         compared=$((compared + 1))
-        [ "$(sum_of "$ref/$f")" = "$d" ] || differs+=("$f")
+        if [ "$(sum_of "$ref/$f")" != "$d" ]; then
+            # a build output (binary) of this machine or of the release download: another build
+            # of the same source differs, so this is a note, not a warning
+            if grep -qxF -- "$f" "$tmp/built"; then builtdiff+=("$f"); else differs+=("$f"); fi
+        fi
     fi
 done <"$tmp/ref"
 while IFS= read -r f; do
@@ -93,8 +98,9 @@ done <"$tmp/downloaded"
 
 ref_version="$(jq -r '.version // empty' "$ref/pak.json" 2>/dev/null)"
 if [ "${#differs[@]}" = 0 ] && [ "${#missing[@]}" = 0 ] && [ "${#extra[@]}" = 0 ]; then
-    echo "Pak under test: matches $label ($compared files compared${notcmp[0]:+, ${#notcmp[@]} not compared: they come from a release download}; user settings ignored)"
+    echo "Pak under test: matches $label (all $((compared - ${#builtdiff[@]})) shipped files compared are identical${builtdiff[0]:+; ${#builtdiff[@]} build outputs differ, see below}${notcmp[0]:+; ${#notcmp[@]} not compared: they come from a release download}; user settings ignored)"
     echo "  pak.json version: $dev_version; PPSSPP build text in the binary: ${dev_build:-unknown}"
+    for f in ${builtdiff[@]+"${builtdiff[@]}"}; do echo "  note: differs from $label; build output, may be a different build: $f"; done
     for f in ${notcmp[@]+"${notcmp[@]}"}; do echo "  not compared (binary comes from a release download): $f"; done
     exit 0
 fi
@@ -102,6 +108,7 @@ echo "WARNING: the pak installed on the device is NOT the one under test ($label
 for f in ${differs[@]+"${differs[@]}"}; do echo "  differs from $label: $f"; done
 for f in ${missing[@]+"${missing[@]}"}; do echo "  missing on the device: $f"; done
 for f in ${extra[@]+"${extra[@]}"}; do echo "  extra on the device (not in the release): $f"; done
+for f in ${builtdiff[@]+"${builtdiff[@]}"}; do echo "  note: differs from $label; build output, may be a different build: $f"; done
 for f in ${notcmp[@]+"${notcmp[@]}"}; do echo "  not compared (binary comes from a release download): $f"; done
 echo "  pak.json version on the device: ${dev_version:-unknown} (under test: ${ref_version:-unknown}); PPSSPP build text on the device: ${dev_build:-unknown}"
 echo "  Update the pak on the device (README, Updating: keep your ppsspp.ini and controls.ini) and run again."

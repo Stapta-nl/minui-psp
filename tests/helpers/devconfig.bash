@@ -130,10 +130,15 @@ cfg_chord_owner() {
 
 # cfg_controls_bind <controls.ini> <name> <codes>: sets "<name> = <codes>" in the first
 # [ControlMapping] section: replaces an EMPTY value of that key, else adds the line at the end
-# of the section (the section is appended when the file has none). Every other line is kept as
+# of the section. It refuses (status 1) when there is no such section: creating one would make
+# PPSSPP drop its built-in mappings. Every other line is kept as
 # it is, BOM and CRLF included. Only call it for a hotkey that is not bound.
 cfg_controls_bind() {
     local tmp="$1.tmp.$$"
+    grep -q '\[ControlMapping\]' "$1" 2>/dev/null || {
+        echo "no [ControlMapping] section in $1: not creating one" >&2
+        return 1
+    }
     awk -v name="$2" -v val="$3" '
         NR == 1 && /\r$/ { cr = "\r" }
         function flush_blank(   i) { for (i = 1; i <= nb; i++) print blank[i]; nb = 0 }
@@ -158,7 +163,6 @@ cfg_controls_bind() {
         END {
             if (sec && !done) add()
             flush_blank()
-            if (!seen) { print "[ControlMapping]" cr; add() }
         }' "$1" >"$tmp" && [ -s "$tmp" ] && cat "$tmp" >"$1"
     local rc=$?
     rm -f "$tmp"
@@ -241,7 +245,13 @@ cfg_init_hotkeys() {
                 src="$ctl not found"
                 [ "$need" = 1 ] && cfg_prob "$ctl not found (the tests do not create it): start a game once so PPSSPP writes it, or set $var"
                 ;;
-            NOSECTION | UNSET)
+            NOSECTION)
+                # PPSSPP erases every button that is not listed once the section exists, so a
+                # section created by the tests would wipe its built-in mappings for the run.
+                src="no [ControlMapping] section in $ctl"
+                [ "$need" = 1 ] && cfg_prob "no [ControlMapping] in $ctl, so $label is not bound (PPSSPP has no default); the tests do not create the section (PPSSPP would then drop its built-in button mappings): bind the hotkeys in PPSSPP (Controls > Hotkeys) or set $var"
+                ;;
+            UNSET)
                 if [ "$need" = 0 ]; then
                     src="not bound in $ctl"
                 elif [ "${SET_HOTKEYS:-1}" = 0 ]; then
@@ -295,6 +305,42 @@ cfg_reinit_hotkeys() {
     cfg_init_hotkeys "$CFG_CTL" "$CFG_NEEDS"
 }
 
+# cfg_backup_and_bind: the one sequence both test files use: back controls.ini up byte for byte
+# (needs stash from e2e.bash, BAK and the "active" flag set by the caller), then bind the missing
+# hotkeys. A refusal to write (no backup) is an error.
+cfg_backup_and_bind() {
+    stash "$CFG_CTL"
+    cfg_apply_hotkeys
+}
+
+# cfg_restore_foreign <other backup dir>: the OTHER test file (e2e vs reboot, each has its own
+# backup dir) may have been cut short while it had hotkeys bound: put its controls.ini back
+# first, so that a bound file is never taken for the original. No-op without such a leftover.
+cfg_restore_foreign() {
+    local o="$1"
+    [ -f "$o/controls.written" ] && [ -f "$o$CFG_CTL" ] || return 0
+    ${CFG_STOP_GAME:-true} # PPSSPP must not run: it rewrites its files when it exits
+    if [ -f "$CFG_CTL" ] && ! cmp -s "$o/controls.written" "$CFG_CTL"; then
+        cp -p "$CFG_CTL" "$CFG_CTL.replaced.$(cfg_stamp)"
+        echo "WARNING: $CFG_CTL changed since an earlier run bound hotkeys in it; the changed file is kept as $CFG_CTL.replaced.*" >&2
+    fi
+    cp -p "$o$CFG_CTL" "$CFG_CTL" && rm -f "$o/controls.written" "$o/controls.bound"
+    echo "an earlier, cut-short run had bound hotkeys in controls.ini: the original was put back first"
+}
+
+cfg_stamp() { echo "$(date +%Y%m%dT%H%M%S 2>/dev/null)-$$-$RANDOM"; }
+
+# cfg_report_restore <had hotkeys 0|1>: after restore_files, says that controls.ini is restored
+# only if it is byte-identical to the backup; else says where the original is.
+cfg_report_restore() {
+    [ "$1" = 1 ] || return 0
+    if cmp -s "$BAK$CFG_CTL" "$CFG_CTL"; then
+        echo "controls.ini restored: the hotkeys the tests had bound are removed again"
+    else
+        echo "WARNING: controls.ini could NOT be restored; the original is in $BAK$CFG_CTL"
+    fi
+}
+
 # cfg_apply_hotkeys: binds the hotkeys on HOTKEY_TO_BIND in controls.ini. The caller must have
 # backed controls.ini up first (stash, under the "active" flag of $BAK): this writes
 # $BAK/controls.written (the file as the tests left it, to notice later changes) and
@@ -302,6 +348,11 @@ cfg_reinit_hotkeys() {
 cfg_apply_hotkeys() {
     local nm codes var chord bound=""
     [ -n "$HOTKEY_TO_BIND" ] || return 0
+    # Never write without the byte-exact backup (stash) that restore_files puts back.
+    if ! grep -qxF -- "$CFG_CTL" "$BAK/present" 2>/dev/null || ! cmp -s "$BAK$CFG_CTL" "$CFG_CTL"; then
+        echo "refusing to change $CFG_CTL: it is not backed up in $BAK (internal error)" >&2
+        return 1
+    fi
     while IFS='|' read -r nm codes var chord; do
         [ -n "$nm" ] || continue
         cfg_controls_bind "$CFG_CTL" "$nm" "$codes" || { echo "could not write $CFG_CTL" >&2; return 1; }

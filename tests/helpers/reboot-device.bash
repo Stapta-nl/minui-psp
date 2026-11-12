@@ -166,12 +166,14 @@ rb_backup() {
         restore_files
         rb_restore_states
         rm -f "$BAK/active"
-        cfg_reinit_hotkeys # what the aborted run had bound is gone: resolve from the restored file
     fi
+    # The e2e test's backup may hold hotkeys bound by a cut-short run: put that file back first.
+    CFG_STOP_GAME=rb_stop_game cfg_restore_foreign "$SHARED/.psp-e2e-backup"
+    cfg_reinit_hotkeys # what an aborted run had bound is gone: resolve from the restored file
     rm -f "$BAK/present" "$BAK/absent" "$BAK/states.before" "$BAK/marker" "$BAK"/evidence-* "$BAK/wrapper.log" "$BAK/trigger.log"
     : >"$BAK/active"
     sync
-    for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW" "$INI" "$CONTROLS"; do stash "$f"; done
+    for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW" "$INI"; do stash "$f"; done
     for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && stash "$f"; done
     mkdir -p "$STATE_DIR"
     ls -1 "$STATE_DIR" >"$BAK/states.before" 2>/dev/null
@@ -190,7 +192,7 @@ rb_backup() {
         echo "$HOTKEY_PROBLEMS" >&2
         return 1
     fi
-    cfg_apply_hotkeys
+    cfg_backup_and_bind # stashes controls.ini byte for byte, then binds
 }
 
 # Puts back the state files backed up by rb_backup that were changed or deleted.
@@ -233,7 +235,7 @@ rb_restore() {
     rb_restore_states
     rm -rf "$BAK/states"
     rm -f "$BAK/active"
-    [ "$had_hotkeys" = 1 ] && echo "controls.ini restored: the hotkeys the tests had bound are removed again"
+    cfg_report_restore "$had_hotkeys"
     kill_ui || true # NextUI starts again with the restored recents and without a marker
     return 0
 }
@@ -262,6 +264,8 @@ rb_ini_set() {
         END { if (g && !done) print key " = " val cr }
     ' "$INI" >"$tmp" && cat "$tmp" >"$INI"
     rm -f "$tmp"
+    # what the tests left, to notice a later change (restore_files keeps a changed file)
+    [ -f "$BAK/active" ] && cp -p "$INI" "$BAK/ini.written" 2>/dev/null
     sync
 }
 

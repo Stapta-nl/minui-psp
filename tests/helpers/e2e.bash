@@ -17,16 +17,19 @@ kill_ui() { killall -9 nextui.elf 2>/dev/null; }
 restore_files() {
     local f
     rm -f /tmp/next
-    # controls.ini: the tests may have bound hotkeys in it (devconfig.bash). If it is not what
-    # they left (PPSSPP or the user changed it since) its current content is kept next to the
-    # backup before the original is put back, so nothing is lost.
-    if [ -f "$BAK/controls.written" ] && [ -n "${CONTROLS:-}" ]; then
-        if [ -f "$CONTROLS" ] && ! cmp -s "$BAK/controls.written" "$CONTROLS"; then
-            cp -p "$CONTROLS" "$BAK/controls.ini.replaced"
-            echo "WARNING: $CONTROLS changed during the run; the original is restored, the changed file is kept as $BAK/controls.ini.replaced" >&2
+    # controls.ini (hotkeys bound by the tests, devconfig.bash) and ppsspp.ini (written by the
+    # tests and rewritten by PPSSPP): if one is not what the tests left, its current content is
+    # kept next to it under a unique name before the original is put back, so nothing is lost.
+    local w t
+    for w in controls ini; do
+        [ -f "$BAK/$w.written" ] || continue
+        if [ "$w" = controls ]; then t="${CONTROLS:-}"; else t="${INI:-}"; fi
+        if [ -n "$t" ] && [ -f "$t" ] && ! cmp -s "$BAK/$w.written" "$t"; then
+            cp -p "$t" "$t.replaced.$(date +%Y%m%dT%H%M%S 2>/dev/null)-$$-$RANDOM"
+            echo "WARNING: $t changed during the run; the original is restored, the changed file is kept as $t.replaced.*" >&2
         fi
-        rm -f "$BAK/controls.written" "$BAK/controls.bound"
-    fi
+        rm -f "$BAK/$w.written" "$BAK/$w.bound"
+    done
     if [ -f "$BAK/present" ]; then
         while IFS= read -r f; do
             [ -n "$f" ] && cp -p "$BAK$f" "$f"
@@ -61,6 +64,17 @@ stash() {
     else
         echo "$1" >>"$BAK/absent"
     fi
+}
+
+# Stops PPSSPP for good (SIGKILL, nothing is saved) and waits until it is gone and NextUI is back:
+# PPSSPP rewrites its ini files when it exits, which must not happen after they are restored.
+e2e_stop_game() {
+    if pgrep PPSSPPSDL >/dev/null 2>&1; then
+        killall -9 "PPSSPPSDL_${PLATFORM:-}" 2>/dev/null
+        wait_for 30 not_running PPSSPPSDL
+        wait_for 90 running nextui.elf # launch.sh has finished when the launcher starts NextUI again
+    fi
+    return 0
 }
 
 # --- helpers ---------------------------------------------------------------------------

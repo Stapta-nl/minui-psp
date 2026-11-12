@@ -230,14 +230,22 @@ done
 # pak: say so right away and in the summary. Only a warning (PAK_MISMATCH=fail makes it fatal).
 echo "== $platform: checking which pak is installed"
 mkdir -p "$stage/pak"
-# shellcheck disable=SC2016 # not expanded here: the command runs on the device
-if rssh "cd '$remote_tmp' && sh tests/collectors/pak-files.sh $(q "$sd/Emus/$platform/$pak_name.pak") $(q "$platform")" </dev/null 2>&1 | redact >"$stage/pak/files.txt" &&
-    [ "$(sed -n 's/^# error: //p' "$stage/pak/files.txt")" = "" ] && [ -s "$stage/pak/files.txt" ]; then
+# The list is the collector's stdout, as it is (no redaction: it would corrupt names like
+# PPSSPPSDL_tg5040 when the ssh alias is the platform name; it holds no address). Its stderr and
+# ssh's go to a separate file, redacted.
+rssh "cd '$remote_tmp' && sh tests/collectors/pak-files.sh $(q "$sd/Emus/$platform/$pak_name.pak") $(q "$platform")" </dev/null >"$stage/pak/files.txt" 2>"$stage/pak/collector-stderr.txt"
+collect_rc=$?
+redact <"$stage/pak/collector-stderr.txt" >"$stage/pak/collector-stderr.txt.tmp" && mv "$stage/pak/collector-stderr.txt.tmp" "$stage/pak/collector-stderr.txt"
+pak_rc=1
+if [ "$collect_rc" != 0 ] || ! grep -q '^# algo: ' "$stage/pak/files.txt"; then
+    printf 'WARNING: the installed pak could not be read from the device (status %s: %s). Is it installed in Emus/%s/%s.pak? Nothing was compared.\n' \
+        "$collect_rc" "$({ sed -n "s/^# error: //p" "$stage/pak/files.txt"; head -n 1 "$stage/pak/collector-stderr.txt"; } | head -n 2 | tr "\n" " ")" "$platform" "$pak_name" >"$stage/pak/check.txt"
+else
     bash tests/pakcheck.sh "$stage/pak/files.txt" >"$stage/pak/check.txt" 2>&1
     pak_rc=$?
-else
-    printf 'WARNING: the installed pak could not be read from the device (%s): is it installed in Emus/%s/%s.pak?\n' "$(head -n 1 "$stage/pak/files.txt" 2>/dev/null)" "$platform" "$pak_name" >"$stage/pak/check.txt"
-    pak_rc=1
+    if [ "$pak_rc" = 2 ]; then
+        printf 'WARNING: the list of the installed pak could not be compared (%s)\n' "$(head -n 1 "$stage/pak/check.txt")" >"$stage/pak/check.txt"
+    fi
 fi
 cat "$stage/pak/check.txt" >&2
 if [ "$pak_rc" != 0 ] && [ "${PAK_MISMATCH:-warn}" = fail ]; then

@@ -91,6 +91,31 @@ check() { bash "$TESTS_DIR/pakcheck.sh" "$T/files.txt" "${1:-$REL}"; }
     assert_output --partial "PPSSPP build text on the device: v1.19.0"
 }
 
+@test "a build output that differs is a note, not a warning, and the 'matches' text stays accurate" {
+    local co="$T/checkout"
+    mkdir -p "$co"
+    cp -R "$REL/." "$co/"
+    printf 'PPSSPP/PPSSPPSDL_tg5040\nbin/jpg2bmp\n' >"$co/.gitarchiveinclude"
+    printf 'built here' >"$co/bin/jpg2bmp"
+    git -C "$co" init -q
+    git -C "$co" add -A
+    printf 'built elsewhere' >"$DEV/bin/jpg2bmp"
+    printf 'ELF v1.19.0 old' >"$DEV/PPSSPP/PPSSPPSDL_tg5040"
+    list_device
+    run check "$co"
+    assert_success
+    refute_output --partial WARNING
+    assert_output --partial "note: differs from the release in $co; build output, may be a different build: bin/jpg2bmp"
+    assert_output --partial "build output, may be a different build: PPSSPP/PPSSPPSDL_tg5040"
+    assert_output --partial "2 build outputs differ"
+    # a tracked file that differs is still the warning
+    printf 'old' >"$DEV/launch.sh"
+    list_device
+    run check "$co"
+    assert_failure 1
+    assert_output --partial "differs from the release in $co: launch.sh"
+}
+
 @test "a checkout: the PPSSPP binary that was not built here is 'not compared', never a mismatch" {
     local co="$T/checkout"
     mkdir -p "$co"
@@ -112,7 +137,7 @@ check() { bash "$TESTS_DIR/pakcheck.sh" "$T/files.txt" "${1:-$REL}"; }
     refute_output --partial "tests/foo"
 }
 
-@test "a checkout whose built binary exists locally is compared" {
+@test "a checkout whose built binary exists locally is compared (a difference is a note, a missing one a warning)" {
     local co="$T/checkout"
     mkdir -p "$co"
     cp -R "$REL/." "$co/"
@@ -122,8 +147,13 @@ check() { bash "$TESTS_DIR/pakcheck.sh" "$T/files.txt" "${1:-$REL}"; }
     printf 'ELF v1.19.0 old' >"$DEV/PPSSPP/PPSSPPSDL_tg5040"
     list_device
     run check "$co"
+    assert_success # a build output: only a note
+    assert_output --partial "build output, may be a different build: PPSSPP/PPSSPPSDL_tg5040"
+    rm "$DEV/PPSSPP/PPSSPPSDL_tg5040" # a MISSING build output is still a warning
+    list_device
+    run check "$co"
     assert_failure 1
-    assert_output --partial "differs from the release in $co: PPSSPP/PPSSPPSDL_tg5040"
+    assert_output --partial "missing on the device: PPSSPP/PPSSPPSDL_tg5040"
 }
 
 @test "an unusable list is status 2, not a verdict" {
@@ -149,4 +179,21 @@ check() { bash "$TESTS_DIR/pakcheck.sh" "$T/files.txt" "${1:-$REL}"; }
     assert_grep "$stage/summary.md" 'differs from this checkout: launch.sh'
     assert_grep "$stage/summary.md" '^| Pak under test | WARNING'
     rm -rf "$stage" "$REPO_DIR"/dist/test-report-"$target"-*.tar.gz
+}
+
+@test "run-device.sh: the list is not redacted, the collector's stderr is separate, the status and the algo line are checked" {
+    local f="$TESTS_DIR/run-device.sh" blk
+    blk="$(sed -n '/checking which pak is installed/,/running the device tests/p' "$f")"
+    [[ "$blk" == *'>"$stage/pak/files.txt" 2>"$stage/pak/collector-stderr.txt"'* ]]
+    [[ "$blk" != *'redact >"$stage/pak/files.txt"'* ]]
+    [[ "$blk" == *'collect_rc=$?'* ]]
+    [[ "$blk" == *"grep -q '^# algo: '"* ]]
+    [[ "$blk" == *"Nothing was compared"* ]]
+}
+
+@test "pakcheck: a list without the algo line is status 2, no extra-file list" {
+    printf 'abc  launch.sh\n' >"$T/files.txt"
+    run bash "$TESTS_DIR/pakcheck.sh" "$T/files.txt" "$REL"
+    assert_failure 2
+    refute_output --partial "extra on the device"
 }

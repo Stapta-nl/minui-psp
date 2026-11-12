@@ -128,16 +128,21 @@ $problems"
     # --- back up everything we will touch ---
     if [ -f "$BAK/active" ]; then
         info "found the backup of an aborted run: restoring those files first"
+        e2e_stop_game # PPSSPP rewrites its ini files when it exits: not after the restore
         restore_files
         rm -f "$BAK/active"
-        # the hotkeys the aborted run had bound are gone again: resolve from the restored file
-        cfg_reinit_hotkeys
-        if [ "$PSP_DEFAULT" = 1 ]; then
-            PSP_KEYS="$SAVE_KEYS sleep3 shot $NEXT_SLOT_KEYS sleep1 shot $SAVE_KEYS sleep3 shot"
-        fi
-        [ -z "$HOTKEY_PROBLEMS" ] || fail "the device is not set up for this test, change this and run again:
-$HOTKEY_PROBLEMS"
     fi
+    # The reboot tests' backup may hold hotkeys bound by a cut-short run: put that file back first.
+    # (A bound file must never be taken for the original.)
+    export CFG_STOP_GAME=e2e_stop_game
+    msg="$(cfg_restore_foreign "$SHARED/.psp-reboot-backup")" && [ -n "$msg" ] && info "$msg"
+    # The hotkeys an aborted run had bound are gone again: resolve from the restored file.
+    cfg_reinit_hotkeys
+    if [ "$PSP_DEFAULT" = 1 ]; then
+        PSP_KEYS="$SAVE_KEYS sleep3 shot $NEXT_SLOT_KEYS sleep1 shot $SAVE_KEYS sleep3 shot"
+    fi
+    [ -z "$HOTKEY_PROBLEMS" ] || fail "the device is not set up for this test, change this and run again:
+$HOTKEY_PROBLEMS"
     rm -f "${OUT:?}"/*.png "${OUT:?}"/*.log "${OUT:?}"/*.shotname \
         "${BAK:?}/present" "${BAK:?}/absent" "${BAK:?}/states.before" "${BAK:?}/marker"
     info "device pad: $PAD"
@@ -153,7 +158,7 @@ $HOTKEY_PROBLEMS"
     sync
     # Bind the missing hotkeys (after the backup above; PPSSPP reads controls.ini when it
     # starts, so this is in place before any game is launched).
-    cfg_apply_hotkeys >"$OUT/hotkeys.txt" || fail "could not set the hotkeys in $CONTROLS (see $OUT/hotkeys.txt)"
+    cfg_backup_and_bind >"$OUT/hotkeys.txt" 2>&1 || fail "could not back up controls.ini and set the hotkeys (see $OUT/hotkeys.txt): $(cat "$OUT/hotkeys.txt")"
     [ -s "$OUT/hotkeys.txt" ] && info "$(cat "$OUT/hotkeys.txt")"
 
     # E1 starts from: the game in recents, slot 0 chosen.
@@ -176,13 +181,13 @@ teardown() {
 teardown_file() {
     # Only when the backup was made (setup_file may have failed in the preflight).
     [ -n "${BAK:-}" ] && [ -f "$BAK/active" ] || return 0
-    killall PPSSPPSDL_"$PLATFORM" 2>/dev/null
+    e2e_stop_game # PPSSPP rewrites controls.ini/ppsspp.ini when it exits: stop it BEFORE the restore
     local had_hotkeys=0
     [ -f "$BAK/controls.bound" ] && had_hotkeys=1
     restore_files
     rm -f "$BAK/active"
     kill_ui # relaunches NextUI with the restored files
-    [ "$had_hotkeys" = 1 ] && echo "# controls.ini restored: the hotkeys the tests had bound are removed again" >&3
+    CFG_CTL="$CONTROLS" cfg_report_restore "$had_hotkeys" | sed 's/^/# /' >&3
     echo "# restored; results in $OUT" >&3
 }
 

@@ -344,6 +344,43 @@ mess_up() {
     cmp "$CONTROLS" "$T/controls.orig"
 }
 
+@test "rb_backup after a cut-short e2e run: the original controls.ini is restored first, and it is the original that rb_restore puts back" {
+    seed_files
+    printf '[ControlMapping]\nSelect = 10-196\nR = 10-192\n' >"$CONTROLS"
+    cp "$CONTROLS" "$T/controls.orig"
+    # the e2e run's side, in its own backup dir on the SD card: backup, bind, cut short
+    local reboot_bak="$BAK"
+    BAK="$SHARED/.psp-e2e-backup"
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    cfg_init_hotkeys "$CONTROLS"
+    cfg_backup_and_bind >/dev/null
+    assert_differ "$CONTROLS" "$T/controls.orig"
+    BAK="$reboot_bak"
+    # the reboot run starts
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    rb_init
+    run rb_backup
+    assert_success
+    assert_output --partial "original was put back first"
+    run rb_restore
+    assert_output --partial "controls.ini restored"
+    cmp "$CONTROLS" "$T/controls.orig"
+}
+
+@test "rb_ini_set remembers what the tests wrote; a different ppsspp.ini at the restore is kept under a unique name" {
+    seed_files
+    rb_backup >/dev/null
+    rb_ini_set SaveStateOnExit False
+    printf '%s\n' '[General]' 'SaveStateOnExit = Rewritten' >"$INI"   # PPSSPP rewrote it when it exited
+    run rb_restore
+    assert_output --partial "WARNING"
+    assert_same "$INI" "$T/ini.copy"
+    run bash -c "grep -l Rewritten '$INI'.replaced.*"
+    assert_success
+}
+
 @test "SET_HOTKEYS is forwarded to the device when set" {
     run rb_env_prelude
     refute_output --partial SET_HOTKEYS
