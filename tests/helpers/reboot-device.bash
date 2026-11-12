@@ -138,7 +138,7 @@ rb_preflight() {
     [ -d "${ROM_DIR:-}" ] || fail_ "no Roms/*(PSP) folder found (set ROM_DIR)"
     [ -f "${ROM:-}" ] || fail_ "no game file found (set ROM)"
     rb_reboot_cmd >/dev/null || fail_ "no reboot command found"
-    for p in pgrep killall sync awk find; do
+    for p in pgrep killall sync awk find cmp cp mv sort mkdir cat tr; do
         command -v "$p" >/dev/null 2>&1 || fail_ "$p is missing"
     done
     case "$SD$BAK$ROM" in *"'"*) fail_ "paths with a single quote are not supported" ;; esac
@@ -174,6 +174,9 @@ rb_backup() {
     cfg_apply_hotkeys
 }
 
+# The size of the save state folder in KB (the host sizes the backup's timeout with it).
+rb_state_kb() { du -sk "$STATE_DIR" 2>/dev/null | cut -f 1; }
+
 # Puts back the state files backed up by rb_backup that were changed or deleted.
 rb_restore_states() { restore_states; }
 
@@ -202,7 +205,8 @@ rb_restore() {
         }
     fi
     [ -f "$BAK/controls.bound" ] && had_hotkeys=1
-    psp_restore normal || return 1
+    # normal for the backup THIS run made (PSP_RUN_ID, from the host), strict for any other
+    psp_finish || return 1
     rm -f "$WRAPPER"
     cfg_report_restore "$had_hotkeys"
     kill_ui || true # NextUI starts again with the restored recents and without a marker

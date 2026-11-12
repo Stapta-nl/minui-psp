@@ -14,78 +14,153 @@ kill_ui() { killall -9 nextui.elf 2>/dev/null; }
 # --- back up everything the test touches, restore on exit ---------------------------------
 # ONE backup directory ($BAK, on the SD card) and ONE "active" flag are shared by e2e.bats and
 # reboot.bats: a run that finds an active backup, whichever test made it, restores it first and
-# then starts clean. psp_backup / psp_restore below are used by both.
+# then starts clean. The "active" file holds the id of the run that made the backup
+# (PSP_RUN_ID, known only once psp_backup succeeded): the end of a run restores NORMALLY only a
+# backup that run made; any other backup is restored in the strict "recover" mode.
+#
+# Every restore is careful with the user's files: a file is put back over what is there only if
+# that is the backup or what the tests left; anything else is kept as <file>.replaced.<unique>
+# (with a warning) first, files are replaced atomically (copy next to it, compare, rename), nothing
+# is deleted that the tests did not provably create, and the backup stays active until every
+# file has been verified.
 
 cfg_stamp() { echo "$(date +%Y%m%dT%H%M%S 2>/dev/null)-$$-$RANDOM"; }
 
 # stash <file>: copies it into $BAK byte for byte and records it as present (or as absent).
-# Fails, recording nothing, when the copy is not identical (full SD card).
+# Fails, recording nothing, when the copy or the record cannot be made (full SD card).
 stash() {
     if [ -e "$1" ]; then
-        if ! { mkdir -p "$BAK$(dirname "$1")" && cp -p "$1" "$BAK$1" && cmp -s "$1" "$BAK$1"; }; then
+        if ! { mkdir -p "$BAK$(dirname "$1")" && cp -p "$1" "$BAK$1" && cmp -s "$1" "$BAK$1" && echo "$1" >>"$BAK/present"; }; then
             echo "could not back up $1 into $BAK (SD card full?)" >&2
             return 1
         fi
-        echo "$1" >>"$BAK/present"
     else
-        echo "$1" >>"$BAK/absent"
+        echo "$1" >>"$BAK/absent" || {
+            echo "could not write $BAK/absent (SD card full?)" >&2
+            return 1
+        }
     fi
 }
 
-# snapshot_left <file>: what the tests (or PPSSPP, after it stopped) left in a settings file.
+# snapshot_left <file>: what the tests, or PPSSPP after it stopped, left in a file.
 snapshot_left() {
     mkdir -p "$BAK/left$(dirname "$1")" && cp -p "$1" "$BAK/left$1"
 }
-
-# guard_changed <file>: a settings file (controls.ini, ppsspp.ini) is only put back over what is
-# there when that is the backup or what the tests left; anything else (the user edited it, an
-# earlier run was cut short half way through) is kept next to it as <file>.replaced.<unique>.
-guard_changed() {
-    local f="$1"
-    [ -f "$f" ] && grep -qxF -- "$f" "$BAK/present" 2>/dev/null || return 0
-    cmp -s "$f" "$BAK$f" && return 0
-    [ -f "$BAK/left$f" ] && cmp -s "$f" "$BAK/left$f" && return 0
-    cp -p "$f" "$f.replaced.$(cfg_stamp)"
-    echo "WARNING: $f is neither the backup nor what the tests left; the original is restored, the file as it was is kept as $f.replaced.*" >&2
+# Notes the settings files as they are now (after the game was stopped; also when the tests wrote
+# them): PPSSPP's own rewrite when it exits is then not mistaken for somebody else's change.
+snapshot_settings() {
+    local f
+    [ -f "$BAK/active" ] || return 0
+    for f in "${CONTROLS:-}" "${INI:-}"; do
+        [ -n "$f" ] && [ -f "$f" ] && grep -qxF -- "$f" "$BAK/present" 2>/dev/null && snapshot_left "$f"
+    done
+    return 0
+}
+# Every backed up file (and every one that did not exist) as it is now, for a normal end of run.
+snapshot_all() {
+    local f
+    while IFS= read -r f; do
+        [ -n "$f" ] && [ -f "$f" ] && snapshot_left "$f"
+    done < <(cat "$BAK/present" "$BAK/absent" 2>/dev/null)
+    return 0
 }
 
+# keep_copy <file>: keeps the file as it is under a unique name next to it.
+keep_copy() {
+    local c
+    c="$1.replaced.$(cfg_stamp)"
+    cp -p "$1" "$c" || {
+        echo "could not keep a copy of $1 (SD card full?): it is left as it is" >&2
+        return 1
+    }
+    echo "WARNING: $1 is neither the backup nor what the tests left; the file as it was is kept as $c" >&2
+}
+
+# guard_changed <file>: succeeds when the live file may be overwritten (or does not exist): it is
+# the backup or what the tests left, or a copy of it was kept.
+guard_changed() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    [ -f "$BAK$f" ] && cmp -s "$f" "$BAK$f" && return 0
+    [ -f "$BAK/left$f" ] && cmp -s "$f" "$BAK/left$f" && return 0
+    keep_copy "$f"
+}
+
+# restore_one <file>: atomic and guarded.
+restore_one() {
+    local f="$1" tmp="$1.psp-restore.$$"
+    guard_changed "$f" || return 1
+    if cp -p "$BAK$f" "$tmp" && cmp -s "$tmp" "$BAK$f" && mv -f "$tmp" "$f"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    echo "could not restore $f from $BAK$f (SD card full?): it is left as it is" >&2
+    return 1
+}
+
+# remove_created <file>: removes a file that did not exist when the backup was made, after a copy
+# is kept unless it is what the tests left.
+remove_created() {
+    [ -e "$1" ] || return 0
+    guard_changed "$1" || return 1
+    rm -f "$1" || return 1
+}
+
+# The files, the previews of the test game and (normal end of run only) the save states made
+# since the backup. PSP_RESTORE_MODE is normal or recover (set by psp_restore; direct callers get
+# the strict one).
 restore_files() {
-    local f rc=0
+    local f rc=0 mode="${PSP_RESTORE_MODE:-recover}" n
     rm -f /tmp/next
-    [ -n "${CONTROLS:-}" ] && guard_changed "$CONTROLS"
-    [ -n "${INI:-}" ] && guard_changed "$INI"
     if [ -f "$BAK/present" ]; then
         while IFS= read -r f; do
             [ -n "$f" ] || continue
-            cp -p "$BAK$f" "$f" || { echo "could not restore $f from $BAK$f" >&2; rc=1; }
+            restore_one "$f" || rc=1
         done <"$BAK/present"
     fi
     if [ -f "$BAK/absent" ]; then
         while IFS= read -r f; do
-            [ -n "$f" ] && rm -f "$f"
+            [ -n "$f" ] || continue
+            remove_created "$f" || rc=1
         done <"$BAK/absent"
     fi
     rm -f "$PERSIST.tmp"
-    # delete previews of other slots that the test created, and any preview a test renamed
-    # to .bmp.off (the restore above has already put back the ones that existed before)
+    # previews of other slots that were made since (and any preview a test renamed to .bmp.off):
+    # the files that existed before are in the backup
     for f in "$MINUI/$ROM_FILE".*.bmp "$MINUI/$ROM_FILE".*.bmp.off; do
-        [ -f "$f" ] && ! grep -qxF "$f" "$BAK/present" 2>/dev/null && rm -f "$f"
+        [ -f "$f" ] || continue
+        grep -qxF -- "$f" "$BAK/present" 2>/dev/null && continue
+        remove_created "$f" || rc=1
     done
-    # delete save states the test created (files that were not there before)
-    if [ -f "$BAK/states.before" ]; then
-        for f in "$STATE_DIR"/*; do
-            [ -f "$f" ] && ! grep -qxF "$(basename "$f")" "$BAK/states.before" && rm -f "$f"
-        done
+    # save states made since the backup: only at a normal end of run (nobody else was at the
+    # device), only files that are new (not in states.before and newer than the backup), never in
+    # the strict mode: a state of another game that appeared after a cut-short run stays
+    if [ "$mode" = normal ] && [ -f "$BAK/states.before" ] && [ -f "$BAK/active" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            n="${f##*/}"
+            grep -qxF -- "$n" "$BAK/states.before" && continue
+            rm -f "$f" || rc=1
+        done < <(find "$STATE_DIR" -maxdepth 1 -type f -newer "$BAK/active" 2>/dev/null)
     fi
     sync
+    # verified: every backed up file is what the backup holds
+    if [ -f "$BAK/present" ]; then
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            cmp -s "$BAK$f" "$f" || { echo "NOT restored: $f" >&2; rc=1; }
+        done <"$BAK/present"
+    fi
     return "$rc"
 }
 
 # Copies every save state file (a test overwrites a slot) into $BAK/states, checked.
 backup_states() {
     local f
-    mkdir -p "$STATE_DIR"
-    ls -1 "$STATE_DIR" >"$BAK/states.before" 2>/dev/null
+    if ! { mkdir -p "$STATE_DIR" && ls -1 "$STATE_DIR" >"$BAK/states.before" 2>/dev/null; }; then
+        echo "could not write $BAK/states.before" >&2
+        return 1
+    fi
     rm -rf "$BAK/states"
     mkdir -p "$BAK/states" || return 1
     for f in "$STATE_DIR"/*; do
@@ -97,14 +172,23 @@ backup_states() {
     done
     sync
 }
-# Puts back the state files that were changed or deleted.
+# Puts back the state files that were changed or deleted (atomic; in the strict mode a state that
+# is neither the backup nor what was there is kept as .replaced first).
 restore_states() {
-    local f n rc=0
+    local f n tmp rc=0
     [ -d "$BAK/states" ] || return 0
     for f in "$BAK/states"/*; do
         [ -f "$f" ] || continue
         n="$STATE_DIR/${f##*/}"
-        cmp -s "$f" "$n" 2>/dev/null || cp -p "$f" "$n" || rc=1
+        cmp -s "$f" "$n" 2>/dev/null && continue
+        if [ "${PSP_RESTORE_MODE:-recover}" != normal ] && [ -f "$n" ]; then
+            keep_copy "$n" || { rc=1; continue; }
+        fi
+        tmp="$n.psp-restore.$$"
+        if cp -p "$f" "$tmp" && cmp -s "$tmp" "$f" && mv -f "$tmp" "$n"; then :; else
+            rm -f "$tmp"
+            rc=1
+        fi
     done
     sync
     return "$rc"
@@ -114,13 +198,16 @@ restore_states() {
 # left: PPSSPP is killed (SIGKILL, nothing is saved) whenever it shows up, and a game that is
 # still starting or that launch.sh is still wrapping up counts as running because NextUI is only
 # back once launch.sh has finished. PPSSPP rewrites its ini files when it exits, which must not
-# happen after they are restored. Fails when it cannot get there.
+# happen after they are restored. Fails when it cannot get there. On success the settings files
+# are noted as they are (see snapshot_settings).
 e2e_stop_game() {
     local n=0 limit="${E2E_STOP_TIMEOUT:-90}"
     while :; do
         if pgrep PPSSPPSDL >/dev/null 2>&1; then
             killall -9 "PPSSPPSDL_${PLATFORM:-}" 2>/dev/null
         elif pgrep nextui.elf >/dev/null 2>&1; then
+            # (not while recovering a cut-short run: what is there then must not become "expected")
+            [ -n "${PSP_NO_SNAPSHOT:-}" ] || snapshot_settings
             return 0
         fi
         if [ "$n" -ge "$limit" ]; then
@@ -132,21 +219,48 @@ e2e_stop_game() {
     done
 }
 
+# psp_restore_dir <dir>: restores the backup in another directory (an older version's), strictly.
+psp_restore_dir() {
+    local saved="$BAK" rc=0
+    BAK="$1"
+    # the older versions kept what the tests left in controls.written / ini.written
+    [ -f "$BAK/controls.written" ] && [ -n "${CONTROLS:-}" ] && { mkdir -p "$BAK/left$(dirname "$CONTROLS")" && cp -p "$BAK/controls.written" "$BAK/left$CONTROLS"; }
+    [ -f "$BAK/ini.written" ] && [ -n "${INI:-}" ] && { mkdir -p "$BAK/left$(dirname "$INI")" && cp -p "$BAK/ini.written" "$BAK/left$INI"; }
+    psp_restore recover || rc=1
+    BAK="$saved"
+    return "$rc"
+}
+
 # psp_backup: the backup of everything the tests touch (needs RECENT PERSIST AUTORESUME SLOT_FILE
-# PREVIEW INI CONTROLS MINUI ROM_FILE STATE_DIR BAK). A leftover active backup, from whichever
-# test, is restored first. "active" is set before anything is copied, so an abort at any point is
-# restored by the next run; a backup that cannot be made completely leaves nothing behind and
-# fails before anything was changed.
+# PREVIEW INI CONTROLS MINUI ROM_FILE STATE_DIR BAK SHARED). A leftover active backup, from
+# whichever test or from an older version (the per-test directories), is restored first.
+# "active" is set before anything is copied, so an abort at any point is restored by the next
+# run; a backup that cannot be made completely leaves nothing behind and fails before anything
+# was changed. Sets and exports PSP_RUN_ID only when it succeeded.
 psp_backup() {
-    local f
+    local f d id
     mkdir -p "$BAK" "$MINUI" || return 1
+    for d in "$SHARED/.psp-e2e-backup" "$SHARED/.psp-reboot-backup"; do
+        [ -f "$d/active" ] || continue
+        echo "found the backup of a cut-short run of an older version in $d: restoring those files first"
+        if psp_restore_dir "$d"; then
+            mv "$d" "$d.restored.$(cfg_stamp)" || rm -f "$d/active"
+        else
+            echo "could not restore $d: fix that (see above) or restore the files by hand and remove $d/active" >&2
+            return 1
+        fi
+    done
     if [ -f "$BAK/active" ]; then
         echo "found the backup of an aborted run: restoring those files first"
         psp_restore recover || return 1
     fi
     rm -rf "$BAK/left" "$BAK/states"
     rm -f "$BAK/present" "$BAK/absent" "$BAK/states.before" "$BAK/marker" "$BAK/controls.bound"
-    : >"$BAK/active"
+    id="$(cfg_stamp)"
+    printf '%s\n' "$id" >"$BAK/active" || {
+        echo "could not write $BAK/active (SD card full?)" >&2
+        return 1
+    }
     sync
     for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW" "$INI" "$CONTROLS"; do
         stash "$f" || { rm -f "$BAK/active" "$BAK/present" "$BAK/absent"; return 1; }
@@ -156,24 +270,26 @@ psp_backup() {
         stash "$f" || { rm -f "$BAK/active" "$BAK/present" "$BAK/absent"; return 1; }
     done
     backup_states || { rm -f "$BAK/active" "$BAK/present" "$BAK/absent"; return 1; }
+    # the settings files as they are now: what the tests will start from
+    snapshot_settings
     sync
+    PSP_RUN_ID="$id"
+    export PSP_RUN_ID
 }
 
 # psp_restore normal|recover: stops the game, then puts everything back. "normal" (the end of a
-# run) first notes what PPSSPP left in the settings files after it stopped, so its own rewrite is
-# not taken for a foreign change; "recover" (a cut-short run) keeps anything unexpected. On a
-# failure the backup stays (active) so that the next run tries again, and says where it is.
+# run that made the backup) first notes the files as they are after PPSSPP stopped, so that
+# PPSSPP's own rewrite is not taken for a foreign change; "recover" keeps anything unexpected as
+# .replaced and never deletes save states. On a failure the backup stays active, so the next run
+# tries again, and says where it is.
 psp_restore() {
-    local f rc=0
+    local rc=0 PSP_RESTORE_MODE="$1" PSP_NO_SNAPSHOT=""
+    [ "$1" = normal ] || PSP_NO_SNAPSHOT=1
     ${PSP_STOP_GAME:-e2e_stop_game} || {
-        echo "WARNING: not restored (a game is still running); the backup stays in $BAK and is restored by the next run" >&2
+        echo "WARNING: not restored (a game is still running or starting); the backup stays in $BAK and is restored by the next run" >&2
         return 1
     }
-    if [ "$1" = normal ]; then
-        for f in "${CONTROLS:-}" "${INI:-}"; do
-            [ -n "$f" ] && [ -f "$f" ] && snapshot_left "$f"
-        done
-    fi
+    [ "$PSP_RESTORE_MODE" = normal ] && snapshot_all
     restore_files || rc=1
     restore_states || rc=1
     if [ "$rc" != 0 ]; then
@@ -181,9 +297,23 @@ psp_restore() {
         return 1
     fi
     # nothing may point at the stash any more: a later run must not copy it over the file again
-    rm -f "$BAK/present" "$BAK/absent" "$BAK/active"
-    rm -rf "$BAK/states" "$BAK/left"
+    if ! { rm -rf "$BAK/states" "$BAK/left" && rm -f "$BAK/present" "$BAK/absent" "$BAK/active"; }; then
+        echo "WARNING: could not clean up $BAK; the files are restored" >&2
+        return 1
+    fi
     return 0
+}
+
+# psp_finish: the end of a run. A backup that THIS run made (its id is in PSP_RUN_ID) is restored
+# normally; any other active backup (a leftover of a cut-short run, when this run failed before its
+# own backup) strictly. Nothing to do without an active backup.
+psp_finish() {
+    [ -f "$BAK/active" ] || return 0
+    if [ -n "${PSP_RUN_ID:-}" ] && [ "$(cat "$BAK/active" 2>/dev/null)" = "$PSP_RUN_ID" ]; then
+        psp_restore normal
+    else
+        psp_restore recover
+    fi
 }
 
 # --- helpers ---------------------------------------------------------------------------

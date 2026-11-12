@@ -150,12 +150,13 @@ teardown() {
 }
 
 teardown_file() {
-    # Only when the backup was made (setup_file may have failed in the preflight).
+    # Only when there is a backup (setup_file may have failed in the preflight, before it).
     [ -n "${BAK:-}" ] && [ -f "$BAK/active" ] || return 0
     local had_hotkeys=0
     [ -f "$BAK/controls.bound" ] && had_hotkeys=1
-    # psp_restore stops PPSSPP first (it rewrites its ini files when it exits), then restores.
-    if psp_restore normal 2>&3; then
+    # psp_finish stops PPSSPP first (it rewrites its ini files when it exits), restores NORMALLY
+    # only the backup this run made (PSP_RUN_ID) and strictly any other one.
+    if psp_finish 2>&3; then
         kill_ui # relaunches NextUI with the restored files
         CFG_CTL="$CONTROLS" cfg_report_restore "$had_hotkeys" | sed 's/^/# /' >&3
         echo "# restored; results in $OUT" >&3
@@ -196,7 +197,6 @@ teardown_file() {
     for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && rm -f "$f"; done
     seed_recent
     mkdir -p "$STATE_DIR"
-    ls -1 "$STATE_DIR" >"$BAK/states.before" 2>/dev/null
     touch "$BAK/marker"
     sleep 2 # FAT mtimes have 2 s resolution
     printf "'%s/launch.sh' '%s'\n" "$PAK" "$ROM" >/tmp/next

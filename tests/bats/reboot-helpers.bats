@@ -498,6 +498,199 @@ unbound_controls() {
     assert_success
 }
 
+# --- the end of a run, with the real functions ----------------------------------------------------
+fake_game_up() { # a NextUI that is up and no game: what e2e_stop_game wants to see
+    mkdir -p "$T/fb"
+    printf '#!/bin/sh\n[ "$1" = nextui.elf ]\n' >"$T/fb/pgrep"
+    printf '#!/bin/sh\n:\n' >"$T/fb/killall"
+    chmod +x "$T/fb/pgrep" "$T/fb/killall"
+    export PATH="$T/fb:$PATH"
+    # shellcheck disable=SC1091
+    . "$HELPERS/e2e.bash" # the real e2e_stop_game (make_device made it a no-op)
+}
+
+@test "end of run: a leftover backup this run did not make (its setup failed early) is restored STRICTLY, a user edit survives" {
+    unbound_controls
+    rb_backup >/dev/null                                  # an older, cut-short run
+    printf '[General]\nSaveStateOnExit = USER\n' >"$INI"  # the user edits ppsspp.ini ...
+    printf '[ControlMapping]\nSelect = 10-196\nSave State = 10-197:10-193\n' >"$CONTROLS" # ... and controls.ini
+    unset PSP_RUN_ID                                      # this run failed before its own backup
+    run psp_finish
+    assert_success
+    assert_output --partial "WARNING"
+    assert_same "$INI" "$T/ini.copy"
+    cmp "$CONTROLS" "$T/controls.orig"
+    run bash -c "cat '$INI'.replaced.* '$CONTROLS'.replaced.*"
+    assert_output --partial "SaveStateOnExit = USER"
+    assert_output --partial "Save State = 10-197:10-193"
+    assert_file_not_exist "$BAK/active"
+    # a backup with ANOTHER run's id is just as strict
+    seed_files
+    rb_backup >/dev/null
+    printf 'edited by hand' >"$RECENT"
+    PSP_RUN_ID=some-other-run run psp_finish
+    assert_output --partial "neither the backup nor what the tests left"
+}
+
+@test "end of run: the backup this run made is restored normally (its own changes are not 'foreign')" {
+    unbound_controls
+    rb_backup >/dev/null
+    [ -n "$PSP_RUN_ID" ] && [ "$(cat "$BAK/active")" = "$PSP_RUN_ID" ]
+    printf '/Roms/changed.iso\n' >"$RECENT"               # what NextUI does during the run
+    printf '%s\n' '[General]' 'x = rewritten by PPSSPP' >"$INI"
+    run psp_finish
+    assert_success
+    refute_output --partial "WARNING"
+    assert_same "$INI" "$T/ini.copy"
+    cmp "$CONTROLS" "$T/controls.orig"
+}
+
+@test "psp_backup sets PSP_RUN_ID only when it succeeded" {
+    unbound_controls
+    unset PSP_RUN_ID
+    cp() { command cp "$@" && : >"$2"; }
+    run psp_backup
+    assert_failure
+    unset -f cp
+    [ -z "${PSP_RUN_ID:-}" ]
+    psp_backup >/dev/null
+    [ -n "$PSP_RUN_ID" ]
+}
+
+@test "recover after an abort: another game's state and a NEWER recent.txt of the user are not lost or deleted" {
+    unbound_controls
+    rb_backup >/dev/null
+    printf 'user state' >"$STATE_DIR/OTHERGAME_1.00_0.ppst"     # the user plays another game ...
+    printf '/Roms/the-users-newest.iso\n' >"$RECENT"             # ... recents moved on
+    printf 'users switcher' >"$PERSIST"                           # a file that did not exist at the backup
+    unset PSP_RUN_ID
+    run psp_finish
+    assert_success
+    assert_file_exist "$STATE_DIR/OTHERGAME_1.00_0.ppst"
+    run cat "$RECENT"
+    assert_output "/Roms/other.iso"
+    run bash -c "cat '$RECENT'.replaced.*"
+    assert_output "/Roms/the-users-newest.iso"
+    run bash -c "cat '$PERSIST'.replaced.*"
+    assert_output "users switcher"
+    assert_file_not_exist "$PERSIST"
+}
+
+@test "normal end of run: only states made since the backup are deleted; the ones that were there stay" {
+    unbound_controls
+    : >"$STATE_DIR/OLD_1.00_1.ppst"
+    rb_backup >/dev/null
+    sleep 1
+    : >"$STATE_DIR/NEW_1.00_2.ppst"
+    run psp_finish
+    assert_success
+    assert_file_not_exist "$STATE_DIR/NEW_1.00_2.ppst"
+    assert_file_exist "$STATE_DIR/OLD_1.00_1.ppst"
+    assert_file_exist "$STATE_DIR/OLD_1.00_0.ppst"
+}
+
+@test "a backup of an OLDER version (per-test dirs) is restored first, retired, and never taken for the original" {
+    unbound_controls
+    local old="$SHARED/.psp-e2e-backup"
+    mkdir -p "$old$(dirname "$CONTROLS")"
+    command cp -p "$CONTROLS" "$old$CONTROLS"
+    printf '%s\n' "$CONTROLS" >"$old/present"
+    : >"$old/active"
+    printf '%s' 'older version: bound' >>"$CONTROLS"      # the file the cut-short run left
+    cp "$CONTROLS" "$T/old-live"
+    run rb_backup
+    assert_success
+    assert_output --partial "older version"
+    assert_output --partial "WARNING"                       # not what the old run is known to have left: kept
+    run bash -c "cat '$CONTROLS'.replaced.*"
+    assert_output --partial "older version: bound"
+    assert_file_not_exist "$old/active"
+    [ -d "$(echo "$old".restored.*)" ]
+    # the new backup holds the ORIGINAL: restoring it gives that back
+    rb_restore >/dev/null
+    cmp "$CONTROLS" "$T/controls.orig"
+}
+
+@test "an older version's backup that cannot be restored stops the run and names the directory" {
+    unbound_controls
+    local old="$SHARED/.psp-reboot-backup"
+    mkdir -p "$old"
+    printf '%s\n' "$CONTROLS" >"$old/present"   # listed, but the copy is missing
+    : >"$old/active"
+    run rb_backup
+    assert_failure
+    assert_output --partial "$old"
+    assert_file_exist "$old/active"
+}
+
+@test "restores are atomic: a copy that fails leaves the live file untouched and the backup active" {
+    unbound_controls
+    rb_backup >/dev/null
+    printf 'user content' >"$RECENT"
+    cp "$RECENT" "$T/live"
+    cp() { return 1; }
+    PSP_RUN_ID="$(cat "$BAK/active")" run psp_finish
+    unset -f cp
+    assert_failure
+    assert_output --partial "backup stays"
+    cmp "$RECENT" "$T/live"
+    assert_file_exist "$BAK/active"
+    run bash -c "ls '$RECENT'.psp-restore.* 2>/dev/null"
+    assert_output ""
+}
+
+@test "unchecked writes are checked: active, present and states.before that cannot be written abort before anything is touched" {
+    unbound_controls
+    mkdir -p "$BAK/active"                    # writing the active flag must fail (a directory)
+    run psp_backup
+    assert_failure
+    assert_output --partial "could not write"
+    rmdir "$BAK/active"
+    mkdir -p "$BAK/present"
+    run psp_backup
+    assert_failure
+    assert_output --partial "could not back up"
+    cmp "$CONTROLS" "$T/controls.orig"
+    assert_file_not_exist "$BAK/active"
+    rm -rf "$BAK/present"
+    mkdir -p "$BAK/states.before"
+    run psp_backup
+    assert_failure
+    assert_output --partial "states.before"
+}
+
+@test "PPSSPP's own rewrite is tolerated once the game has been stopped (snapshot after the stop); a later edit is not" {
+    seed_files
+    fake_game_up
+    psp_backup >/dev/null
+    printf '%s\n' '[General]' 'x = rewritten by PPSSPP when it exited' >"$INI"
+    e2e_stop_game                                  # the harness stops/settles: the files are noted
+    # the run is cut short here. The next start:
+    unset PSP_RUN_ID
+    run psp_backup
+    refute_output --partial "WARNING"
+    assert_same "$INI" "$T/ini.copy"
+    psp_restore normal >/dev/null
+    # and the same cut-short run with a user edit AFTER the last stop is flagged
+    psp_backup >/dev/null
+    printf '%s\n' '[General]' 'x = rewritten' >"$INI"
+    e2e_stop_game
+    printf '%s\n' '[General]' 'x = the user edited it' >"$INI"
+    unset PSP_RUN_ID
+    run psp_backup
+    assert_output --partial "WARNING"
+    run bash -c "cat '$INI'.replaced.*"
+    assert_output --partial "the user edited it"
+}
+
+@test "rb_restore: a backup this run made is waited for; none known means a leftover is just restored strictly" {
+    unbound_controls
+    rb_backup >/dev/null
+    PSP_RUN_ID="$(cat "$BAK/active")" run rb_restore
+    assert_success
+    assert_output --partial "controls.ini restored"
+}
+
 @test "SET_HOTKEYS is forwarded to the device when set" {
     run rb_env_prelude
     refute_output --partial SET_HOTKEYS
@@ -518,7 +711,8 @@ unbound_controls() {
     run cat "$RECENT"
     assert_output "/Roms/other.iso"
     assert_file_not_exist "$AUTORESUME"
-    assert_file_not_exist "$STATE_DIR/NEW_1.00_2.ppst"
+    # (save states are never deleted when recovering a cut-short run: their origin is not known)
+    assert_file_exist "$STATE_DIR/NEW_1.00_2.ppst"
     # and the fresh backup holds the restored state, so a second restore changes nothing
     mess_up
     rb_restore

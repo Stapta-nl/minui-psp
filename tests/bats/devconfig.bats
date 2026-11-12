@@ -410,10 +410,10 @@ bind_run() { # bind_run [needs]
     cmp "$CTL" "$T/orig"
 }
 
-@test "e2e.bats uses the shared backup and restore (psp_backup, psp_restore), nothing of its own" {
+@test "e2e.bats uses the shared backup and the run-id aware end of run (psp_backup, psp_finish), nothing of its own" {
     local f="$TESTS_DIR/bats/e2e.bats"
     assert_grep "$f" 'psp_backup'
-    assert_grep "$f" 'psp_restore normal'
+    assert_grep "$f" 'psp_finish'
     refute_grep "$f" '^[^#]*\(cfg_backup_and_bind\|cfg_restore_foreign\|restore_files\)'
     refute_grep "$f" 'psp-e2e-backup'
 }
@@ -512,8 +512,7 @@ FAKE
     run stash "$CTL"
     assert_failure
     assert_output --partial "could not back up"
-    run grep -c . "$BAK/present"
-    refute_output "1"
+    [ ! -e "$BAK/present" ] || refute_grep "$BAK/present" "$CTL"
 }
 
 @test "guard: a settings file that is neither the backup nor what the tests left is kept under a unique name; the usual cases are silent" {

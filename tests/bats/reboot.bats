@@ -141,8 +141,16 @@ setup_file() {
     # restores it, or the next run does.
     RB_STARTED=1
     export RB_STARTED
-    dev_kit 300 rb_backup >"$OUT/hotkeys.txt" 2>&1 || fail "could not back up the device's files (and bind the hotkeys): $(cat "$OUT/hotkeys.txt")"
+    # The backup copies every save state (about 9 MB each): the time limit follows the size.
+    local kb
+    kb="$(dev_kit 60 rb_state_kb 2>/dev/null)"
+    case "$kb" in "" | *[!0-9]*) kb=0 ;; esac
+    dev_kit "${RB_BACKUP_TIMEOUT:-$((300 + kb / 1000))}" rb_backup >"$OUT/hotkeys.txt" 2>&1 || fail "could not back up the device's files (and bind the hotkeys): $(cat "$OUT/hotkeys.txt")"
     [ -s "$OUT/hotkeys.txt" ] && info "$(cat "$OUT/hotkeys.txt")"
+    # The id of the backup THIS run made: only that one is restored normally at the end.
+    PSP_RUN_ID="$(dev_kit 60 'cat "$BAK/active"' 2>/dev/null)"
+    [ -n "$PSP_RUN_ID" ] || fail "could not read the id of this run's backup"
+    export PSP_RUN_ID
     dev_kit 300 rb_settle || fail "could not bring the device to a clean start"
 }
 
@@ -155,7 +163,10 @@ teardown_file() {
         return 0
     }
     dev_install_kit
-    if restored="$(dev_kit 400 "RB_EXPECT_BACKUP=1; export RB_EXPECT_BACKUP; rb_restore")"; then
+    # A backup is expected (and waited for) only when this run made one.
+    local expect=""
+    [ -n "${PSP_RUN_ID:-}" ] && expect="RB_EXPECT_BACKUP=1; export RB_EXPECT_BACKUP;"
+    if restored="$(dev_kit 400 "$expect rb_restore")"; then
         [ -n "$restored" ] && echo "# $restored" >&3
         echo "# restored; results in $OUT" >&3
     else
