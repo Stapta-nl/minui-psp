@@ -331,38 +331,132 @@ shutdown_in_progress() {
     return 1
 }
 
-# minui-power-control's shutdown script draws "Powering off" (minui-presenter,
-# forever) before PPSSPP's save is known to be done. Like NextUI's minarch
-# cores, say "Quicksave created, powering off" instead, but only once a state
-# really was saved during this launch (newer than $STATE_MARKER). Best effort:
-# show_message runs in the background and is never waited for; it times out
-# by itself if the device does not power off. A state counts as saved if it is
-# newer than the launch, so a state the player saved by hand counts too when
-# save-on-exit is off (no cheap reliable way to tell the two apart here).
+# What NextUI's minarch does on a power-off (workspace/all/common/api.c,
+# PWR_powerOff): the emulator process itself draws "Quicksave created,
+# powering off" (GFX_blitMessage on its own screen) after Menu_beforeSleep()
+# wrote the quicksave and the auto-resume file. Here the screen belongs to
+# minui-power-control's shutdown script instead: it SIGTERMs PPSSPP, then runs
+# `minui-presenter --message "Powering off" --timeout -1 &` (its own function
+# called show_message; neither is a command on our PATH: the presenter binary
+# lives in the self-extracting archive's temp dir, which is deleted when the
+# emulator exits), then sync and poweroff. So, once the save is known to be
+# done, we stop that presenter and start the same binary again with our text.
+# The binary is copied from the running presenter's /proc/<pid>/exe.
+QS_MSG="Quicksave created, powering off"
+QS_DIR="/tmp/psp-quicksave"
+QS_PID=""
+PROC_DIR="${PSP_PROC_DIR:-/proc}"
+
+# True if process $1 exists and is not a zombie (a dead presenter that nobody has
+# reaped yet still shows up in pgrep and answers kill -0).
+process_alive() {
+    kill -0 "$1" 2>/dev/null || return 1
+    ! grep -q '^State:.*Z' "$PROC_DIR/$1/status" 2>/dev/null
+}
+
+# Stops our quicksave presenter (the device did not power off after all).
+stop_quicksave_message() {
+    [ -z "$QS_PID" ] || kill -KILL "$QS_PID" 2>/dev/null # (we run with TERM ignored: scripts cannot undo that)
+    QS_PID=""
+    rm -rf "$QS_DIR"
+}
+
+# Sets QS_BIN to a minui-presenter we can start (and says how in QS_HOW), or "".
+find_quicksave_presenter() {
+    QS_BIN=""
+    QS_HOW=""
+    for qs_pid in $QS_OLD_PIDS; do
+        [ -r "$PROC_DIR/$qs_pid/exe" ] || continue
+        mkdir -p "$QS_DIR" 2>/dev/null || break
+        if cp "$PROC_DIR/$qs_pid/exe" "$QS_DIR/minui-presenter" 2>/dev/null &&
+            [ -s "$QS_DIR/minui-presenter" ] && chmod +x "$QS_DIR/minui-presenter" 2>/dev/null; then
+            QS_BIN="$QS_DIR/minui-presenter"
+            QS_HOW="copy of the running presenter $qs_pid"
+            return 0
+        fi
+    done
+    if qs_cmd="$(command -v minui-presenter 2>/dev/null)" && [ -n "$qs_cmd" ]; then
+        QS_BIN="$qs_cmd"
+        QS_HOW="minui-presenter on PATH ($qs_cmd)"
+    fi
+}
+
+# Like NextUI's minarch, say "Quicksave created, powering off" instead of
+# "Powering off", but only once a state really was saved during this launch
+# (newer than $STATE_MARKER). Best effort and in the background; the log says
+# every step (what was found, what ran) so a device run shows what happened.
+# A state counts as saved if it is newer than the launch, so a state the
+# player saved by hand counts too when save-on-exit is off (no cheap reliable
+# way to tell the two apart here).
 show_quicksave_message() {
     saved=""
     for ppst in "$STATE_DIR"/*.ppst; do
         case "$ppst" in *.undo.ppst) continue ;; esac
         # shellcheck disable=SC3013 # -nt is supported by BusyBox ash and dash
         if [ -f "$ppst" ] && [ "$ppst" -nt "$STATE_MARKER" ]; then
-            saved=1
+            saved="$ppst"
             break
         fi
     done
-    [ -n "$saved" ] || return 0
-    command -v show_message >/dev/null 2>&1 || return 0
+    if [ -z "$saved" ]; then
+        echo "Quicksave message: no state newer than the launch in $STATE_DIR, not shown."
+        return 0
+    fi
+    echo "Quicksave message: state saved during this launch: $saved"
     # The shim creates the request file only after the shutdown script has
     # started its "Powering off" presenter: wait for it (at most 2 s, then go
-    # on anyway) so that our killall below cannot come too early.
+    # on anyway) so that we cannot come before that presenter.
     waited=0
     while [ ! -f "$POWEROFF_REQ" ] && [ "$waited" -lt 4 ]; do
         sleep 0.5 2>/dev/null || sleep 1
         waited=$((waited + 1))
     done
-    echo "Showing the quicksave message."
-    # Replace the "Powering off" screen instead of drawing over it.
-    killall minui-presenter >/dev/null 2>&1 || true
-    show_message "Quicksave created, powering off" 10 >/dev/null 2>&1 &
+    QS_OLD_PIDS=""
+    for qs_pid in $(pgrep minui-presenter 2>/dev/null); do
+        process_alive "$qs_pid" && QS_OLD_PIDS="${QS_OLD_PIDS:+$QS_OLD_PIDS }$qs_pid"
+    done
+    echo "Quicksave message: at $(now): request file $([ -f "$POWEROFF_REQ" ] && echo present || echo absent), minui-presenter pids: ${QS_OLD_PIDS:-none}, pgrep: $(command -v pgrep || echo missing), show_message: $(command -v show_message || echo missing)"
+    find_quicksave_presenter
+    if [ -n "$QS_BIN" ]; then
+        echo "Showing the quicksave message (using the $QS_HOW)."
+        if [ -n "$QS_OLD_PIDS" ]; then
+            # shellcheck disable=SC2086 # a list of pids
+            kill $QS_OLD_PIDS 2>/dev/null
+            # Wait (at most 1 s) until the old presenter is gone: its shutdown
+            # must not clear the screen after ours has drawn.
+            gone=0
+            while [ "$gone" -lt 10 ]; do
+                alive=""
+                for qs_pid in $QS_OLD_PIDS; do
+                    process_alive "$qs_pid" && alive=1
+                done
+                [ -n "$alive" ] || break
+                sleep 0.1 2>/dev/null || sleep 1
+                gone=$((gone + 1))
+            done
+            echo "Quicksave message: stopped the presenter(s) $QS_OLD_PIDS (${alive:+still running after 1 s, }checked ${gone}x)."
+        fi
+        "$QS_BIN" --message "$QS_MSG" --timeout -1 >/dev/null 2>&1 &
+        QS_PID=$!
+        sleep 0.3 2>/dev/null || sleep 1
+        if kill -0 "$QS_PID" 2>/dev/null; then
+            echo "Quicksave message: presenter $QS_PID is running (started at $(now))."
+        else
+            echo "Quicksave message: presenter $QS_PID exited at once; the screen shows whatever was there."
+            QS_PID=""
+        fi
+        return 0
+    fi
+    # No presenter binary to be found: use a platform show_message, if any.
+    if command -v show_message >/dev/null 2>&1; then
+        echo "Showing the quicksave message (show_message, no minui-presenter found)."
+        killall minui-presenter >/dev/null 2>&1
+        echo "Quicksave message: killall exit status $?"
+        show_message "$QS_MSG" 10 >/dev/null 2>&1 &
+    else
+        echo "Quicksave message: no minui-presenter to copy or run and no show_message: not shown."
+    fi
+    return 0
 }
 
 # Arm auto-resume, tell the poweroff shim it may go ahead, then wait for the
@@ -391,12 +485,14 @@ arm_auto_resume_and_wait() {
     case "$budget" in "" | *[!0-9]*) budget=3 ;; esac
     used=$(($(now) - ${PPSSPP_EXIT_TS:-0}))
     if [ -n "$PPSSPP_EXIT_TS" ] && [ "$used" -gt "$budget" ]; then
-        echo "Skipping the Game Switcher preview and the quicksave message: ${used}s since PPSSPP exited."
+        echo "Skipping the Game Switcher preview: ${used}s since PPSSPP exited."
         PREVIEW_ROM=""
-    else
-        [ "$armed" = 1 ] && show_quicksave_message
-        write_game_switcher_preview
     fi
+    # The message is cheap (a background process), so it does not depend on the budget.
+    [ "$armed" = 1 ] && show_quicksave_message
+    write_game_switcher_preview
+    # Let the message be seen: poweroff kills everything as soon as it runs.
+    [ -z "$QS_PID" ] || sleep 1
     : >"$POWEROFF_OK"
     echo "Told the poweroff shim to go ahead."
     # Marker, states and preview are synced and PPSSPP is gone: release the
@@ -413,6 +509,7 @@ arm_auto_resume_and_wait() {
     case "$wait_secs" in "" | *[!0-9]*) wait_secs=60 ;; esac
     sleep "$wait_secs"
     echo "Device did not power off, removing auto-resume marker."
+    stop_quicksave_message
     rm -f "$AUTO_RESUME_PATH" "$POWEROFF_REQ" "$POWEROFF_OK"
     sync
 }
