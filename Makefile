@@ -40,6 +40,8 @@ SHELL_FILES := $(SH_FILES) $(filter-out $(SH_FILES),$(wildcard tests/*.sh))
 lint:
 	for f in $(SH_FILES); do sh -n "$$f" || exit 1; done
 	shellcheck -x $(SHELL_FILES)
+	# exactly what tests/bats/repo.bats runs (keep the two in step): also the bash helpers and the bats files
+	shellcheck -x launch.sh scripts/*.sh tests/*.sh tests/helpers/*.bash tests/bats/*.bats
 
 # The auto-resume logic (real launch.sh, stub PPSSPP, real bind mounts; needs root or sudo).
 # Plain sh on purpose: CI also runs it under BusyBox in docker (see ci.yaml). The poweroff shim
