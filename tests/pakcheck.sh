@@ -4,7 +4,12 @@
 #
 # Usage: pakcheck.sh <device list> [<reference dir>]      (reference: $SRC_PAK, else this checkout)
 # Prints the report: a first line "Pak under test: matches ..." (status 0), or "WARNING: ..." with
-# one line per differing, missing or extra file (status 1). Status 2: the list is unusable.
+# one line per differing or missing file (status 1). Status 2: the list is unusable.
+# Files on the device that the release does not have (leftovers of older installs) are only a
+# note ("leftover files ... harmless unless the pak loads them") and never make the verdict a
+# warning; a file that shadows something the pak loads cannot be found generically, so that is not tried.
+# For the PPSSPP binaries the build text (git describe) found in the device's file and in the reference
+# file is printed next to the checksum verdict, so the installed build is visible.
 # A mismatch is only a warning for the caller (PAK_MISMATCH=fail makes it fatal in run-device.sh).
 #
 # What counts: every file the release ships, except the user's settings (pak.json "update_ignore",
@@ -24,6 +29,16 @@ algo="$(sed -n 's/^# algo: //p' "$list" | head -n 1)"
 case "$algo" in md5sum | sha1sum | cksum | size) ;; *) echo "pakcheck.sh: unknown checksum algorithm in $list" >&2; exit 2 ;; esac
 dev_version="$(sed -n 's/^# pak.json version: //p' "$list" | head -n 1)"
 dev_build="$(sed -n 's/^# ppsspp build: //p' "$list" | head -n 1)"
+# build_of_dev <path>: the build text the collector found in that binary on the device ("" if none)
+build_of_dev() { sed -n "s|^# ppsspp build of $1: ||p" "$list" | head -n 1; }
+# build_note <path>: " (device build: X; <label> build: Y)" for the PPSSPP binaries, else nothing
+build_note() {
+    local d r=""
+    case "$1" in PPSSPP/PPSSPPSDL_*) ;; *) return 0 ;; esac
+    d="$(build_of_dev "$1")"
+    [ -f "$ref/$1" ] && r="$(sh "$ROOT/tests/collectors/pak-files.sh" --build "$ref/$1" 2>/dev/null)"
+    printf ' (build text on the device: %s; in %s: %s)' "${d:-unknown}" "$label" "${r:-not available}"
+}
 
 sum_of() {
     case "$algo" in
@@ -91,25 +106,27 @@ while IFS= read -r f; do
         extra+=("$f")
     fi
 done <"$tmp/devfiles"
-# a download-only file that the device lacks is missing too, but only worth a note
+# a download-only file that the device lacks is missing too: the release ships it
 while IFS= read -r f; do
-    grep -qxF -- "$f" "$tmp/devfiles" || missing+=("$f (not compared: comes from a release download)")
+    grep -qxF -- "$f" "$tmp/devfiles" || missing+=("$f (the release ships it; it is not in this reference to compare)")
 done <"$tmp/downloaded"
 
 ref_version="$(jq -r '.version // empty' "$ref/pak.json" 2>/dev/null)"
-if [ "${#differs[@]}" = 0 ] && [ "${#missing[@]}" = 0 ] && [ "${#extra[@]}" = 0 ]; then
-    echo "Pak under test: matches $label (all $((compared - ${#builtdiff[@]})) shipped files compared are identical${builtdiff[0]:+; ${#builtdiff[@]} build outputs differ, see below}${notcmp[0]:+; ${#notcmp[@]} not compared: they come from a release download}; user settings ignored)"
+print_notes() {
+    for f in ${extra[@]+"${extra[@]}"}; do echo "  note: leftover file on the device, not part of this release (harmless unless the pak loads it): $f"; done
+    for f in ${builtdiff[@]+"${builtdiff[@]}"}; do echo "  note: differs from $label; build output, may be a different build: $f$(build_note "$f")"; done
+    for f in ${notcmp[@]+"${notcmp[@]}"}; do echo "  not compared (binary comes from a release download, none in $label): $f$(build_note "$f")"; done
+}
+if [ "${#differs[@]}" = 0 ] && [ "${#missing[@]}" = 0 ]; then
+    echo "Pak under test: matches $label (all $((compared - ${#builtdiff[@]})) shipped files compared are identical${builtdiff[0]:+; ${#builtdiff[@]} build outputs differ, see below}${notcmp[0]:+; ${#notcmp[@]} not compared: they come from a release download}; user settings ignored${extra[0]:+; ${#extra[@]} leftover files, see pak/check.txt})"
     echo "  pak.json version: $dev_version; PPSSPP build text in the binary: ${dev_build:-unknown}"
-    for f in ${builtdiff[@]+"${builtdiff[@]}"}; do echo "  note: differs from $label; build output, may be a different build: $f"; done
-    for f in ${notcmp[@]+"${notcmp[@]}"}; do echo "  not compared (binary comes from a release download): $f"; done
+    print_notes
     exit 0
 fi
 echo "WARNING: the pak installed on the device is NOT the one under test ($label). The results may be about an older pak."
-for f in ${differs[@]+"${differs[@]}"}; do echo "  differs from $label: $f"; done
+for f in ${differs[@]+"${differs[@]}"}; do echo "  differs from $label: $f$(build_note "$f")"; done
 for f in ${missing[@]+"${missing[@]}"}; do echo "  missing on the device: $f"; done
-for f in ${extra[@]+"${extra[@]}"}; do echo "  extra on the device (not in the release): $f"; done
-for f in ${builtdiff[@]+"${builtdiff[@]}"}; do echo "  note: differs from $label; build output, may be a different build: $f"; done
-for f in ${notcmp[@]+"${notcmp[@]}"}; do echo "  not compared (binary comes from a release download): $f"; done
+print_notes
 echo "  pak.json version on the device: ${dev_version:-unknown} (under test: ${ref_version:-unknown}); PPSSPP build text on the device: ${dev_build:-unknown}"
 echo "  Update the pak on the device (README, Updating: keep your ppsspp.ini and controls.ini) and run again."
 exit 1

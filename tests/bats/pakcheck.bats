@@ -17,7 +17,7 @@ setup() {
     printf '#!/bin/sh\necho poweroff\n' >"$REL/bin/poweroff"
     printf 'ini\n' >"$REL/scripts/ini.sh"
     printf 'font' >"$REL/PPSSPP/assets/font.ttf"
-    printf 'ELF v1.20.3-5-gabcdef0 rest' >"$REL/PPSSPP/PPSSPPSDL_tg5040"
+    printf 'ELF\0v1.20.3-5-gabcdef0\0rest' >"$REL/PPSSPP/PPSSPPSDL_tg5040"
     printf 'default ini' >"$REL/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
     printf 'default controls' >"$REL/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini"
     jq -n '{name:"PSP", version:"6.2.0", update_ignore:["PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini","PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"]}' >"$REL/pak.json"
@@ -77,17 +77,18 @@ check() { bash "$TESTS_DIR/pakcheck.sh" "$T/files.txt" "${1:-$REL}"; }
     assert_output --partial "WARNING: the pak installed on the device is NOT the one under test"
     assert_output --partial "differs from the release in $REL: launch.sh"
     assert_output --partial "missing on the device: scripts/ini.sh"
-    assert_output --partial "extra on the device (not in the release): bin/leftover"
+    assert_output --partial "leftover file on the device, not part of this release (harmless unless the pak loads it): bin/leftover"
+    refute_output --partial "extra on the device"
     refute_output --partial "bin/poweroff"
     assert_output --partial "pak.json version on the device: 6.2.0"
 }
 
 @test "mismatch: a different PPSSPP binary is found by its checksum" {
-    printf 'ELF v1.19.0 old' >"$DEV/PPSSPP/PPSSPPSDL_tg5040"
+    printf 'ELF\0v1.19.0\0old' >"$DEV/PPSSPP/PPSSPPSDL_tg5040"
     list_device
     run check
     assert_failure 1
-    assert_output --partial "differs from the release in $REL: PPSSPP/PPSSPPSDL_tg5040"
+    assert_output --partial "differs from the release in $REL: PPSSPP/PPSSPPSDL_tg5040 (build text on the device: v1.19.0; in the release in $REL: v1.20.3-5-gabcdef0)"
     assert_output --partial "PPSSPP build text on the device: v1.19.0"
 }
 
@@ -100,7 +101,7 @@ check() { bash "$TESTS_DIR/pakcheck.sh" "$T/files.txt" "${1:-$REL}"; }
     git -C "$co" init -q
     git -C "$co" add -A
     printf 'built elsewhere' >"$DEV/bin/jpg2bmp"
-    printf 'ELF v1.19.0 old' >"$DEV/PPSSPP/PPSSPPSDL_tg5040"
+    printf 'ELF\0v1.19.0\0old' >"$DEV/PPSSPP/PPSSPPSDL_tg5040"
     list_device
     run check "$co"
     assert_success
@@ -131,7 +132,7 @@ check() { bash "$TESTS_DIR/pakcheck.sh" "$T/files.txt" "${1:-$REL}"; }
     run check "$co"
     assert_success
     assert_output --partial "1 not compared"
-    assert_output --partial "not compared (binary comes from a release download): PPSSPP/PPSSPPSDL_tg5040"
+    assert_output --partial "not compared (binary comes from a release download, none in the release in $co): PPSSPP/PPSSPPSDL_tg5040 (build text on the device: v1.20.3-5-gabcdef0; in the release in $co: not available)"
     # ... and a file that only the checkout's tests/ or Makefile has is not "missing on the device"
     refute_output --partial "Makefile"
     refute_output --partial "tests/foo"
@@ -144,16 +145,63 @@ check() { bash "$TESTS_DIR/pakcheck.sh" "$T/files.txt" "${1:-$REL}"; }
     printf 'PPSSPP/PPSSPPSDL_tg5040\n' >"$co/.gitarchiveinclude"
     git -C "$co" init -q
     git -C "$co" add -A
-    printf 'ELF v1.19.0 old' >"$DEV/PPSSPP/PPSSPPSDL_tg5040"
+    printf 'ELF\0v1.19.0\0old' >"$DEV/PPSSPP/PPSSPPSDL_tg5040"
     list_device
     run check "$co"
     assert_success # a build output: only a note
-    assert_output --partial "build output, may be a different build: PPSSPP/PPSSPPSDL_tg5040"
+    assert_output --partial "build output, may be a different build: PPSSPP/PPSSPPSDL_tg5040 (build text on the device: v1.19.0; in the release in $co: v1.20.3-5-gabcdef0)"
     rm "$DEV/PPSSPP/PPSSPPSDL_tg5040" # a MISSING build output is still a warning
     list_device
     run check "$co"
     assert_failure 1
     assert_output --partial "missing on the device: PPSSPP/PPSSPPSDL_tg5040"
+}
+
+@test "extra files alone are a note, not a warning: the verdict is a match with a leftover count, status 0" {
+    mkdir -p "$DEV/tests/device/fixtures"
+    printf 'x' >"$DEV/tests/device/e2e.sh"
+    printf 'x' >"$DEV/tests/device/fixtures/thumb1.jpg"
+    printf 'old binary' >"$DEV/PPSSPP/PPSSPPSDL_tg5040.orig"
+    list_device
+    run check
+    assert_success
+    assert_output --partial "Pak under test: matches the release in $REL"
+    assert_output --partial "3 leftover files, see pak/check.txt"
+    assert_output --partial "leftover file on the device, not part of this release (harmless unless the pak loads it): tests/device/e2e.sh"
+    refute_output --partial WARNING
+    refute_output --partial "NOT the one"
+    # with a real difference, the extras are still only notes
+    printf 'old' >"$DEV/launch.sh"
+    list_device
+    run check
+    assert_failure 1
+    assert_output --partial "differs from the release in $REL: launch.sh"
+    assert_output --partial "leftover file on the device"
+}
+
+@test "collector: PPSSPP's own version string is found among decoys (v1.1, zlib's v1.2.11) and an unreliable find is 'unknown'" {
+    local b="$DEV/PPSSPP/PPSSPPSDL_tg5040"
+    printf 'ELF\0libfoo v1.1\0v1.1\0libz v1.2.11 text\0v1.2.11\0\0v1.20.3\0PPSSPP %%s\0' >"$b"
+    run sh "$TESTS_DIR/collectors/pak-files.sh" --build "$b"
+    assert_output "v1.20.3 (also found: v1.2.11)"
+    # a describe string with commits since the tag wins over any plain tag-like text
+    printf 'ELF\0v1.2.11\0v1.20.3-14-g0123abc\0v1.19.0\0' >"$b"
+    run sh "$TESTS_DIR/collectors/pak-files.sh" --build "$b"
+    assert_output "v1.20.3-14-g0123abc (also found: v1.2.11 v1.19.0)"
+    # only decoys of the wrong shape: unknown, never the first v1.x text
+    printf 'ELF\0v1.1\0see v1.2.11 here\0v1.2\0' >"$b"
+    run sh "$TESTS_DIR/collectors/pak-files.sh" --build "$b"
+    assert_output "unknown"
+    list_device
+    assert_grep "$T/files.txt" '^# ppsspp build: unknown$'
+    assert_grep "$T/files.txt" '^# ppsspp build of PPSSPP/PPSSPPSDL_tg5040: unknown$'
+}
+
+@test "collector: the build text of every PPSSPP binary in the pak is listed" {
+    printf 'ELF\0v1.20.3\0' >"$DEV/PPSSPP/PPSSPPSDL_tg5050"
+    list_device
+    assert_grep "$T/files.txt" '^# ppsspp build of PPSSPP/PPSSPPSDL_tg5050: v1.20.3$'
+    assert_grep "$T/files.txt" '^# ppsspp build of PPSSPP/PPSSPPSDL_tg5040: v1.20.3-5-gabcdef0$'
 }
 
 @test "an unusable list is status 2, not a verdict" {
