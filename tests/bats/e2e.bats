@@ -30,7 +30,12 @@
 #              tests/helpers/devconfig.bash). PPSSPP has no default for them: a hotkey that is
 #              not bound there is reported by the preflight (bind it, or set the variables).
 #              PSP_KEYS="" skips saving: then there must be no preview (NextUI shows No Preview).
-#   SAVE_KEYS, NEXT_SLOT_KEYS  override the two hotkeys above (same step syntax, one chord).
+#   SAVE_KEYS, NEXT_SLOT_KEYS  override the two hotkeys above (same step syntax, one chord);
+#              a hotkey given this way is not touched in controls.ini.
+#   SET_HOTKEYS  (1) a needed hotkey that is not bound in controls.ini is bound by the test
+#              (Save State select+r1, Next Slot select+right, Exit App select+start, or a free
+#              fallback) and the original controls.ini is put back at the end; 0 = do not,
+#              an unbound hotkey is then a preflight failure.
 #   EXIT_KEYS  how the emulator is quit (default: the Exit App hotkey; "" kills PPSSPP instead).
 #   BOOT_WAIT (20)  UI_WAIT (6)  KEY_GAP (0.5)  CHORD_HOLD (0.3)
 #
@@ -65,8 +70,10 @@ setup_file() {
     CONTROLS="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini"
     # The Exit hotkey is always needed (EXIT_KEYS="" kills PPSSPP instead); Save State and
     # Next Slot only when PSP_KEYS is not given.
-    cfg_init_hotkeys "$CONTROLS" "exit$([ -z "${PSP_KEYS+x}" ] && echo ' save next')"
-    if [ -z "${PSP_KEYS+x}" ]; then
+    PSP_DEFAULT=0
+    [ -z "${PSP_KEYS+x}" ] && PSP_DEFAULT=1
+    cfg_init_hotkeys "$CONTROLS" "exit$([ "$PSP_DEFAULT" = 1 ] && echo ' save next')"
+    if [ "$PSP_DEFAULT" = 1 ]; then
         PSP_KEYS="$SAVE_KEYS sleep3 shot $NEXT_SLOT_KEYS sleep1 shot $SAVE_KEYS sleep3 shot"
     elif [ -n "$PSP_KEYS" ] && ! bad="$(cfg_keys_valid "$PSP_KEYS")"; then
         HOTKEY_PROBLEMS="$HOTKEY_PROBLEMS${HOTKEY_PROBLEMS:+
@@ -123,6 +130,13 @@ $problems"
         info "found the backup of an aborted run: restoring those files first"
         restore_files
         rm -f "$BAK/active"
+        # the hotkeys the aborted run had bound are gone again: resolve from the restored file
+        cfg_reinit_hotkeys
+        if [ "$PSP_DEFAULT" = 1 ]; then
+            PSP_KEYS="$SAVE_KEYS sleep3 shot $NEXT_SLOT_KEYS sleep1 shot $SAVE_KEYS sleep3 shot"
+        fi
+        [ -z "$HOTKEY_PROBLEMS" ] || fail "the device is not set up for this test, change this and run again:
+$HOTKEY_PROBLEMS"
     fi
     rm -f "${OUT:?}"/*.png "${OUT:?}"/*.log "${OUT:?}"/*.shotname \
         "${BAK:?}/present" "${BAK:?}/absent" "${BAK:?}/states.before" "${BAK:?}/marker"
@@ -137,6 +151,10 @@ $problems"
     for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW"; do stash "$f"; done
     for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && stash "$f"; done # previews of other slots
     sync
+    # Bind the missing hotkeys (after the backup above; PPSSPP reads controls.ini when it
+    # starts, so this is in place before any game is launched).
+    cfg_apply_hotkeys >"$OUT/hotkeys.txt" || fail "could not set the hotkeys in $CONTROLS (see $OUT/hotkeys.txt)"
+    [ -s "$OUT/hotkeys.txt" ] && info "$(cat "$OUT/hotkeys.txt")"
 
     # E1 starts from: the game in recents, slot 0 chosen.
     mkdir -p "$MINUI"
@@ -159,9 +177,12 @@ teardown_file() {
     # Only when the backup was made (setup_file may have failed in the preflight).
     [ -n "${BAK:-}" ] && [ -f "$BAK/active" ] || return 0
     killall PPSSPPSDL_"$PLATFORM" 2>/dev/null
+    local had_hotkeys=0
+    [ -f "$BAK/controls.bound" ] && had_hotkeys=1
     restore_files
     rm -f "$BAK/active"
     kill_ui # relaunches NextUI with the restored files
+    [ "$had_hotkeys" = 1 ] && echo "# controls.ini restored: the hotkeys the tests had bound are removed again" >&3
     echo "# restored; results in $OUT" >&3
 }
 

@@ -50,8 +50,12 @@
 # the end; a run that is cut short is restored at the start of the next one. New save states
 # are deleted.
 #
+# Hotkeys: read from the device's controls.ini (Save State, Exit App). A hotkey that is not bound there
+# is bound by the tests (SET_HOTKEYS=0 turns that off: a preflight failure instead) and controls.ini is
+# put back at the end like the other files; SAVE_KEYS/EXIT_KEYS override and are never written.
+#
 # Env: DEVICE_HOST, DEVICE_SSH_OPTS (set by run-reboot.sh), SDCARD_PATH, PLATFORM, ROM_DIR, ROM,
-# EXIT_KEYS, BOOT_WAIT (20), UI_WAIT (6), NOGAME_WAIT (25: how long "no auto-launch" is watched),
+# SET_HOTKEYS, SAVE_KEYS, EXIT_KEYS, BOOT_WAIT (20), UI_WAIT (6), NOGAME_WAIT (25: how long "no auto-launch" is watched),
 # and the timeouts and intervals listed in tests/helpers/reboot.bash.
 
 load '../helpers/common'
@@ -137,7 +141,8 @@ setup_file() {
     # restores it, or the next run does.
     RB_STARTED=1
     export RB_STARTED
-    dev_kit 300 rb_backup || fail "could not back up the device's files"
+    dev_kit 300 rb_backup >"$OUT/hotkeys.txt" 2>&1 || fail "could not back up the device's files (and bind the hotkeys): $(cat "$OUT/hotkeys.txt")"
+    [ -s "$OUT/hotkeys.txt" ] && info "$(cat "$OUT/hotkeys.txt")"
     dev_kit 300 rb_settle || fail "could not bring the device to a clean start"
 }
 
@@ -150,7 +155,8 @@ teardown_file() {
         return 0
     }
     dev_install_kit
-    if dev_kit 400 rb_restore; then
+    if restored="$(dev_kit 400 rb_restore)"; then
+        [ -n "$restored" ] && echo "# $restored" >&3
         echo "# restored; results in $OUT" >&3
     else
         echo "# the restore failed: run again, the next run restores from the backup on the SD card" >&3

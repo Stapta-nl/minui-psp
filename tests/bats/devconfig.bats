@@ -16,7 +16,7 @@ setup() {
     # shellcheck disable=SC1091
     . "$TESTS_DIR/helpers/devconfig.bash"
     CTL="$T/controls.ini"
-    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS CFG_CTL
     # The shipped layout (with the BOM and CRLF the real file may have)
     SHIPPED='[ControlMapping]
 Up = 10-19
@@ -36,22 +36,25 @@ Pause = 10-109'
 
 ctl() { printf '%s\n' "$SHIPPED" >"$CTL"; printf '%s\n' "$@" >>"$CTL"; }
 
-@test "the shipped controls.ini has no hotkeys: each needed one is a problem, no default is assumed" {
+@test "SET_HOTKEYS=0: the shipped controls.ini has no hotkeys, each needed one is a problem, nothing is assumed" {
     cp "$REPO_DIR/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini" "$CTL"
-    cfg_init_hotkeys "$CTL"
+    SET_HOTKEYS=0 cfg_init_hotkeys "$CTL"
+    [ -z "$HOTKEY_TO_BIND" ]
     [ -z "$SAVE_KEYS" ] && [ -z "$NEXT_SLOT_KEYS" ] && [ -z "$EXIT_KEYS" ]
-    [[ "$HOTKEY_PROBLEMS" == *"Save State hotkey (Save State) is not bound in controls.ini; PPSSPP has no default - bind it in PPSSPP's Controls > Hotkeys or set SAVE_KEYS"* ]]
+    [[ "$HOTKEY_PROBLEMS" == *"Save State hotkey (Save State) is not bound in controls.ini; PPSSPP has no default - bind it in PPSSPP's Controls > Hotkeys, set SAVE_KEYS"* ]]
     [[ "$HOTKEY_PROBLEMS" == *"set NEXT_SLOT_KEYS"* ]] && [[ "$HOTKEY_PROBLEMS" == *"set EXIT_KEYS"* ]]
 }
 
 @test "a missing controls.ini, or one without [ControlMapping], is reported once per needed hotkey" {
     cfg_init_hotkeys "$T/nope.ini" save
     [[ "$HOTKEY_PROBLEMS" == *"nope.ini not found"*"set SAVE_KEYS"* ]]
+    [ -z "$HOTKEY_TO_BIND" ]
+    [ ! -e "$T/nope.ini" ]
     [ "$(printf '%s\n' "$HOTKEY_PROBLEMS" | wc -l)" = 1 ]
     printf '[Other]\nx = 1\n' >"$CTL"
     unset SAVE_KEYS
-    cfg_init_hotkeys "$CTL" save
-    [[ "$HOTKEY_PROBLEMS" == *"no [ControlMapping] section"* ]]
+    SET_HOTKEYS=0 cfg_init_hotkeys "$CTL" save
+    [[ "$HOTKEY_PROBLEMS" == *"Save State"*"not bound"* ]]
 }
 
 @test "an empty value is unbound" {
@@ -122,12 +125,14 @@ ctl() { printf '%s\n' "$SHIPPED" >"$CTL"; printf '%s\n' "$@" >>"$CTL"; }
 
 @test "environment overrides win and are validated; empty SAVE_KEYS is rejected, EXIT_KEYS=\"\" is kill mode" {
     cp "$REPO_DIR/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini" "$CTL"
+    cp "$CTL" "$T/orig"
     SAVE_KEYS="l1+r1" EXIT_KEYS="" NEXT_SLOT_KEYS="select+bogus"
     cfg_init_hotkeys "$CTL"
     [ "$SAVE_KEYS" = l1+r1 ] && [ -z "$EXIT_KEYS" ]
     [[ "$HOTKEY_PROBLEMS" == *"NEXT_SLOT_KEYS='select+bogus' has a step the test cannot press: 'select+bogus'"* ]]
     [[ "$HOTKEY_PROBLEMS" != *"EXIT_KEYS"* ]]
-    [[ "$HOTKEY_INFO" == *"Save State hotkey: l1+r1 (set by the environment)"* ]]
+    [[ "$HOTKEY_INFO" == *"Save State hotkey: l1+r1 (set by the environment"* ]]
+    [[ "$HOTKEY_TO_BIND" != *"Save State"* ]] # an override means: do not touch controls.ini for it
     SAVE_KEYS="" NEXT_SLOT_KEYS="select+right"
     cfg_init_hotkeys "$CTL"
     [[ "$HOTKEY_PROBLEMS" == *"SAVE_KEYS is empty"* ]]
@@ -195,4 +200,186 @@ ctl() { printf '%s\n' "$SHIPPED" >"$CTL"; printf '%s\n' "$@" >>"$CTL"; }
     HOTKEY_PROBLEMS=""
     run e2e_preflight_problems
     assert_success
+}
+
+# --- binding missing hotkeys temporarily ---------------------------------------------------------
+# The backup/restore is the e2e one (restore_files); BAK is a throw-away dir.
+bind_setup() {
+    BAK="$T/bak"
+    export CONTROLS="$CTL"
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+}
+# What e2e.bats / rb_backup do: stash, then bind.
+# shellcheck disable=SC2119,SC2120
+bind_run() { # bind_run [needs]
+    stash "$CTL"
+    cfg_init_hotkeys "$CTL" "$@"
+    cfg_apply_hotkeys
+}
+
+@test "unbound hotkeys are bound with PPSSPP's names and codes, and the original comes back byte for byte" {
+    bind_setup
+    cp "$REPO_DIR/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini" "$CTL"
+    cp "$CTL" "$T/orig"
+    cfg_init_hotkeys "$CTL"
+    [ -z "$HOTKEY_PROBLEMS" ]
+    [ "$SAVE_KEYS" = select+r1 ] && [ "$NEXT_SLOT_KEYS" = select+right ] && [ "$EXIT_KEYS" = select+start ]
+    [[ "$HOTKEY_INFO" == *"NOT BOUND"*"restore the file"* ]]
+    [ ! -f "$BAK/controls.bound" ]  # nothing is written by the preflight
+    cmp "$CTL" "$T/orig"
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    run bind_run
+    assert_success
+    assert_output --partial "Save State = 10-196:10-192"
+    assert_grep "$CTL" '^Save State = 10-196:10-192'
+    assert_grep "$CTL" '^Next Slot = 10-196:10-22'
+    assert_grep "$CTL" '^Exit App = 10-196:10-197'
+    # every other line is untouched, and the BOM is still the first thing in the file
+    run grep -c -v -E '^(Save State|Next Slot|Exit App) = ' "$CTL"
+    [ "$output" = "$(wc -l <"$T/orig")" ]
+    [ "$(head -c 3 "$CTL" | od -An -tx1 | tr -d ' ')" = efbbbf ]
+    run cfg_hotkey_lookup "$CTL" "Exit App"
+    assert_output "OK select+start"
+    restore_files
+    cmp "$CTL" "$T/orig"
+    assert_file_not_exist "$BAK/controls.written"
+}
+
+@test "a partly bound file keeps the user's bindings; only the missing ones are added" {
+    bind_setup
+    ctl 'Save State = 10-193:10-197'
+    cp "$CTL" "$T/orig"
+    run bind_run
+    assert_success
+    refute_output --partial "Save State"
+    assert_grep "$CTL" '^Save State = 10-193:10-197$'
+    assert_grep "$CTL" '^Exit App = 10-196:10-197'
+    run grep -c '^Save State' "$CTL"
+    [ "$output" = 1 ]
+    restore_files
+    cmp "$CTL" "$T/orig"
+}
+
+@test "an empty value is filled in place, CRLF line endings and the BOM are kept" {
+    bind_setup
+    { printf '\357\273\277'; printf '%s\r\n' '[ControlMapping]' 'Select = 10-196' 'Save State = ' 'R = 10-192' '[Other]' 'x = 1'; } >"$CTL"
+    cp "$CTL" "$T/orig"
+    run bind_run save
+    assert_success
+    run cat -A "$CTL"
+    assert_output --partial 'Save State = 10-196:10-192^M$'
+    assert_output --partial 'Select = 10-196^M$'
+    [ "$(grep -c 'Save State' "$CTL")" = 1 ]
+    # added keys stay inside [ControlMapping], before the next section
+    run awk '/^\[Other\]/{o=1} o && /Exit App/{bad=1} END{print bad+0}' "$CTL"
+    assert_output "0"
+    restore_files
+    cmp "$CTL" "$T/orig"
+}
+
+@test "a file with no [ControlMapping] section gets the section appended; a missing file is not created" {
+    bind_setup
+    printf '[Other]\nx = 1\n' >"$CTL"
+    cp "$CTL" "$T/orig"
+    run bind_run save
+    assert_success
+    run cat "$CTL"
+    assert_output "[Other]
+x = 1
+[ControlMapping]
+Save State = 10-196:10-192"
+    restore_files
+    cmp "$CTL" "$T/orig"
+    rm -f "$CTL"
+    cfg_init_hotkeys "$CTL" save
+    [[ "$HOTKEY_PROBLEMS" == *"not found (the tests do not create it)"* ]]
+    [ ! -e "$CTL" ]
+}
+
+@test "a chord that another action already uses is not taken: a free one is chosen and said so" {
+    bind_setup
+    ctl 'Pause = 10-196:10-192'
+    cfg_init_hotkeys "$CTL" save
+    [ "$SAVE_KEYS" = start+r1 ]
+    [[ "$HOTKEY_INFO" == *"the usual select+r1 is taken by 'Pause'"* ]]
+    # the chord is compared as a set: R+select in the other order collides too
+    ctl 'Pause = 10-192:10-196' 'Next Slot = 10-197:10-22'
+    unset SAVE_KEYS
+    cfg_init_hotkeys "$CTL" "save next"
+    [ "$SAVE_KEYS" = start+r1 ]
+}
+
+@test "no free chord at all is one clear problem naming the hotkey, nothing is bound" {
+    ctl 'A1 = 10-196:10-192' 'A2 = 10-197:10-192' 'A3 = 10-196:10-193'
+    cfg_init_hotkeys "$CTL" save
+    [[ "$HOTKEY_PROBLEMS" == *"Save State hotkey (Save State) is not bound"*"already used by another action"*"set SAVE_KEYS"* ]]
+    [ -z "$HOTKEY_TO_BIND" ]
+}
+
+@test "the hotkeys chosen for one run never share a chord with each other" {
+    ctl 'Pause = 10-196:10-197'
+    cfg_init_hotkeys "$CTL"
+    [ "$EXIT_KEYS" != select+start ]
+    [ "$SAVE_KEYS" != "$EXIT_KEYS" ] && [ "$SAVE_KEYS" != "$NEXT_SLOT_KEYS" ]
+}
+
+@test "SET_HOTKEYS=0 keeps the old behaviour: a clear failure and the file is left alone" {
+    bind_setup
+    ctl 'Exit App = 10-196:10-197'
+    cp "$CTL" "$T/orig"
+    SET_HOTKEYS=0 run bash -c ". '$TESTS_DIR/helpers/e2e.bash'; . '$TESTS_DIR/helpers/devconfig.bash'; cfg_init_hotkeys '$CTL'; printf '%s' \"\$HOTKEY_PROBLEMS\""
+    assert_output --partial "Save State hotkey (Save State) is not bound in controls.ini; PPSSPP has no default"
+    assert_output --partial "SET_HOTKEYS=0"
+    cmp "$CTL" "$T/orig"
+}
+
+@test "environment overrides leave controls.ini alone" {
+    bind_setup
+    ctl 'Pause = 10-109'
+    cp "$CTL" "$T/orig"
+    SAVE_KEYS=l1+r1 NEXT_SLOT_KEYS=select+left EXIT_KEYS=start+l1 run bind_run
+    assert_success
+    assert_output ""
+    cmp "$CTL" "$T/orig"
+    assert_file_not_exist "$BAK/controls.bound"
+}
+
+@test "a hotkey the user bound to something unpressable is never overwritten" {
+    bind_setup
+    ctl 'Save State = 1-133'
+    cp "$CTL" "$T/orig"
+    cfg_init_hotkeys "$CTL" save
+    [[ "$HOTKEY_PROBLEMS" == *"is bound to '1-133'"*"never changed"* ]]
+    [ -z "$HOTKEY_TO_BIND" ]
+}
+
+@test "an aborted run: the next start puts the original back first and binds again" {
+    bind_setup
+    ctl 'Select = 10-196'
+    cp "$CTL" "$T/orig"
+    bind_run >/dev/null
+    assert_differ "$CTL" "$T/orig"
+    # next run: the file still has the old run's bindings, so nothing looks unbound ...
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    cfg_init_hotkeys "$CTL"
+    [ -z "$HOTKEY_TO_BIND" ]
+    # ... until the restore of the aborted run, then the hotkeys are resolved again
+    restore_files
+    cmp "$CTL" "$T/orig"
+    cfg_reinit_hotkeys
+    [[ "$HOTKEY_TO_BIND" == *"Save State|10-196:10-192|SAVE_KEYS|select+r1"* ]]
+    [ "$SAVE_KEYS" = select+r1 ]
+}
+
+@test "restore: a controls.ini changed since is kept as controls.ini.replaced, the original still comes back" {
+    bind_setup
+    ctl 'Select = 10-196'
+    cp "$CTL" "$T/orig"
+    bind_run >/dev/null
+    printf '[ControlMapping]\nSave State = 10-197\n' >"$CTL"
+    run restore_files
+    assert_output --partial "WARNING"
+    cmp "$CTL" "$T/orig"
+    assert_grep "$BAK/controls.ini.replaced" 'Save State = 10-197'
 }

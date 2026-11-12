@@ -291,6 +291,66 @@ mess_up() {
     assert_success
 }
 
+@test "rb_backup binds a missing Save State/Exit hotkey (not Next Slot); rb_restore puts controls.ini back byte for byte" {
+    seed_files
+    printf '[ControlMapping]\nSelect = 10-196\nR = 10-192\n' >"$CONTROLS"
+    cp "$CONTROLS" "$T/controls.orig"
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    rb_init
+    run rb_config_info
+    assert_output --partial "NOT BOUND"
+    cmp "$CONTROLS" "$T/controls.orig"     # nothing is written before the backup
+    run rb_backup
+    assert_success
+    assert_output --partial "Save State = 10-196:10-192"
+    assert_grep "$CONTROLS" '^Exit App = 10-196:10-197'
+    refute_grep "$CONTROLS" '^Next Slot'
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    rb_init
+    [ "$SAVE_KEYS" = select+r1 ] && [ -z "$HOTKEY_TO_BIND" ]
+    run rb_restore
+    assert_output --partial "controls.ini restored"
+    cmp "$CONTROLS" "$T/controls.orig"
+}
+
+@test "rb_backup after an aborted run: the original controls.ini is restored first, then the hotkeys are bound again" {
+    seed_files
+    printf '[ControlMapping]\nSelect = 10-196\n' >"$CONTROLS"
+    cp "$CONTROLS" "$T/controls.orig"
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    rb_init
+    rb_backup >/dev/null
+    assert_differ "$CONTROLS" "$T/controls.orig"
+    # the run is cut short here: no rb_restore. The next run:
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    rb_init
+    run rb_backup
+    assert_success
+    assert_output --partial "restoring those files first"
+    assert_output --partial "Save State = 10-196:10-192"
+    rb_restore >/dev/null
+    cmp "$CONTROLS" "$T/controls.orig"  # the ORIGINAL, not the run's bound version
+}
+
+@test "rb_backup: an unbound hotkey with SET_HOTKEYS=0 fails and leaves controls.ini alone" {
+    seed_files
+    printf '[ControlMapping]\nSelect = 10-196\n' >"$CONTROLS"
+    cp "$CONTROLS" "$T/controls.orig"
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    SET_HOTKEYS=0 rb_init
+    SET_HOTKEYS=0 run rb_preflight
+    assert_failure
+    assert_output --partial "FAIL: Save State hotkey (Save State) is not bound"
+    cmp "$CONTROLS" "$T/controls.orig"
+}
+
+@test "SET_HOTKEYS is forwarded to the device when set" {
+    run rb_env_prelude
+    refute_output --partial SET_HOTKEYS
+    SET_HOTKEYS=0 run rb_env_prelude
+    assert_output --partial "export SET_HOTKEYS='0';"
+}
+
 @test "rb_backup: the backup of an aborted run is restored first, and the original is not lost" {
     seed_files
     rb_backup

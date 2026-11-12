@@ -17,6 +17,16 @@ kill_ui() { killall -9 nextui.elf 2>/dev/null; }
 restore_files() {
     local f
     rm -f /tmp/next
+    # controls.ini: the tests may have bound hotkeys in it (devconfig.bash). If it is not what
+    # they left (PPSSPP or the user changed it since) its current content is kept next to the
+    # backup before the original is put back, so nothing is lost.
+    if [ -f "$BAK/controls.written" ] && [ -n "${CONTROLS:-}" ]; then
+        if [ -f "$CONTROLS" ] && ! cmp -s "$BAK/controls.written" "$CONTROLS"; then
+            cp -p "$CONTROLS" "$BAK/controls.ini.replaced"
+            echo "WARNING: $CONTROLS changed during the run; the original is restored, the changed file is kept as $BAK/controls.ini.replaced" >&2
+        fi
+        rm -f "$BAK/controls.written" "$BAK/controls.bound"
+    fi
     if [ -f "$BAK/present" ]; then
         while IFS= read -r f; do
             [ -n "$f" ] && cp -p "$BAK$f" "$f"

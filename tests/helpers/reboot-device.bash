@@ -11,6 +11,7 @@
 #
 # Settings (env; the host passes them): SD (/mnt/SDCARD)  PLATFORM  PAK_NAME  ROM_DIR  ROM
 #   SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS (read from controls.ini when unset)  UI_WAIT  CHORD_HOLD  KEEPAWAKE_KEY (l1)  POWER_DEV_NAME  SLEEP_PROBE
+#   SET_HOTKEYS (1; 0 = never bind a missing hotkey in controls.ini)
 # Test hooks (host unit tests only): RB_TMP (/tmp)  RB_REBOOT_CMD  RB_HARD_REBOOT_CMD  BOOT_ID_FILE
 
 # The files e2e.bash's backup/restore helpers use ($BAK/present, absent, states.before, marker,
@@ -83,6 +84,7 @@ rb_discover() {
 # What the tests read from the device, for the log (hotkeys, start screen).
 rb_config_info() {
     printf '%s' "$HOTKEY_INFO"
+    [ -s "$BAK/controls.bound" ] && printf 'bound by the tests in controls.ini (restored at the end):\n%s' "$(cat "$BAK/controls.bound")"
     echo "NextUI start screen: $(cfg_start_mode_info "$SHARED/minuisettings.txt") (the tests work in either mode)"
 }
 
@@ -164,11 +166,12 @@ rb_backup() {
         restore_files
         rb_restore_states
         rm -f "$BAK/active"
+        cfg_reinit_hotkeys # what the aborted run had bound is gone: resolve from the restored file
     fi
     rm -f "$BAK/present" "$BAK/absent" "$BAK/states.before" "$BAK/marker" "$BAK"/evidence-* "$BAK/wrapper.log" "$BAK/trigger.log"
     : >"$BAK/active"
     sync
-    for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW" "$INI"; do stash "$f"; done
+    for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW" "$INI" "$CONTROLS"; do stash "$f"; done
     for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && stash "$f"; done
     mkdir -p "$STATE_DIR"
     ls -1 "$STATE_DIR" >"$BAK/states.before" 2>/dev/null
@@ -181,6 +184,13 @@ rb_backup() {
         cp -p "$f" "$BAK/states/" || return 1
     done
     sync
+    # PPSSPP reads controls.ini when it starts: the hotkeys are bound before any game is launched,
+    # and stay in place (the file is on the SD card) until rb_restore at the very end.
+    if [ -n "$HOTKEY_PROBLEMS" ]; then
+        echo "$HOTKEY_PROBLEMS" >&2
+        return 1
+    fi
+    cfg_apply_hotkeys
 }
 
 # Puts back the state files backed up by rb_backup that were changed or deleted.
@@ -215,12 +225,15 @@ rb_stop_game() {
 # Puts everything back (also called at the start of a run that finds a backup).
 rb_restore() {
     [ -f "$BAK/active" ] || return 0
+    local had_hotkeys=0
+    [ -f "$BAK/controls.bound" ] && had_hotkeys=1
     rb_stop_game
     rm -f "$WRAPPER"
     restore_files
     rb_restore_states
     rm -rf "$BAK/states"
     rm -f "$BAK/active"
+    [ "$had_hotkeys" = 1 ] && echo "controls.ini restored: the hotkeys the tests had bound are removed again"
     kill_ui || true # NextUI starts again with the restored recents and without a marker
     return 0
 }
