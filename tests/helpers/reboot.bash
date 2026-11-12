@@ -19,7 +19,7 @@
 #   RESUME_TIMEOUT (180)      after boot: NextUI must be up and relaunch the game within this
 
 RB_KIT_PATH="${RB_KIT_PATH:-/tmp/psp-reboot-kit.sh}"
-RB_ENV_VARS="SD PLATFORM PAK_NAME ROM_DIR ROM EXIT_KEYS UI_WAIT CHORD_HOLD KEEPAWAKE_KEY POWER_DEV_NAME SLEEP_PROBE RB_TMP RB_OUT RB_REBOOT_CMD RB_HARD_REBOOT_CMD BOOT_ID_FILE"
+RB_ENV_VARS="SD PLATFORM PAK_NAME ROM_DIR ROM SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS UI_WAIT CHORD_HOLD KEEPAWAKE_KEY POWER_DEV_NAME SLEEP_PROBE RB_TMP RB_OUT RB_REBOOT_CMD RB_HARD_REBOOT_CMD BOOT_ID_FILE"
 
 # Quotes a value for the remote shell.
 rb_q() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
@@ -87,7 +87,7 @@ dev_install_kit() {
     local here="${BASH_SOURCE[0]%/*}" errf rc
     rb_ssh_ready || { echo "DEVICE_HOST is not set" >&2; return 2; }
     errf="$(mktemp "${TMPDIR:-/tmp}/rb-ssh-err.XXXXXX")" || return 2
-    cat "$here/e2e.bash" "$here/reboot-device.bash" |
+    cat "$here/e2e.bash" "$here/devconfig.bash" "$here/reboot-device.bash" |
         timeout -k 3 60 "${RB_SSH[@]}" "$DEVICE_HOST" "cat >$(rb_q "$RB_KIT_PATH.part") && mv $(rb_q "$RB_KIT_PATH.part") $(rb_q "$RB_KIT_PATH")" 2>"$errf"
     rc=${PIPESTATUS[1]}
     rb_scrub <"$errf" >&2

@@ -21,7 +21,7 @@
 # The pak is expected in Emus/<platform>/<PAK_NAME>.pak; PAK_NAME defaults to "name" in
 # pak.json (PSP) and is passed to the device.
 #
-# Forwarded to the device when set: SDCARD_PATH ROM_DIR ROM PSP_KEYS EXIT_KEYS BOOT_WAIT
+# Forwarded to the device when set: SDCARD_PATH ROM_DIR ROM PSP_KEYS SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS BOOT_WAIT
 # UI_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT.
 #
 # Afterwards the tests tagged "reboot" (tests/bats/reboot.bats: they REBOOT the device) run on
@@ -216,7 +216,7 @@ sd="${SDCARD_PATH:-/mnt/SDCARD}"
 pak_name="${PAK_NAME:-$(jq -r '.name // empty' pak.json 2>/dev/null)}"
 pak_name="${pak_name:-PSP}"
 assignments="PLATFORM=$(q "$platform") PAK_NAME=$(q "$pak_name") SRC_PAK=$(q "$sd/Emus/$platform/$pak_name.pak") RESULT_DIR=$(q "$remote_tmp/result") DEVICE_COLLECT=1"
-for v in SDCARD_PATH ROM_DIR ROM PSP_KEYS EXIT_KEYS BOOT_WAIT UI_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT; do
+for v in SDCARD_PATH ROM_DIR ROM PSP_KEYS SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS BOOT_WAIT UI_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT; do
     if [ -n "${!v+x}" ]; then
         assignments="$assignments $v=$(q "${!v}")"
     fi

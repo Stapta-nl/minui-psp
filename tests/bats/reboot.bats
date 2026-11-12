@@ -126,6 +126,7 @@ setup_file() {
     [ -n "$ROM" ] || fail "no game found in Roms/*(PSP) on the device (set ROM_DIR or ROM)"
     export ROM
     info "game: $ROM"
+    info "$(dev_kit 60 rb_config_info 2>&1)"
 
     local problems
     if ! problems="$(dev_kit 60 rb_preflight)"; then
@@ -160,7 +161,7 @@ teardown_file() {
 @test "R1 quit with the Exit hotkey: a state and its preview are saved, no auto-resume marker" {
     start_game True
     dev_kit 30 rb_quit_game
-    await 40 "PPSSPP to exit after the Exit hotkey" dev_ok 20 rb_no_game
+    await 40 "PPSSPP to exit after the Exit hotkey (see the hotkeys in the log: read from controls.ini)" dev_ok 20 rb_no_game
     await 90 "NextUI to be back" dev_ok 20 rb_nextui_up
     await 60 "a new save state (.ppst) from the exit" dev_ok 20 rb_has_new_state
     await 40 "the Game Switcher preview of the newest state" dev_ok 20 rb_has_new_preview
@@ -173,7 +174,7 @@ teardown_file() {
     step_done r1-quit
 }
 
-@test "R2 NextUI shows its normal menu after a quit and after a restart: no auto-launch" {
+@test "R2 NextUI is up after a quit and after a restart and launches no game (no auto-launch)" {
     need_step r1-quit
     dev_kit 30 kill_ui # SIGKILL: NextUI starts again, and would run autoResume() if a marker existed
     await 90 "NextUI to be back" dev_ok 20 rb_nextui_up
@@ -248,7 +249,7 @@ teardown_file() {
 @test "R7 forced reboot without the handshake (power cut analogue): no auto-resume, states intact" {
     start_game True
     dev_kit 30 rb_save_state
-    await 30 "a state saved with the hotkey (select+r1)" dev_ok 20 rb_has_new_state
+    await 30 "a state saved with the Save State hotkey (see the hotkeys in the log: read from controls.ini)" dev_ok 20 rb_has_new_state
     dev_kit 30 rb_save_snapshot
     local old
     old="$(rb_boot_id)"

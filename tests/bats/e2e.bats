@@ -25,10 +25,13 @@
 #   PSP_KEYS   space separated steps run inside PPSSPP after boot, to make save states.
 #              Steps: up down left right a b x y l1 r1 select start | chords joined with +
 #              (select+r1) | sleep<sec> | shot
-#              Default uses the PPSSPP hotkeys set up on the device: select+r1 = save state,
-#              select+right = next slot. It saves slot 0, moves to slot 1 and saves again.
+#              Default: save, next slot, save, using the hotkeys of the DEVICE: the Save State,
+#              Next Slot and Exit App bindings are read from the pak's controls.ini (see
+#              tests/helpers/devconfig.bash) and the documented defaults select+r1,
+#              select+right and select+start are used only for a hotkey that is not set there.
 #              PSP_KEYS="" skips saving: then there must be no preview (NextUI shows No Preview).
-#   EXIT_KEYS  how the emulator is quit (default select+start; "" kills PPSSPP instead).
+#   SAVE_KEYS, NEXT_SLOT_KEYS  override the two hotkeys above (same step syntax, one chord).
+#   EXIT_KEYS  how the emulator is quit (default: the Exit App hotkey; "" kills PPSSPP instead).
 #   BOOT_WAIT (20)  UI_WAIT (6)  KEY_GAP (0.5)  CHORD_HOLD (0.3)
 #
 # The save states made by the test (new files in /.userdata/shared/PSP-ppsspp) are deleted
@@ -36,6 +39,7 @@
 
 load '../helpers/common'
 load '../helpers/e2e'
+load '../helpers/devconfig'
 
 setup_file() {
     require_tools awk cmp cp mv rm mkdir grep head tail tr find ls wc sed cat sleep touch basename dirname sync pgrep killall id printf
@@ -51,35 +55,34 @@ setup_file() {
     BOOT_WAIT="${BOOT_WAIT:-20}"
     UI_WAIT="${UI_WAIT:-6}"
     KEY_GAP="${KEY_GAP:-0.5}"
-    PSP_KEYS="${PSP_KEYS-select+r1 sleep3 shot select+right sleep1 shot select+r1 sleep3 shot}"
-    EXIT_KEYS="${EXIT_KEYS-select+start}"
     STATE_DIR="$SD/.userdata/shared/PSP-ppsspp"
     PNGCOLOR="$TESTS_DIR/bin/pngcolor"
     BAK="$SD/.userdata/shared/.psp-e2e-backup" # on the SD card, so a power loss cannot lose it
 
-    # --- preflight ---
-    [ "$(id -u)" = 0 ] || fail "run as root (needed to write to /dev/input)"
-    [ -d "$PAK" ] || fail "the pak is not installed at $PAK"
-    [ -x "$PAK/bin/jpg2bmp" ] || fail "$PAK/bin/jpg2bmp missing (install a pak built by CI or make build)"
-    [ -f "$MON/bin/screenshot" ] || fail "Screenshot Monitor pak not found at $MON"
-    [ -x "$PNGCOLOR" ] || fail "$PNGCOLOR missing (use the bundle from make test-bundle)"
-    [ -f /tmp/nextui_exec ] || fail "NextUI launcher not running (/tmp/nextui_exec missing)"
-
+    # --- preflight (the checks that need ROM etc. come after they are found, below) ---
     PAD="$(awk '/^N: Name="TRIMUI Player1"/{f=1} f&&/^H: Handlers=/{for(i=1;i<=NF;i++) if($i ~ /^event/){print "/dev/input/" $i; exit}}' /proc/bus/input/devices)"
-    [ -c "$PAD" ] || fail "TRIMUI Player1 input device not found"
+    INI="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
+    CONTROLS="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini"
+    cfg_init_hotkeys "$CONTROLS"
+    # (EXIT_KEYS may be "" on purpose: kill PPSSPP instead)
+    if [ -z "${PSP_KEYS+x}" ]; then
+        PSP_KEYS="$SAVE_KEYS sleep3 shot $NEXT_SLOT_KEYS sleep1 shot $SAVE_KEYS sleep3 shot"
+    elif [ -n "$PSP_KEYS" ] && ! bad="$(cfg_keys_valid "$PSP_KEYS")"; then
+        HOTKEY_PROBLEMS="$HOTKEY_PROBLEMS${HOTKEY_PROBLEMS:+
+}PSP_KEYS has a step the test cannot press: '$bad'"
+    fi
 
     if [ -z "${ROM_DIR:-}" ]; then
         for d in "$SD"/Roms/*"(PSP)"; do
             [ -d "$d" ] && ROM_DIR="$d" && break
         done
     fi
-    [ -d "${ROM_DIR:-}" ] || fail "no Roms/*(PSP) folder found (set ROM_DIR)"
-    if [ -z "${ROM:-}" ]; then
+    if [ -z "${ROM:-}" ] && [ -d "${ROM_DIR:-}" ]; then
         for f in "$ROM_DIR"/*; do
             [ -f "$f" ] && ROM="$f" && break
         done
     fi
-    [ -f "${ROM:-}" ] || fail "no game file in $ROM_DIR (set ROM)"
+    [ -f "${ROM:-}" ] || ROM="" # reported by the preflight below
 
     # Same emu tag NextUI uses: the text in the last (...) of the Roms folder name.
     tag="${ROM%/*}"
@@ -90,7 +93,7 @@ setup_file() {
         tag="${tag%%)*}"
         ;;
     esac
-    ROM_FILE="$(basename "$ROM")"
+    ROM_FILE="$(basename "${ROM:-none}")"
     MINUI="$SHARED/.minui/$tag"
     SLOT_FILE="$MINUI/$ROM_FILE.txt"
     PREVIEW="$MINUI/$ROM_FILE.0.bmp" # slot 0, used by E1; E2 uses whatever slot the game saved
@@ -99,7 +102,16 @@ setup_file() {
     AUTORESUME="$SHARED/.minui/auto_resume.txt"
     SHOTDIR="$SD/Screenshots"
 
-    export SD PLATFORM PAK MON SHARED LOGS OUT BOOT_WAIT UI_WAIT KEY_GAP PSP_KEYS EXIT_KEYS \
+    # ONE message with everything that must change, before anything is touched.
+    if ! problems="$(e2e_preflight_problems)"; then
+        fail "the device is not set up for this test, change this and run again:
+$problems"
+    fi
+    info "hotkeys (read from the device):"
+    info "$(printf '%s' "$HOTKEY_INFO" | sed 's/^/  /')"
+    info "NextUI start screen: $(cfg_start_mode_info "$SHARED/minuisettings.txt") (the tests work in either mode)"
+
+    export INI CONTROLS SAVE_KEYS NEXT_SLOT_KEYS SD PLATFORM PAK MON SHARED LOGS OUT BOOT_WAIT UI_WAIT KEY_GAP PSP_KEYS EXIT_KEYS \
         STATE_DIR PNGCOLOR BAK PAD ROM_DIR ROM tag ROM_FILE MINUI SLOT_FILE PREVIEW RECENT \
         PERSIST AUTORESUME SHOTDIR
 
@@ -223,7 +235,7 @@ teardown_file() {
     sleep "$UI_WAIT"
     ls -l --full-time "$STATE_DIR" >"$OUT/e2-states.txt" 2>/dev/null || ls -l "$STATE_DIR" >"$OUT/e2-states.txt" 2>&1
     cp "$LOGS/PSP.txt" "$OUT/e2-PSP.log" 2>/dev/null
-    [ "$exit_ok" = 1 ] || fail "PPSSPP did not exit on $EXIT_KEYS (it had to be killed)"
+    [ "$exit_ok" = 1 ] || fail "PPSSPP did not exit on the Exit hotkey ($EXIT_KEYS, read from $CONTROLS) and had to be killed. Check the Exit App binding in PPSSPP (or set EXIT_KEYS)"
 }
 
 @test "E2 no save state: no slot file, no preview image" {
@@ -246,7 +258,7 @@ teardown_file() {
     local n
     n="$(new_state_thumbs | wc -l)"
     info "new states: $n"
-    [ "$n" -ge 2 ]
+    [ "$n" -ge 2 ] || fail "$n new state(s), expected 2: PPSSPP did not react to the Save State hotkey ($SAVE_KEYS) and Next Slot hotkey ($NEXT_SLOT_KEYS), which were read from $CONTROLS. Check the bindings in PPSSPP (or set SAVE_KEYS/NEXT_SLOT_KEYS)"
 }
 
 @test "E2 slot file holds the newest state's slot" {

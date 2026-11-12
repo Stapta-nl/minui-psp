@@ -76,6 +76,8 @@ make_device() {
     # shellcheck disable=SC1091
     . "$HELPERS/e2e.bash"
     # shellcheck disable=SC1091
+    . "$HELPERS/devconfig.bash"
+    # shellcheck disable=SC1091
     . "$HELPERS/reboot-device.bash"
     rb_init
     PAD=/dev/null
@@ -630,6 +632,36 @@ SHIM
     assert_failure
     assert_output --partial "not installed"
     assert_output --partial "no Roms/*(PSP) folder"
+}
+
+@test "rb_preflight: a hotkey bound to something the test cannot press is one clear FAIL line" {
+    printf '[ControlMapping]\nSelect = 10-196\nSaveState = 1-133\n' >"$CONTROLS"
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS # rb_init in setup set them
+    rb_init
+    RB_REBOOT_CMD=/bin/true run rb_preflight
+    assert_failure
+    assert_output --partial "FAIL: Save State hotkey is bound to '1-133'"
+}
+
+@test "rb_save_state and rb_quit_game press the hotkeys read from the device's controls.ini" {
+    printf '[ControlMapping]\nSelect = 10-196\nStart = 10-197\nL = 10-193\nR = 10-192\nSaveState = 10-197:10-193\nExitApp = 10-196:10-192\n' >"$CONTROLS"
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS # rb_init in setup set them
+    rb_init
+    press() { echo "$1" >>"$T/pressed"; }
+    rb_save_state
+    rb_quit_game
+    run cat "$T/pressed"
+    assert_output "start+l1
+select+r1"
+}
+
+@test "dev_kit: the kit has devconfig.bash, so the hotkeys are resolved on the device" {
+    printf '[ControlMapping]\nSelect = 10-196\nStart = 10-197\nExitApp = 10-197:10-196\n' >"$CONTROLS"
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS # set by rb_init in setup; the device resolves its own
+    run dev_install_kit
+    assert_success
+    run dev_kit 20 'echo "$EXIT_KEYS|$SAVE_KEYS"'
+    assert_output "start+select|select+r1"
 }
 
 # --- run-reboot.sh and the tags ---------------------------------------------------------------

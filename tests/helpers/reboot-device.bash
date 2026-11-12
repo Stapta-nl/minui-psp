@@ -10,7 +10,7 @@
 # Everything is bash and BusyBox friendly (no GNU only tools).
 #
 # Settings (env; the host passes them): SD (/mnt/SDCARD)  PLATFORM  PAK_NAME  ROM_DIR  ROM
-#   EXIT_KEYS (select+start)  UI_WAIT  CHORD_HOLD  KEEPAWAKE_KEY (l1)  POWER_DEV_NAME  SLEEP_PROBE
+#   SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS (read from controls.ini when unset)  UI_WAIT  CHORD_HOLD  KEEPAWAKE_KEY (l1)  POWER_DEV_NAME  SLEEP_PROBE
 # Test hooks (host unit tests only): RB_TMP (/tmp)  RB_REBOOT_CMD  RB_HARD_REBOOT_CMD  BOOT_ID_FILE
 
 # The files e2e.bash's backup/restore helpers use ($BAK/present, absent, states.before, marker,
@@ -31,13 +31,16 @@ rb_init() {
     STATE_DIR="$SHARED/PSP-ppsspp"
     BAK="$SHARED/.psp-reboot-backup" # on the SD card: survives the reboots and a cut-short run
     INI="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
+    CONTROLS="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini"
     SHOTDIR="$SD/Screenshots"
     OUT="${RB_OUT:-${RB_TMP:-/tmp}/psp-reboot-out}"
     RB_TMP="${RB_TMP:-/tmp}"
     NEXT="$RB_TMP/next"
     WRAPPER="$RB_TMP/psp-test-poweroff"
     UI_WAIT="${UI_WAIT:-6}"
-    EXIT_KEYS="${EXIT_KEYS:-select+start}"
+    [ -n "${EXIT_KEYS:-}" ] || unset EXIT_KEYS # empty = not set here (there is no kill mode)
+    # The hotkeys of the DEVICE (controls.ini), the documented defaults where unset: devconfig.bash
+    cfg_init_hotkeys "$CONTROLS"
     mkdir -p "$OUT" 2>/dev/null
 
     if [ -z "${ROM_DIR:-}" ]; then
@@ -77,6 +80,12 @@ rb_discover() {
     printf 'ROM=%s\n' "$ROM"
 }
 
+# What the tests read from the device, for the log (hotkeys, start screen).
+rb_config_info() {
+    printf '%s' "$HOTKEY_INFO"
+    echo "NextUI start screen: $(cfg_start_mode_info "$SHARED/minuisettings.txt") (the tests work in either mode)"
+}
+
 # The command that reboots (never "poweroff"): the first that exists.
 rb_reboot_cmd() {
     local c
@@ -110,6 +119,9 @@ rb_preflight() {
     [ -d "$PAK" ] || fail_ "the pak is not installed at $PAK"
     [ -f "$PAK/launch.sh" ] || fail_ "$PAK/launch.sh missing"
     [ -f "$INI" ] || fail_ "$INI missing (start a game once so PPSSPP writes it)"
+    while IFS= read -r p; do
+        [ -n "$p" ] && fail_ "$p"
+    done <<<"${HOTKEY_PROBLEMS:-}"
     [ -x "$PAK/bin/jpg2bmp" ] || fail_ "$PAK/bin/jpg2bmp missing (install a pak built by CI or make build)"
     [ -f "$PAK/bin/poweroff" ] || fail_ "$PAK/bin/poweroff (the shim) is missing: this pak has no auto-resume"
     # The shim must USE the override in code (not just mention it in a comment). If it does not,
@@ -287,7 +299,7 @@ rb_nextui_up() { pgrep nextui.elf >/dev/null 2>&1; }
 rb_no_game() { ! pgrep PPSSPPSDL >/dev/null 2>&1; }
 
 rb_quit_game() { press "$EXIT_KEYS"; }
-rb_save_state() { press select+r1; }
+rb_save_state() { press "$SAVE_KEYS"; }
 
 rb_marker_exists() { [ -e "$AUTORESUME" ]; }
 rb_marker_content() { cat "$AUTORESUME" 2>/dev/null; }
