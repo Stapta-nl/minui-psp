@@ -46,7 +46,7 @@
 #
 # Backup: recents, game_switcher, auto_resume, the slot file and previews of the test game, and
 # ppsspp.ini, and a copy of every file in the save state folder (the tests overwrite a slot of the
-# test game), are backed up on the SD card (/.userdata/shared/.psp-reboot-backup) and restored at
+# test game), are backed up on the SD card (/.userdata/shared/.psp-test-backup, shared with e2e.bats) and restored at
 # the end; a run that is cut short is restored at the start of the next one. New save states
 # are deleted.
 #
@@ -155,7 +155,7 @@ teardown_file() {
         return 0
     }
     dev_install_kit
-    if restored="$(dev_kit 400 rb_restore)"; then
+    if restored="$(dev_kit 400 "RB_EXPECT_BACKUP=1; export RB_EXPECT_BACKUP; rb_restore")"; then
         [ -n "$restored" ] && echo "# $restored" >&3
         echo "# restored; results in $OUT" >&3
     else

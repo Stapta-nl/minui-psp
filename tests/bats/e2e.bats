@@ -15,7 +15,7 @@
 # least one file in a "...(PSP)" folder under Roms/. The test uses the FIRST file there.
 #
 # It temporarily changes recents / resume files of the test game and restores them at the end.
-# The backup is kept on the SD card (/.userdata/shared/.psp-e2e-backup); if a run is cut
+# The backup is kept on the SD card (/.userdata/shared/.psp-test-backup, shared with reboot.bats); if a run is cut
 # short, the next run restores from it first. Do not touch the device while it runs.
 #
 # The tests run in order and share state (E2 builds on the game that E2's first test starts).
@@ -62,23 +62,13 @@ setup_file() {
     KEY_GAP="${KEY_GAP:-0.5}"
     STATE_DIR="$SD/.userdata/shared/PSP-ppsspp"
     PNGCOLOR="$TESTS_DIR/bin/pngcolor"
-    BAK="$SD/.userdata/shared/.psp-e2e-backup" # on the SD card, so a power loss cannot lose it
+    BAK="$SHARED/.psp-test-backup" # on the SD card, so a power loss cannot lose it; shared with reboot.bats
 
     # --- preflight (the checks that need ROM etc. come after they are found, below) ---
     PAD="$(awk '/^N: Name="TRIMUI Player1"/{f=1} f&&/^H: Handlers=/{for(i=1;i<=NF;i++) if($i ~ /^event/){print "/dev/input/" $i; exit}}' /proc/bus/input/devices)"
     INI="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
     CONTROLS="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini"
-    # The Exit hotkey is always needed (EXIT_KEYS="" kills PPSSPP instead); Save State and
-    # Next Slot only when PSP_KEYS is not given.
-    PSP_DEFAULT=0
-    [ -z "${PSP_KEYS+x}" ] && PSP_DEFAULT=1
-    cfg_init_hotkeys "$CONTROLS" "exit$([ "$PSP_DEFAULT" = 1 ] && echo ' save next')"
-    if [ "$PSP_DEFAULT" = 1 ]; then
-        PSP_KEYS="$SAVE_KEYS sleep3 shot $NEXT_SLOT_KEYS sleep1 shot $SAVE_KEYS sleep3 shot"
-    elif [ -n "$PSP_KEYS" ] && ! bad="$(cfg_keys_valid "$PSP_KEYS")"; then
-        HOTKEY_PROBLEMS="$HOTKEY_PROBLEMS${HOTKEY_PROBLEMS:+
-}PSP_KEYS has a step the test cannot press: '$bad'"
-    fi
+    e2e_setup_hotkeys
 
     if [ -z "${ROM_DIR:-}" ]; then
         for d in "$SD"/Roms/*"(PSP)"; do
@@ -123,42 +113,23 @@ $problems"
         STATE_DIR PNGCOLOR BAK PAD ROM_DIR ROM tag ROM_FILE MINUI SLOT_FILE PREVIEW RECENT \
         PERSIST AUTORESUME SHOTDIR
 
-    mkdir -p "$OUT" "$BAK"
-
-    # --- back up everything we will touch ---
-    if [ -f "$BAK/active" ]; then
-        info "found the backup of an aborted run: restoring those files first"
-        e2e_stop_game # PPSSPP rewrites its ini files when it exits: not after the restore
-        restore_files
-        rm -f "$BAK/active"
-    fi
-    # The reboot tests' backup may hold hotkeys bound by a cut-short run: put that file back first.
-    # (A bound file must never be taken for the original.)
-    export CFG_STOP_GAME=e2e_stop_game
-    msg="$(cfg_restore_foreign "$SHARED/.psp-reboot-backup")" && [ -n "$msg" ] && info "$msg"
-    # The hotkeys an aborted run had bound are gone again: resolve from the restored file.
-    cfg_reinit_hotkeys
-    if [ "$PSP_DEFAULT" = 1 ]; then
-        PSP_KEYS="$SAVE_KEYS sleep3 shot $NEXT_SLOT_KEYS sleep1 shot $SAVE_KEYS sleep3 shot"
-    fi
-    [ -z "$HOTKEY_PROBLEMS" ] || fail "the device is not set up for this test, change this and run again:
-$HOTKEY_PROBLEMS"
-    rm -f "${OUT:?}"/*.png "${OUT:?}"/*.log "${OUT:?}"/*.shotname \
-        "${BAK:?}/present" "${BAK:?}/absent" "${BAK:?}/states.before" "${BAK:?}/marker"
+    mkdir -p "$OUT"
+    rm -f "${OUT:?}"/*.png "${OUT:?}"/*.log "${OUT:?}"/*.shotname
     info "device pad: $PAD"
     info "game:       $ROM"
     info "emu tag:    $tag"
 
-    # "active" is set before anything is copied or changed, so an abort at any point from here
-    # on (also halfway through the stashing) is restored by teardown_file or the next run.
-    : >"$BAK/active"
-    sync
-    for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW"; do stash "$f"; done
-    for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && stash "$f"; done # previews of other slots
-    sync
-    # Bind the missing hotkeys (after the backup above; PPSSPP reads controls.ini when it
-    # starts, so this is in place before any game is launched).
-    cfg_backup_and_bind >"$OUT/hotkeys.txt" 2>&1 || fail "could not back up controls.ini and set the hotkeys (see $OUT/hotkeys.txt): $(cat "$OUT/hotkeys.txt")"
+    # Back everything up (a leftover backup of a cut-short run, e2e or reboot, is restored first).
+    # Nothing has been changed before this succeeds.
+    psp_backup >"$OUT/backup.txt" 2>&1 || fail "could not back up the device's files, nothing was changed: $(cat "$OUT/backup.txt")"
+    [ -s "$OUT/backup.txt" ] && info "$(cat "$OUT/backup.txt")"
+    # What a cut-short run had bound is gone again: resolve the hotkeys from the restored file.
+    e2e_reinit_hotkeys
+    [ -z "$HOTKEY_PROBLEMS" ] || fail "the device is not set up for this test, change this and run again:
+$HOTKEY_PROBLEMS"
+    # Bind the missing hotkeys (the backup above has the original; PPSSPP reads controls.ini when
+    # it starts, so this is in place before any game is launched).
+    cfg_apply_hotkeys >"$OUT/hotkeys.txt" 2>&1 || fail "could not set the hotkeys (see $OUT/hotkeys.txt): $(cat "$OUT/hotkeys.txt")"
     [ -s "$OUT/hotkeys.txt" ] && info "$(cat "$OUT/hotkeys.txt")"
 
     # E1 starts from: the game in recents, slot 0 chosen.
@@ -181,14 +152,16 @@ teardown() {
 teardown_file() {
     # Only when the backup was made (setup_file may have failed in the preflight).
     [ -n "${BAK:-}" ] && [ -f "$BAK/active" ] || return 0
-    e2e_stop_game # PPSSPP rewrites controls.ini/ppsspp.ini when it exits: stop it BEFORE the restore
     local had_hotkeys=0
     [ -f "$BAK/controls.bound" ] && had_hotkeys=1
-    restore_files
-    rm -f "$BAK/active"
-    kill_ui # relaunches NextUI with the restored files
-    CFG_CTL="$CONTROLS" cfg_report_restore "$had_hotkeys" | sed 's/^/# /' >&3
-    echo "# restored; results in $OUT" >&3
+    # psp_restore stops PPSSPP first (it rewrites its ini files when it exits), then restores.
+    if psp_restore normal 2>&3; then
+        kill_ui # relaunches NextUI with the restored files
+        CFG_CTL="$CONTROLS" cfg_report_restore "$had_hotkeys" | sed 's/^/# /' >&3
+        echo "# restored; results in $OUT" >&3
+    else
+        echo "# NOT restored: the backup is in $BAK and is restored by the next run (tests or reboot tests)" >&3
+    fi
 }
 
 # --- E1: NextUI renders the BMP that jpg2bmp makes ------------------------------------------

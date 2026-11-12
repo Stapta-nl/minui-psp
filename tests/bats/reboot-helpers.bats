@@ -86,6 +86,7 @@ make_device() {
     rb_game_up() { false; }
     rb_kill_game() { :; }
     kill_ui() { :; }
+    e2e_stop_game() { :; } # the real one is tested in devconfig.bats; this machine has no game
 }
 
 # --- host side: ssh, kit, waits -------------------------------------------------------------
@@ -344,40 +345,156 @@ mess_up() {
     cmp "$CONTROLS" "$T/controls.orig"
 }
 
-@test "rb_backup after a cut-short e2e run: the original controls.ini is restored first, and it is the original that rb_restore puts back" {
+# A device whose controls.ini has no hotkeys (so the tests bind them).
+unbound_controls() {
     seed_files
     printf '[ControlMapping]\nSelect = 10-196\nR = 10-192\n' >"$CONTROLS"
     cp "$CONTROLS" "$T/controls.orig"
-    # the e2e run's side, in its own backup dir on the SD card: backup, bind, cut short
-    local reboot_bak="$BAK"
-    BAK="$SHARED/.psp-e2e-backup"
-    mkdir -p "$BAK"
-    : >"$BAK/active"
     unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
-    cfg_init_hotkeys "$CONTROLS"
-    cfg_backup_and_bind >/dev/null
+    rb_init
+}
+
+@test "e2e and reboot share ONE backup dir: a bound file left by a cut-short run of either is restored first" {
+    unbound_controls
+    # the e2e side uses the same functions and the same dir (see e2e.bats): backup, bind, cut short
+    cfg_reinit_hotkeys
+    psp_backup >/dev/null
+    cfg_apply_hotkeys >/dev/null
     assert_differ "$CONTROLS" "$T/controls.orig"
-    BAK="$reboot_bak"
-    # the reboot run starts
+    [ "$BAK" = "$SHARED/.psp-test-backup" ]
+    grep -q 'psp-test-backup' "$TESTS_DIR/bats/e2e.bats"
+    # the other suite starts
     unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
     rb_init
     run rb_backup
     assert_success
-    assert_output --partial "original was put back first"
+    assert_output --partial "aborted run"
+    assert_output --partial "Save State = 10-196:10-192"
     run rb_restore
     assert_output --partial "controls.ini restored"
+    cmp "$CONTROLS" "$T/controls.orig"   # the ORIGINAL, never the bound file
+}
+
+@test "an interrupted bind (killed between the first write and the end) is restored by the next start; nothing is lost" {
+    unbound_controls
+    cfg_reinit_hotkeys
+    psp_backup >/dev/null
+    cfg_controls_bind "$CONTROLS" "Save State" "10-196:10-192" # the first write ... and then the run dies
+    assert_differ "$CONTROLS" "$T/controls.orig"
+    assert_file_not_exist "$BAK/controls.bound"
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    rb_init
+    run rb_backup
+    assert_success
+    assert_output --partial "WARNING"          # the half-bound file is kept, not silently dropped
+    run bash -c "grep -l 'Save State' '$CONTROLS'.replaced.*"
+    assert_success
+    rb_restore >/dev/null
     cmp "$CONTROLS" "$T/controls.orig"
 }
 
-@test "rb_ini_set remembers what the tests wrote; a different ppsspp.ini at the restore is kept under a unique name" {
+@test "after a restore nothing points at the stash: a later user edit is never overwritten" {
+    unbound_controls
+    rb_backup >/dev/null
+    run rb_restore
+    assert_success
+    assert_file_not_exist "$BAK/active"
+    assert_file_not_exist "$BAK/present"
+    printf '[ControlMapping]\nSelect = 10-196\nSave State = 10-197:10-193\n' >"$CONTROLS"   # the user edits it
+    cp "$CONTROLS" "$T/user.edit"
+    run rb_restore                                  # a second restore (or the next suite's start) does nothing
+    assert_success
+    cmp "$CONTROLS" "$T/user.edit"
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    rb_init
+    rb_backup >/dev/null                            # the edited file is the original of the next run
+    rb_restore >/dev/null
+    cmp "$CONTROLS" "$T/user.edit"
+}
+
+@test "a user edit after a CUT-SHORT run is kept as .replaced.<unique>, the original is restored, the edit is not lost" {
+    unbound_controls
+    rb_backup >/dev/null
+    printf '[ControlMapping]\nSelect = 10-196\nSave State = 10-197:10-193\n' >"$CONTROLS"   # edited by the user
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    rb_init
+    run rb_backup
+    assert_output --partial "neither the backup nor what the tests left"
+    run bash -c "cat '$CONTROLS'.replaced.*"
+    assert_output --partial "Save State = 10-197:10-193"
+    rb_restore >/dev/null
+    cmp "$CONTROLS" "$T/controls.orig"
+}
+
+@test "a normal end of run: PPSSPP's own rewrite of ppsspp.ini is not a foreign change (no .replaced copy), a cut-short one is flagged" {
     seed_files
     rb_backup >/dev/null
     rb_ini_set SaveStateOnExit False
     printf '%s\n' '[General]' 'SaveStateOnExit = Rewritten' >"$INI"   # PPSSPP rewrote it when it exited
     run rb_restore
-    assert_output --partial "WARNING"
+    assert_success
+    refute_output --partial "WARNING"
     assert_same "$INI" "$T/ini.copy"
+    set -- "$INI".replaced.*
+    [ ! -e "$1" ]
+    # cut short: nothing refreshed the snapshot, the rewrite differs from backup and from what the tests left
+    rb_backup >/dev/null
+    rb_ini_set SaveStateOnExit False
+    printf '%s\n' '[General]' 'SaveStateOnExit = Rewritten' >"$INI"
+    run rb_backup
+    assert_output --partial "WARNING"
     run bash -c "grep -l Rewritten '$INI'.replaced.*"
+    assert_success
+}
+
+@test "a backup that cannot be made completely (full SD card) fails before anything was changed" {
+    unbound_controls
+    cp() { command cp "$@" && : >"$2"; } # every copy is truncated
+    run rb_backup
+    assert_failure
+    assert_output --partial "could not back up"
+    unset -f cp
+    cmp "$CONTROLS" "$T/controls.orig"
+    assert_file_not_exist "$BAK/active"
+    refute_grep "$CONTROLS" 'Save State'
+}
+
+@test "psp_restore stops the game BEFORE restoring; a game that is still starting means NOT restored and the backup stays" {
+    unbound_controls
+    rb_backup >/dev/null
+    PSP_STOP_GAME=hook
+    hook() { command cp "$CONTROLS" "$T/seen-at-stop"; }
+    run psp_restore normal
+    assert_success
+    grep -q 'Save State = 10-196:10-192' "$T/seen-at-stop"   # still bound when the game was stopped
+    cmp "$CONTROLS" "$T/controls.orig"                        # restored after
+    # now a game that cannot be stopped (still starting): nothing is restored
+    rb_backup >/dev/null
+    export PSP_STOP_GAME=false
+    run psp_restore normal
+    assert_failure
+    assert_output --partial "not restored"
+    assert_output --partial "$BAK"
+    assert_file_exist "$BAK/active"
+    grep -q 'Save State = 10-196:10-192' "$CONTROLS"
+}
+
+@test "rb_restore after a reboot: waits for the SD card, and fails loudly when there is no backup (RB_EXPECT_BACKUP)" {
+    unbound_controls
+    RB_EXPECT_BACKUP=1 RB_SD_WAIT=1 run rb_restore
+    assert_failure
+    assert_output --partial "no backup found at $BAK"
+    assert_output --partial "NOTHING WAS RESTORED"
+    # the backup shows up while it waits (the SD card gets mounted)
+    rb_backup >/dev/null
+    mv "$BAK" "$T/unmounted"
+    ( sleep 1; mv "$T/unmounted" "$BAK" ) &
+    RB_EXPECT_BACKUP=1 RB_SD_WAIT=5 run rb_restore
+    wait
+    assert_success
+    cmp "$CONTROLS" "$T/controls.orig"
+    # without the expectation a missing backup is fine (nothing to do)
+    run rb_restore
     assert_success
 }
 

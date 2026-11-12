@@ -273,6 +273,7 @@ cfg_init_hotkeys() {
                 fi
                 ;;
             *)
+                # shellcheck disable=SC2089 # text for the log, quotes are literal
                 src="UNUSABLE binding '${r#BAD }'"
                 [ "$need" = 1 ] && cfg_prob "$label ($nm) is bound to '${r#BAD }' in controls.ini, which the test cannot press (it needs buttons of the TRIMUI pad: d-pad, A B X Y, L1 R1, select, start): rebind it in PPSSPP's Controls > Hotkeys or set $var (your binding is never changed by the tests)"
                 ;;
@@ -294,6 +295,10 @@ cfg_init_hotkeys() {
         fi
     done
     unset -f cfg_one cfg_prob cfg_free_chord
+    # Exported: bats tests, and the commands they run, only see exported variables, and an
+    # unset + assignment (cfg_reinit_hotkeys) would otherwise drop the attribute.
+    # shellcheck disable=SC2090 # HOTKEY_INFO is text, quotes in it are literal
+    export SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS HOTKEY_INFO
     return 0
 }
 
@@ -304,31 +309,6 @@ cfg_reinit_hotkeys() {
     for v in $HOTKEY_DERIVED; do unset "$v"; done
     cfg_init_hotkeys "$CFG_CTL" "$CFG_NEEDS"
 }
-
-# cfg_backup_and_bind: the one sequence both test files use: back controls.ini up byte for byte
-# (needs stash from e2e.bash, BAK and the "active" flag set by the caller), then bind the missing
-# hotkeys. A refusal to write (no backup) is an error.
-cfg_backup_and_bind() {
-    stash "$CFG_CTL"
-    cfg_apply_hotkeys
-}
-
-# cfg_restore_foreign <other backup dir>: the OTHER test file (e2e vs reboot, each has its own
-# backup dir) may have been cut short while it had hotkeys bound: put its controls.ini back
-# first, so that a bound file is never taken for the original. No-op without such a leftover.
-cfg_restore_foreign() {
-    local o="$1"
-    [ -f "$o/controls.written" ] && [ -f "$o$CFG_CTL" ] || return 0
-    ${CFG_STOP_GAME:-true} # PPSSPP must not run: it rewrites its files when it exits
-    if [ -f "$CFG_CTL" ] && ! cmp -s "$o/controls.written" "$CFG_CTL"; then
-        cp -p "$CFG_CTL" "$CFG_CTL.replaced.$(cfg_stamp)"
-        echo "WARNING: $CFG_CTL changed since an earlier run bound hotkeys in it; the changed file is kept as $CFG_CTL.replaced.*" >&2
-    fi
-    cp -p "$o$CFG_CTL" "$CFG_CTL" && rm -f "$o/controls.written" "$o/controls.bound"
-    echo "an earlier, cut-short run had bound hotkeys in controls.ini: the original was put back first"
-}
-
-cfg_stamp() { echo "$(date +%Y%m%dT%H%M%S 2>/dev/null)-$$-$RANDOM"; }
 
 # cfg_report_restore <had hotkeys 0|1>: after restore_files, says that controls.ini is restored
 # only if it is byte-identical to the backup; else says where the original is.
@@ -342,8 +322,8 @@ cfg_report_restore() {
 }
 
 # cfg_apply_hotkeys: binds the hotkeys on HOTKEY_TO_BIND in controls.ini. The caller must have
-# backed controls.ini up first (stash, under the "active" flag of $BAK): this writes
-# $BAK/controls.written (the file as the tests left it, to notice later changes) and
+# backed controls.ini up first (psp_backup, which sets the "active" flag of $BAK): this writes
+# $BAK/left (the file as the tests left it, so that a later change is noticed) and
 # $BAK/controls.bound (what was bound, for the log). Prints what it did.
 cfg_apply_hotkeys() {
     local nm codes var chord bound=""
@@ -363,7 +343,7 @@ cfg_apply_hotkeys() {
         bound="$bound$nm = $codes ($chord)
 "
     done <<<"$HOTKEY_TO_BIND"
-    cp -p "$CFG_CTL" "$BAK/controls.written" && printf '%s' "$bound" >"$BAK/controls.bound" || return 1
+    snapshot_left "$CFG_CTL" && printf '%s' "$bound" >"$BAK/controls.bound" || return 1
     sync
     printf 'hotkeys bound by the tests in controls.ini (the original file is restored at the end):\n%s' "$bound"
 }
@@ -409,4 +389,30 @@ e2e_preflight_problems() {
         [ -n "$line" ] && f_ "$line"
     done <<<"${HOTKEY_PROBLEMS:-}"
     return "$bad"
+}
+
+# --- the hotkey setup of e2e.bats ---------------------------------------------------------------
+# e2e_setup_hotkeys: needs CONTROLS. The Exit hotkey is always needed (EXIT_KEYS="" kills PPSSPP
+# instead); Save State and Next Slot only when PSP_KEYS is not given. Sets and exports PSP_KEYS
+# (the default sequence from the hotkeys) and the hotkeys.
+e2e_setup_hotkeys() {
+    PSP_DEFAULT=0
+    [ -z "${PSP_KEYS+x}" ] && PSP_DEFAULT=1
+    cfg_init_hotkeys "$CONTROLS" "exit$([ "$PSP_DEFAULT" = 1 ] && echo ' save next')"
+    e2e_default_keys
+}
+# e2e_reinit_hotkeys: the same after the files were put back (resolve again from the file).
+e2e_reinit_hotkeys() {
+    cfg_reinit_hotkeys
+    e2e_default_keys
+}
+e2e_default_keys() {
+    local bad
+    if [ "$PSP_DEFAULT" = 1 ]; then
+        PSP_KEYS="$SAVE_KEYS sleep3 shot $NEXT_SLOT_KEYS sleep1 shot $SAVE_KEYS sleep3 shot"
+    elif [ -n "$PSP_KEYS" ] && ! bad="$(cfg_keys_valid "$PSP_KEYS")"; then
+        HOTKEY_PROBLEMS="$HOTKEY_PROBLEMS${HOTKEY_PROBLEMS:+
+}PSP_KEYS has a step the test cannot press: '$bad'"
+    fi
+    export PSP_KEYS PSP_DEFAULT
 }

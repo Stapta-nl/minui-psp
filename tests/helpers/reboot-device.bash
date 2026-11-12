@@ -30,7 +30,8 @@ rb_init() {
     SHARED="$SD/.userdata/shared"
     LOGS="$SD/.userdata/$PLATFORM/logs"
     STATE_DIR="$SHARED/PSP-ppsspp"
-    BAK="$SHARED/.psp-reboot-backup" # on the SD card: survives the reboots and a cut-short run
+    BAK="$SHARED/.psp-test-backup" # on the SD card: survives the reboots and a cut-short run; shared with e2e.bats
+    PSP_STOP_GAME=rb_stop_game
     INI="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
     CONTROLS="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini"
     SHOTDIR="$SD/Screenshots"
@@ -155,86 +156,54 @@ rb_preflight() {
 }
 
 # --- backup / restore ------------------------------------------------------------------
-# Like e2e.bats, plus ppsspp.ini. "active" is set first, so an abort at any point is restored
-# by rb_restore (this run) or by the next run.
+# The backup is the one of e2e.bash (psp_backup / psp_restore, shared with e2e.bats): the same
+# files, plus controls.ini (the hotkeys the tests bind), ppsspp.ini and a copy of every save state.
+# "active" is set first, so an abort at any point is restored by rb_restore (this run) or by the
+# next run, of either test file.
 rb_backup() {
-    local f
-    mkdir -p "$BAK" "$MINUI"
-    if [ -f "$BAK/active" ]; then
-        echo "found the backup of an aborted run: restoring those files first"
-        rb_stop_game
-        restore_files
-        rb_restore_states
-        rm -f "$BAK/active"
-    fi
-    # The e2e test's backup may hold hotkeys bound by a cut-short run: put that file back first.
-    CFG_STOP_GAME=rb_stop_game cfg_restore_foreign "$SHARED/.psp-e2e-backup"
-    cfg_reinit_hotkeys # what an aborted run had bound is gone: resolve from the restored file
-    rm -f "$BAK/present" "$BAK/absent" "$BAK/states.before" "$BAK/marker" "$BAK"/evidence-* "$BAK/wrapper.log" "$BAK/trigger.log"
-    : >"$BAK/active"
-    sync
-    for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW" "$INI"; do stash "$f"; done
-    for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && stash "$f"; done
-    mkdir -p "$STATE_DIR"
-    ls -1 "$STATE_DIR" >"$BAK/states.before" 2>/dev/null
-    # The tests save states (a slot of the test game is overwritten), so keep copies of every
-    # existing state file and put them back in rb_restore.
-    rm -rf "$BAK/states"
-    mkdir -p "$BAK/states"
-    for f in "$STATE_DIR"/*; do
-        [ -f "$f" ] || continue
-        cp -p "$f" "$BAK/states/" || return 1
-    done
-    sync
-    # PPSSPP reads controls.ini when it starts: the hotkeys are bound before any game is launched,
-    # and stay in place (the file is on the SD card) until rb_restore at the very end.
+    psp_backup || return 1
+    rm -f "$BAK"/evidence-* "$BAK/wrapper.log" "$BAK/trigger.log"
+    # What a cut-short run had bound is gone again: resolve the hotkeys from the restored file.
+    cfg_reinit_hotkeys
     if [ -n "$HOTKEY_PROBLEMS" ]; then
         echo "$HOTKEY_PROBLEMS" >&2
         return 1
     fi
-    cfg_backup_and_bind # stashes controls.ini byte for byte, then binds
+    # PPSSPP reads controls.ini when it starts: the hotkeys are bound before any game is launched,
+    # and stay in place (the file is on the SD card) until rb_restore at the very end.
+    cfg_apply_hotkeys
 }
 
 # Puts back the state files backed up by rb_backup that were changed or deleted.
-rb_restore_states() {
-    local f n rc=0
-    [ -d "$BAK/states" ] || return 0
-    for f in "$BAK/states"/*; do
-        [ -f "$f" ] || continue
-        n="$STATE_DIR/${f##*/}"
-        cmp -s "$f" "$n" 2>/dev/null || cp -p "$f" "$n" || rc=1
-    done
-    sync
-    return "$rc"
-}
+rb_restore_states() { restore_states; }
 
-# Stops the emulator without saving anything, waits for NextUI to be back.
+# Stops the emulator without saving anything, waits for NextUI to be back (bounded). Fails if a
+# game is still running or starting then.
 rb_game_up() { pgrep PPSSPPSDL >/dev/null 2>&1; }
 rb_kill_game() { killall -9 "PPSSPPSDL_$PLATFORM" 2>/dev/null; }
 
 rb_stop_game() {
-    if rb_game_up; then
-        rb_kill_game
-        wait_for 30 rb_no_game
-        # launch.sh (which writes the slot file and preview after the emulator) is done when
-        # the launcher has started NextUI again.
-        wait_for 90 running nextui.elf
-    fi
+    local rc=0
+    e2e_stop_game || rc=1
     rm -f "$NEXT"
-    return 0
+    return "$rc"
 }
 
-# Puts everything back (also called at the start of a run that finds a backup).
+# Puts everything back. Also used at the end of the run, after a reboot that cut it short: the SD
+# card and NextUI may not be up yet, so with RB_EXPECT_BACKUP=1 (the caller knows a backup was made)
+# it waits (RB_SD_WAIT, 120 s) for the backup and fails loudly instead of returning silently.
 rb_restore() {
-    [ -f "$BAK/active" ] || return 0
     local had_hotkeys=0
+    if [ ! -f "$BAK/active" ]; then
+        [ -n "${RB_EXPECT_BACKUP:-}" ] || return 0
+        wait_for "${RB_SD_WAIT:-120}" test -f "$BAK/active" || {
+            echo "no backup found at $BAK (is the SD card mounted?): NOTHING WAS RESTORED" >&2
+            return 1
+        }
+    fi
     [ -f "$BAK/controls.bound" ] && had_hotkeys=1
-    rb_stop_game
+    psp_restore normal || return 1
     rm -f "$WRAPPER"
-    restore_files
-    rb_restore_states
-    rm -rf "$BAK/states"
-    rm -f "$BAK/active"
     cfg_report_restore "$had_hotkeys"
     kill_ui || true # NextUI starts again with the restored recents and without a marker
     return 0
@@ -264,8 +233,8 @@ rb_ini_set() {
         END { if (g && !done) print key " = " val cr }
     ' "$INI" >"$tmp" && cat "$tmp" >"$INI"
     rm -f "$tmp"
-    # what the tests left, to notice a later change (restore_files keeps a changed file)
-    [ -f "$BAK/active" ] && cp -p "$INI" "$BAK/ini.written" 2>/dev/null
+    # what the tests left, so that a later change is noticed (guard_changed in e2e.bash)
+    [ -f "$BAK/active" ] && snapshot_left "$INI"
     sync
 }
 

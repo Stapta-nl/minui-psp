@@ -383,18 +383,17 @@ bind_run() { # bind_run [needs]
     assert_success
 }
 
-@test "backup: controls.ini is in \$BAK/present BEFORE anything is written, and setup + teardown leave it byte-identical" {
+@test "backup: controls.ini is in $BAK/present BEFORE anything is written, and backup + restore leave it byte-identical" {
     bind_setup
     cp "$REPO_DIR/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini" "$CTL"
     cp "$CTL" "$T/orig"
     cfg_init_hotkeys "$CTL"
-    # the sequence of e2e.bats' setup_file ...
-    run cfg_backup_and_bind
-    assert_success
+    stash "$CTL"
     assert_grep "$BAK/present" "^$CTL\$"
     cmp "$BAK$CTL" "$T/orig"
+    run cfg_apply_hotkeys
+    assert_success
     assert_differ "$CTL" "$T/orig"
-    # ... and its teardown_file
     run restore_files
     assert_success
     cmp "$CTL" "$T/orig"
@@ -411,64 +410,83 @@ bind_run() { # bind_run [needs]
     cmp "$CTL" "$T/orig"
 }
 
-@test "e2e.bats uses the same sequence (backup, then bind) and stops PPSSPP before every restore" {
+@test "e2e.bats uses the shared backup and restore (psp_backup, psp_restore), nothing of its own" {
     local f="$TESTS_DIR/bats/e2e.bats"
-    assert_grep "$f" 'cfg_backup_and_bind'
-    refute_grep "$f" 'cfg_apply_hotkeys'
-    # teardown_file: e2e_stop_game comes before restore_files
-    run awk '/^teardown_file/{t=1} t && /e2e_stop_game/{s=NR} t && /restore_files/{r=NR; exit} END{print (s && s<r) ? "ok" : "bad"}' "$f"
-    assert_output ok
+    assert_grep "$f" 'psp_backup'
+    assert_grep "$f" 'psp_restore normal'
+    refute_grep "$f" '^[^#]*\(cfg_backup_and_bind\|cfg_restore_foreign\|restore_files\)'
+    refute_grep "$f" 'psp-e2e-backup'
 }
 
-@test "e2e_stop_game: SIGKILL, then waits until PPSSPP is gone and NextUI is back" {
+# A fake pgrep/killall: $FB/ppsspp exists while the emulator runs, $FB/nextui_down while NextUI is
+# not up (a game is running or starting); killing the emulator brings NextUI back.
+fake_game_tools() {
     mkdir -p "$T/fb"
     cat >"$T/fb/pgrep" <<'FAKE'
 #!/bin/sh
 case "$1" in
 PPSSPPSDL) [ -e "$FB/ppsspp" ] ;;
-nextui.elf) [ ! -e "$FB/ppsspp" ] ;;
+nextui.elf) [ ! -e "$FB/nextui_down" ] ;;
 esac
 FAKE
     cat >"$T/fb/killall" <<'FAKE'
 #!/bin/sh
-echo "$*" >"$FB/killed"
-rm -f "$FB/ppsspp"
+echo "$*" >>"$FB/killed"
+rm -f "$FB/ppsspp" "$FB/nextui_down"
 FAKE
     chmod +x "$T/fb/pgrep" "$T/fb/killall"
-    : >"$T/fb/ppsspp"
-    PATH="$T/fb:$PATH" FB="$T/fb" PLATFORM=tg5040 run e2e_stop_game
-    assert_success
-    assert_file_exist "$T/fb/killed"
-    run cat "$T/fb/killed"
-    assert_output "-9 PPSSPPSDL_tg5040"
-    rm -f "$T/fb/killed"
-    PATH="$T/fb:$PATH" FB="$T/fb" PLATFORM=tg5040 run e2e_stop_game # nothing runs: nothing is killed
-    assert_file_not_exist "$T/fb/killed"
+    export FB="$T/fb" PLATFORM=tg5040
 }
 
-@test "a cut-short e2e run left a bound file: the other test file puts the original back first and never takes the bound file for the original" {
-    local e2e_bak="$T/e2e-bak" calls="$T/calls"
-    # the e2e run: backup, bind, then cut short (no restore)
-    bind_setup
-    cp "$REPO_DIR/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini" "$CTL"
-    cp "$CTL" "$T/orig"
-    cfg_init_hotkeys "$CTL"
-    cfg_backup_and_bind >/dev/null
-    mv "$BAK" "$e2e_bak"
-    assert_differ "$CTL" "$T/orig"
-    # the reboot kit starts with its own backup dir
-    BAK="$T/reboot-bak"
-    mkdir -p "$BAK"
-    stopped() { echo stopped >"$calls"; }
-    CFG_STOP_GAME=stopped run cfg_restore_foreign "$e2e_bak"
+@test "e2e_stop_game: SIGKILL, then waits until PPSSPP is gone and NextUI is back; nothing running: nothing killed" {
+    fake_game_tools
+    : >"$FB/ppsspp"
+    : >"$FB/nextui_down"
+    PATH="$FB:$PATH" run e2e_stop_game
     assert_success
-    assert_output --partial "original was put back first"
-    cmp "$CTL" "$T/orig"
-    assert_file_exist "$calls" # PPSSPP was stopped first
-    assert_file_not_exist "$e2e_bak/controls.written"
-    # nothing left: a second call does nothing
-    run cfg_restore_foreign "$e2e_bak"
-    assert_output ""
+    run cat "$FB/killed"
+    assert_output "-9 PPSSPPSDL_tg5040"
+    rm -f "$FB/killed"
+    PATH="$FB:$PATH" run e2e_stop_game
+    assert_success
+    assert_file_not_exist "$FB/killed"
+}
+
+@test "e2e_stop_game: a game that is still STARTING (NextUI down, no PPSSPP yet) is waited for and then killed" {
+    fake_game_tools
+    : >"$FB/nextui_down"
+    ( sleep 2; : >"$FB/ppsspp" ) &
+    PATH="$FB:$PATH" run e2e_stop_game
+    assert_success
+    assert_file_exist "$FB/killed"
+    wait
+}
+
+@test "e2e_stop_game: fails (bounded) when NextUI never comes back, so the caller does not restore too early" {
+    fake_game_tools
+    : >"$FB/nextui_down"
+    printf '#!/bin/sh\n:\n' >"$FB/killall"
+    E2E_STOP_TIMEOUT=2 PATH="$FB:$PATH" run e2e_stop_game
+    assert_failure
+    assert_output --partial "still running or starting after 2s"
+}
+
+@test "the hotkeys are EXPORTED after the e2e setup path, also after a re-init, so a test sees them" {
+    ctl 'Exit App = 10-196:10-197' 'Save State = 10-196:10-192' 'Next Slot = 10-196:10-22'
+    local out
+    out="$(CONTROLS="$CTL" bash -c ". '$TESTS_DIR/helpers/e2e.bash'; . '$TESTS_DIR/helpers/devconfig.bash'; unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS PSP_KEYS
+        e2e_setup_hotkeys; e2e_reinit_hotkeys
+        bash -c 'printf \"%s|%s|%s|%s\" \"\$EXIT_KEYS\" \"\$SAVE_KEYS\" \"\$PSP_KEYS\" \"\${HOTKEY_INFO:+info}\"'")"
+    [ "$out" = "select+start|select+r1|select+r1 sleep3 shot select+right sleep1 shot select+r1 sleep3 shot|info" ]
+}
+
+@test "e2e: with the Exit hotkey exported, the E2 exit test takes the hotkey path, not the kill path" {
+    ctl 'Exit App = 10-196:10-197'
+    local out
+    out="$(CONTROLS="$CTL" PSP_KEYS="" bash -c ". '$TESTS_DIR/helpers/e2e.bash'; . '$TESTS_DIR/helpers/devconfig.bash'; unset EXIT_KEYS
+        e2e_setup_hotkeys; e2e_reinit_hotkeys
+        bash -c '[ -n \"\$EXIT_KEYS\" ] && echo hotkey || echo kill'")"
+    [ "$out" = hotkey ]
 }
 
 @test "the restored message is only printed when the file really is the original" {
@@ -476,7 +494,8 @@ FAKE
     ctl 'Select = 10-196'
     cp "$CTL" "$T/orig"
     cfg_init_hotkeys "$CTL" save
-    cfg_backup_and_bind >/dev/null
+    stash "$CTL"
+    cfg_apply_hotkeys >/dev/null
     CFG_CTL="$CTL" run cfg_report_restore 1
     assert_output --partial "WARNING: controls.ini could NOT be restored"
     restore_files
@@ -486,27 +505,38 @@ FAKE
     assert_output ""
 }
 
-@test "restore_files: every changed-meanwhile copy gets its own name; ppsspp.ini has the same guard" {
+@test "stash: a copy that is not identical (full SD card) is an error and is not recorded" {
+    bind_setup
+    ctl 'Select = 10-196'
+    cp() { command cp "$@" && : >"$2"; } # a truncated copy
+    run stash "$CTL"
+    assert_failure
+    assert_output --partial "could not back up"
+    run grep -c . "$BAK/present"
+    refute_output "1"
+}
+
+@test "guard: a settings file that is neither the backup nor what the tests left is kept under a unique name; the usual cases are silent" {
     bind_setup
     export INI="$T/ppsspp.ini"
-    printf '[General]\nA = 1\n' >"$INI"
     ctl 'Select = 10-196'
+    printf '[General]\nA = 1\n' >"$INI"
     stash "$INI"
-    cfg_init_hotkeys "$CTL" save
-    cfg_backup_and_bind >/dev/null
-    cp -p "$INI" "$BAK/ini.written"
-    printf '[General]\nA = 2\n' >"$INI"          # rewritten (by PPSSPP, or by the user)
-    printf '[ControlMapping]\nX = 1\n' >"$CTL"
+    stash "$CTL"
+    # what the tests left
+    printf '[General]\nA = 2\n' >"$INI"
+    snapshot_left "$INI"
     run restore_files
-    assert_output --partial "WARNING: $INI changed"
-    assert_output --partial "WARNING: $CTL changed"
-    run bash -c "cat '$INI'.replaced.*"
-    assert_output --partial "A = 2"
-    # a second run in the same second does not overwrite the first copy
-    : >"$BAK/active"
-    stash "$INI"
+    assert_output ""                                    # backup / left: no copy, no noise
+    cmp "$INI" "$BAK$INI"
+    # a user edit in between (neither the backup nor what the tests left)
     printf '[General]\nA = 3\n' >"$INI"
-    cp -p "$INI" "$BAK/ini.written"
+    run restore_files
+    assert_output --partial "WARNING: $INI is neither the backup nor what the tests left"
+    cmp "$INI" "$BAK$INI"
+    run bash -c "cat '$INI'.replaced.*"
+    assert_output --partial "A = 3"
+    # a second one in the same second keeps its own name
     printf '[General]\nA = 4\n' >"$INI"
     restore_files 2>/dev/null
     set -- "$INI".replaced.*

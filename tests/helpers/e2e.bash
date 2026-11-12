@@ -12,27 +12,52 @@
 kill_ui() { killall -9 nextui.elf 2>/dev/null; }
 
 # --- back up everything the test touches, restore on exit ---------------------------------
-# The backup lives on the SD card. If a run is cut short (power loss, SIGKILL), the next run
-# first puts the files back from it.
-restore_files() {
-    local f
-    rm -f /tmp/next
-    # controls.ini (hotkeys bound by the tests, devconfig.bash) and ppsspp.ini (written by the
-    # tests and rewritten by PPSSPP): if one is not what the tests left, its current content is
-    # kept next to it under a unique name before the original is put back, so nothing is lost.
-    local w t
-    for w in controls ini; do
-        [ -f "$BAK/$w.written" ] || continue
-        if [ "$w" = controls ]; then t="${CONTROLS:-}"; else t="${INI:-}"; fi
-        if [ -n "$t" ] && [ -f "$t" ] && ! cmp -s "$BAK/$w.written" "$t"; then
-            cp -p "$t" "$t.replaced.$(date +%Y%m%dT%H%M%S 2>/dev/null)-$$-$RANDOM"
-            echo "WARNING: $t changed during the run; the original is restored, the changed file is kept as $t.replaced.*" >&2
+# ONE backup directory ($BAK, on the SD card) and ONE "active" flag are shared by e2e.bats and
+# reboot.bats: a run that finds an active backup, whichever test made it, restores it first and
+# then starts clean. psp_backup / psp_restore below are used by both.
+
+cfg_stamp() { echo "$(date +%Y%m%dT%H%M%S 2>/dev/null)-$$-$RANDOM"; }
+
+# stash <file>: copies it into $BAK byte for byte and records it as present (or as absent).
+# Fails, recording nothing, when the copy is not identical (full SD card).
+stash() {
+    if [ -e "$1" ]; then
+        if ! { mkdir -p "$BAK$(dirname "$1")" && cp -p "$1" "$BAK$1" && cmp -s "$1" "$BAK$1"; }; then
+            echo "could not back up $1 into $BAK (SD card full?)" >&2
+            return 1
         fi
-        rm -f "$BAK/$w.written" "$BAK/$w.bound"
-    done
+        echo "$1" >>"$BAK/present"
+    else
+        echo "$1" >>"$BAK/absent"
+    fi
+}
+
+# snapshot_left <file>: what the tests (or PPSSPP, after it stopped) left in a settings file.
+snapshot_left() {
+    mkdir -p "$BAK/left$(dirname "$1")" && cp -p "$1" "$BAK/left$1"
+}
+
+# guard_changed <file>: a settings file (controls.ini, ppsspp.ini) is only put back over what is
+# there when that is the backup or what the tests left; anything else (the user edited it, an
+# earlier run was cut short half way through) is kept next to it as <file>.replaced.<unique>.
+guard_changed() {
+    local f="$1"
+    [ -f "$f" ] && grep -qxF -- "$f" "$BAK/present" 2>/dev/null || return 0
+    cmp -s "$f" "$BAK$f" && return 0
+    [ -f "$BAK/left$f" ] && cmp -s "$f" "$BAK/left$f" && return 0
+    cp -p "$f" "$f.replaced.$(cfg_stamp)"
+    echo "WARNING: $f is neither the backup nor what the tests left; the original is restored, the file as it was is kept as $f.replaced.*" >&2
+}
+
+restore_files() {
+    local f rc=0
+    rm -f /tmp/next
+    [ -n "${CONTROLS:-}" ] && guard_changed "$CONTROLS"
+    [ -n "${INI:-}" ] && guard_changed "$INI"
     if [ -f "$BAK/present" ]; then
         while IFS= read -r f; do
-            [ -n "$f" ] && cp -p "$BAK$f" "$f"
+            [ -n "$f" ] || continue
+            cp -p "$BAK$f" "$f" || { echo "could not restore $f from $BAK$f" >&2; rc=1; }
         done <"$BAK/present"
     fi
     if [ -f "$BAK/absent" ]; then
@@ -53,27 +78,111 @@ restore_files() {
         done
     fi
     sync
-    return 0
+    return "$rc"
 }
 
-stash() {
-    if [ -e "$1" ]; then
-        mkdir -p "$BAK$(dirname "$1")"
-        cp -p "$1" "$BAK$1"
-        echo "$1" >>"$BAK/present"
-    else
-        echo "$1" >>"$BAK/absent"
-    fi
+# Copies every save state file (a test overwrites a slot) into $BAK/states, checked.
+backup_states() {
+    local f
+    mkdir -p "$STATE_DIR"
+    ls -1 "$STATE_DIR" >"$BAK/states.before" 2>/dev/null
+    rm -rf "$BAK/states"
+    mkdir -p "$BAK/states" || return 1
+    for f in "$STATE_DIR"/*; do
+        [ -f "$f" ] || continue
+        if ! { cp -p "$f" "$BAK/states/" && cmp -s "$f" "$BAK/states/${f##*/}"; }; then
+            echo "could not back up $f (SD card full?)" >&2
+            return 1
+        fi
+    done
+    sync
+}
+# Puts back the state files that were changed or deleted.
+restore_states() {
+    local f n rc=0
+    [ -d "$BAK/states" ] || return 0
+    for f in "$BAK/states"/*; do
+        [ -f "$f" ] || continue
+        n="$STATE_DIR/${f##*/}"
+        cmp -s "$f" "$n" 2>/dev/null || cp -p "$f" "$n" || rc=1
+    done
+    sync
+    return "$rc"
 }
 
-# Stops PPSSPP for good (SIGKILL, nothing is saved) and waits until it is gone and NextUI is back:
-# PPSSPP rewrites its ini files when it exits, which must not happen after they are restored.
+# Stops PPSSPP for good and waits (bounded: E2E_STOP_TIMEOUT, 90 s) until nothing of a game is
+# left: PPSSPP is killed (SIGKILL, nothing is saved) whenever it shows up, and a game that is
+# still starting or that launch.sh is still wrapping up counts as running because NextUI is only
+# back once launch.sh has finished. PPSSPP rewrites its ini files when it exits, which must not
+# happen after they are restored. Fails when it cannot get there.
 e2e_stop_game() {
-    if pgrep PPSSPPSDL >/dev/null 2>&1; then
-        killall -9 "PPSSPPSDL_${PLATFORM:-}" 2>/dev/null
-        wait_for 30 not_running PPSSPPSDL
-        wait_for 90 running nextui.elf # launch.sh has finished when the launcher starts NextUI again
+    local n=0 limit="${E2E_STOP_TIMEOUT:-90}"
+    while :; do
+        if pgrep PPSSPPSDL >/dev/null 2>&1; then
+            killall -9 "PPSSPPSDL_${PLATFORM:-}" 2>/dev/null
+        elif pgrep nextui.elf >/dev/null 2>&1; then
+            return 0
+        fi
+        if [ "$n" -ge "$limit" ]; then
+            echo "a game was still running or starting after ${limit}s (NextUI is not back)" >&2
+            return 1
+        fi
+        sleep 1
+        n=$((n + 1))
+    done
+}
+
+# psp_backup: the backup of everything the tests touch (needs RECENT PERSIST AUTORESUME SLOT_FILE
+# PREVIEW INI CONTROLS MINUI ROM_FILE STATE_DIR BAK). A leftover active backup, from whichever
+# test, is restored first. "active" is set before anything is copied, so an abort at any point is
+# restored by the next run; a backup that cannot be made completely leaves nothing behind and
+# fails before anything was changed.
+psp_backup() {
+    local f
+    mkdir -p "$BAK" "$MINUI" || return 1
+    if [ -f "$BAK/active" ]; then
+        echo "found the backup of an aborted run: restoring those files first"
+        psp_restore recover || return 1
     fi
+    rm -rf "$BAK/left" "$BAK/states"
+    rm -f "$BAK/present" "$BAK/absent" "$BAK/states.before" "$BAK/marker" "$BAK/controls.bound"
+    : >"$BAK/active"
+    sync
+    for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW" "$INI" "$CONTROLS"; do
+        stash "$f" || { rm -f "$BAK/active" "$BAK/present" "$BAK/absent"; return 1; }
+    done
+    for f in "$MINUI/$ROM_FILE".*.bmp; do # previews of other slots
+        [ -f "$f" ] || continue
+        stash "$f" || { rm -f "$BAK/active" "$BAK/present" "$BAK/absent"; return 1; }
+    done
+    backup_states || { rm -f "$BAK/active" "$BAK/present" "$BAK/absent"; return 1; }
+    sync
+}
+
+# psp_restore normal|recover: stops the game, then puts everything back. "normal" (the end of a
+# run) first notes what PPSSPP left in the settings files after it stopped, so its own rewrite is
+# not taken for a foreign change; "recover" (a cut-short run) keeps anything unexpected. On a
+# failure the backup stays (active) so that the next run tries again, and says where it is.
+psp_restore() {
+    local f rc=0
+    ${PSP_STOP_GAME:-e2e_stop_game} || {
+        echo "WARNING: not restored (a game is still running); the backup stays in $BAK and is restored by the next run" >&2
+        return 1
+    }
+    if [ "$1" = normal ]; then
+        for f in "${CONTROLS:-}" "${INI:-}"; do
+            [ -n "$f" ] && [ -f "$f" ] && snapshot_left "$f"
+        done
+    fi
+    restore_files || rc=1
+    restore_states || rc=1
+    if [ "$rc" != 0 ]; then
+        echo "WARNING: some files could not be restored; the backup stays in $BAK and is restored by the next run" >&2
+        return 1
+    fi
+    # nothing may point at the stash any more: a later run must not copy it over the file again
+    rm -f "$BAK/present" "$BAK/absent" "$BAK/active"
+    rm -rf "$BAK/states" "$BAK/left"
     return 0
 }
 
