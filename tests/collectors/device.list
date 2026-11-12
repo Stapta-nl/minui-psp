@@ -9,8 +9,8 @@ nextui-version.txt | cat "$SD/.system/version.txt"
 required-tools.txt | for t in bash tar gzip mktemp awk sort uniq cut nl pgrep killall; do printf '%s: ' "$t"; command -v "$t" || echo MISSING; done
 df.txt | df -h
 pak.json | cat "$SD/Emus/$PLATFORM/${PAK_NAME:-PSP}.pak/pak.json"
-ppsspp.ini | cat "$SD/Emus/$PLATFORM/${PAK_NAME:-PSP}.pak/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
+ppsspp.ini | sed -E 's/^([^=]*([Tt][Oo][Kk][Ee][Nn]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Uu][Ss][Ee][Rr][Nn][Aa][Mm][Ee])[^=]*=).*/\1<hidden>/' "$SD/Emus/$PLATFORM/${PAK_NAME:-PSP}.pak/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
 PSP.txt | cat "$SD/.userdata/$PLATFORM/logs/PSP.txt"
 controls.ini | cat "$SD/Emus/$PLATFORM/${PAK_NAME:-PSP}.pak/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini"
-minuisettings.txt | cat "$SD/.userdata/shared/minuisettings.txt"
+minuisettings.txt | sed -E 's/^([^=]*([Tt][Oo][Kk][Ee][Nn]|[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Uu][Ss][Ee][Rr]|[Aa][Uu][Tt][Hh])[^=]*=).*/\1<hidden>/' "$SD/.userdata/shared/minuisettings.txt"
 minui-state.txt | ls -l "$SD/.userdata/shared/.minui"; echo; cat "$SD/.userdata/shared/.minui/game_switcher.txt" 2>&1

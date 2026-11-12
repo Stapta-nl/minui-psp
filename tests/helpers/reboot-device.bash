@@ -40,7 +40,7 @@ rb_init() {
     UI_WAIT="${UI_WAIT:-6}"
     [ -n "${EXIT_KEYS:-}" ] || unset EXIT_KEYS # empty = not set here (there is no kill mode)
     # The hotkeys of the DEVICE (controls.ini), the documented defaults where unset: devconfig.bash
-    cfg_init_hotkeys "$CONTROLS"
+    cfg_init_hotkeys "$CONTROLS" "save exit" # Next Slot is never pressed here
     mkdir -p "$OUT" 2>/dev/null
 
     if [ -z "${ROM_DIR:-}" ]; then

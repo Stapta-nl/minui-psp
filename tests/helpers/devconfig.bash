@@ -6,139 +6,168 @@
 # key checks, btn_set from e2e.bash. Nothing here changes anything on the device.
 #
 # Hotkeys: PPSSPP keeps its hotkey bindings in controls.ini, next to ppsspp.ini, in the
-# [ControlMapping] section: "SaveState = 10-196:10-192" is a chord (":") of two pad
-# buttons ("10" is the pad, the number is PPSSPP's key code); "," separates alternatives.
-# The same section maps PSP buttons to the same codes ("Select = 10-196", "R = 10-192"), so a
-# code is turned back into a button of the TRIMUI pad through that mapping. A hotkey that is
-# not in the file is unset: the documented default is used (and said so).
+# [ControlMapping] section, under the names PPSSPP writes ("Save State", "Next Slot",
+# "Exit App"; keys are matched without regard to case, the first line wins, like PPSSPP's
+# IniFile). "Save State = 10-196:10-192" is a chord (":") of two buttons; "," separates
+# alternatives; "10" is the pad device and the number is PPSSPP's key code. PPSSPP has NO
+# default binding for these hotkeys: a hotkey that is not in the file does not exist, so it
+# is a problem to report (or to override with SAVE_KEYS, NEXT_SLOT_KEYS, EXIT_KEYS).
+# The key codes of the pad are fixed (SDL game controller -> PPSSPP key codes, the same on
+# every device, whatever the user mapped the PSP buttons to), so a code is turned into the
+# button of the TRIMUI pad that the test can press through this table only.
 
-CFG_DEFAULT_SAVE_KEYS="select+r1"
-CFG_DEFAULT_NEXT_SLOT_KEYS="select+right"
-CFG_DEFAULT_EXIT_KEYS="select+start"
-
-# cfg_hotkey_lookup <controls.ini> <alias>[,<alias>...]: looks the hotkey up (names compared
-# without case, spaces, "_" and "-", so "Save State" = "SaveState") and prints one line:
-#   UNSET                 the hotkey (or the file) is not there
-#   OK <chord>            e.g. "OK select+r1" (the first alternative that can be pressed)
-#   BAD <value>           it is bound, but to nothing the test can press (keyboard, an
-#                         unmapped code, an axis, ...)
-cfg_hotkey_lookup() {
-    [ -f "$1" ] || { echo UNSET; return 0; }
-    awk -v aliases="$2" '
-        function norm(s) { s = tolower(s); gsub(/[ _\-]/, "", s); return s }
-        BEGIN {
-            n = split(aliases, a, ","); for (i = 1; i <= n; i++) want[norm(a[i])] = 1
-            pad["Up"] = "up"; pad["Down"] = "down"; pad["Left"] = "left"; pad["Right"] = "right"
-            pad["Circle"] = "a"; pad["Cross"] = "b"; pad["Square"] = "y"; pad["Triangle"] = "x"
-            pad["Start"] = "start"; pad["Select"] = "select"; pad["L"] = "l1"; pad["R"] = "r1"
-        }
-        { sub(/^\357\273\277/, ""); sub(/\r$/, "") }
-        /^[ \t]*\[/ { sec = ($0 ~ /^[ \t]*\[ControlMapping\]/); next }
-        !sec || $0 !~ /=/ { next }
-        {
-            k = $0; sub(/[ \t]*=.*/, "", k); sub(/^[ \t]*/, "", k)
-            v = $0; sub(/^[^=]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v)
-            if (k in pad) {
-                m = split(v, alt, ",")
-                for (i = 1; i <= m; i++) if (alt[i] ~ /^10-[0-9]+$/ && !(alt[i] in code)) code[alt[i]] = pad[k]
-            } else if (norm(k) in want) { hot = v; found = 1 }
-        }
-        END {
-            if (!found) { print "UNSET"; exit }
-            m = split(hot, alt, ",")
-            for (i = 1; i <= m; i++) {
-                c = split(alt[i], tok, ":"); chord = ""; ok = (c > 0)
-                for (j = 1; j <= c; j++) {
-                    if (!(tok[j] in code)) { ok = 0; break }
-                    chord = chord (j > 1 ? "+" : "") code[tok[j]]
-                }
-                if (ok) { print "OK " chord; exit }
-            }
-            print "BAD " hot
-        }' "$1"
-}
-
-# cfg_hotkey <controls.ini> <aliases> <default>: prints the chord to press (the default when
-# the hotkey is unset). Returns 1 and prints nothing when it is bound to something unpressable.
-cfg_hotkey() {
-    local r
-    r="$(cfg_hotkey_lookup "$1" "$2")"
-    case "$r" in
-    "OK "*) printf '%s' "${r#OK }" ;;
-    UNSET) printf '%s' "$3" ;;
+# cfg_code_button <code>: the pad button for a PPSSPP key code of device 10 ("10-196").
+cfg_code_button() {
+    case "$1" in
+    10-19) echo up ;;
+    10-20) echo down ;;
+    10-21) echo left ;;
+    10-22) echo right ;;
+    10-189) echo b ;;
+    10-190) echo a ;;
+    10-191) echo y ;;
+    10-188) echo x ;;
+    10-193) echo l1 ;;
+    10-192) echo r1 ;;
+    10-196) echo select ;;
+    10-197) echo start ;;
     *) return 1 ;;
     esac
+}
+
+# cfg_hotkey_lookup <controls.ini> <name>: prints one line:
+#   NOFILE | NOSECTION    the file or its [ControlMapping] section is not there
+#   UNSET                 the hotkey is not in the section, or has an empty value
+#   OK <chord>            e.g. "OK select+r1" (the first alternative that can be pressed)
+#   BAD <value>           bound, but to nothing the test can press (keyboard, another pad,
+#                         an axis, a button the pad injection does not have, ...)
+cfg_hotkey_lookup() {
+    local raw alt tok chord ok btn
+    [ -f "$1" ] || { echo NOFILE; return 0; }
+    raw="$(awk -v want="$2" '
+        { sub(/^\357\273\277/, ""); sub(/\r$/, "") }
+        /^[ \t]*\[/ { sec = ($0 ~ /^[ \t]*\[ControlMapping\][ \t]*$/); if (sec) seen = 1; next }
+        sec && /=/ && !done {
+            k = $0; sub(/[ \t]*=.*/, "", k); sub(/^[ \t]*/, "", k)
+            if (tolower(k) == tolower(want)) {
+                v = $0; sub(/^[^=]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v)
+                print "V" v; done = 1
+            }
+        }
+        END { if (!done) print (seen ? "UNSET" : "NOSECTION") }
+    ' "$1")"
+    case "$raw" in
+    V) echo UNSET; return 0 ;;
+    V*) raw="${raw#V}" ;;
+    *) echo "$raw"; return 0 ;;
+    esac
+    while IFS= read -r alt; do
+        chord="" ok=1
+        for tok in $(printf '%s' "$alt" | tr ':' ' '); do
+            btn="$(cfg_code_button "$tok")" || { ok=0; break; }
+            chord="$chord${chord:+ +}$btn"
+        done
+        if [ "$ok" = 1 ] && [ -n "$chord" ]; then
+            echo "OK $(printf '%s' "$chord" | tr -d ' ')"
+            return 0
+        fi
+    done < <(printf '%s\n' "$raw" | tr ',' '\n')
+    echo "BAD $raw"
 }
 
 # cfg_keys_valid <steps>: every step is a button/chord that btn_set knows, sleepN or shot.
 # Prints the first bad step.
 cfg_keys_valid() {
     local step k
+    set -f
     for step in $1; do
         case "$step" in
         shot) continue ;;
         sleep*)
-            case "${step#sleep}" in "" | *[!0-9.]*) echo "$step"; return 1 ;; esac
+            case "${step#sleep}" in "" | *[!0-9.]*) echo "$step"; set +f; return 1 ;; esac
             continue
             ;;
         esac
         for k in $(printf '%s' "$step" | tr '+' ' '); do
-            btn_set "$k" 2>/dev/null || { echo "$step"; return 1; }
+            btn_set "$k" 2>/dev/null || { echo "$step"; set +f; return 1; }
         done
     done
+    set +f
     return 0
 }
 
-# cfg_init_hotkeys <controls.ini>: sets SAVE_KEYS, NEXT_SLOT_KEYS and EXIT_KEYS. A value that
-# is already set (the environment: SAVE_KEYS, NEXT_SLOT_KEYS, EXIT_KEYS) wins, EXIT_KEYS=""
-# meaning "kill PPSSPP instead" in the on-device test, which then keeps it. Otherwise the value
-# is read from controls.ini, else the documented default. HOTKEY_INFO says where each came from;
-# HOTKEY_PROBLEMS (newline separated) lists what cannot be pressed.
+# cfg_init_hotkeys <controls.ini> [needs]: sets SAVE_KEYS, NEXT_SLOT_KEYS and EXIT_KEYS, for
+# the consumer that needs the hotkeys named in "needs" (words of: save next exit; default all).
+# A value already set in the environment wins (it is validated); EXIT_KEYS="" is kill mode and
+# stays. Otherwise the value comes from controls.ini; a hotkey that is not bound there is a
+# problem (no default is assumed: PPSSPP has none). HOTKEY_INFO says where each value came
+# from; HOTKEY_PROBLEMS (newline separated) lists what stops the test, only for hotkeys in
+# "needs". Hotkeys that are not needed are still resolved when they can be (for the log).
 cfg_init_hotkeys() {
-    local ctl="$1" r val bad
+    local ctl="$1" needs="${2:-save next exit}" r val bad
     HOTKEY_INFO="" HOTKEY_PROBLEMS=""
-    cfg_one() { # cfg_one <var> <label> <aliases> <default> <env set?>
-        local var="$1" label="$2" val src
+    cfg_prob() { HOTKEY_PROBLEMS="$HOTKEY_PROBLEMS${HOTKEY_PROBLEMS:+
+}$*"; }
+    cfg_one() { # cfg_one <var> <need word> <label> <ppsspp name> <env set?>
+        local var="$1" label="$3" nm="$4" v src need=0
+        case " $needs " in *" $2 "*) need=1 ;; esac
         if [ "$5" = 1 ]; then
-            eval "val=\${$var}"
+            eval "v=\${$var}"
             src="set by the environment"
+            if [ -z "$v" ] && [ "$var" != EXIT_KEYS ] && [ "$need" = 1 ]; then
+                cfg_prob "$var is empty: give a button chord (e.g. select+r1) or unset it to read the $label from controls.ini"
+            fi
         else
-            r="$(cfg_hotkey_lookup "$ctl" "$3")"
+            r="$(cfg_hotkey_lookup "$ctl" "$nm")"
+            v="" src=""
             case "$r" in
-            "OK "*) val="${r#OK }" src="from controls.ini" ;;
-            UNSET) val="$4" src="not set in controls.ini, assuming the default" ;;
+            "OK "*) v="${r#OK }" src="from $ctl" ;;
+            NOFILE)
+                src="$ctl not found"
+                [ "$need" = 1 ] && cfg_prob "$ctl not found: start a game once so PPSSPP writes it, or set $var"
+                ;;
+            NOSECTION)
+                src="no [ControlMapping] section in $ctl"
+                [ "$need" = 1 ] && cfg_prob "$ctl has no [ControlMapping] section, so $label is not bound: PPSSPP has no default - bind it in PPSSPP's Controls > Hotkeys or set $var"
+                ;;
+            UNSET)
+                src="not bound in $ctl"
+                [ "$need" = 1 ] && cfg_prob "$label ($nm) is not bound in controls.ini; PPSSPP has no default - bind it in PPSSPP's Controls > Hotkeys or set $var"
+                ;;
             *)
-                val="$4" src="UNUSABLE"
-                HOTKEY_PROBLEMS="$HOTKEY_PROBLEMS${HOTKEY_PROBLEMS:+
-}$label is bound to '${r#BAD }' in controls.ini, which the test cannot press: bind it to pad buttons (e.g. $4) or set $var"
+                src="UNUSABLE binding '${r#BAD }'"
+                [ "$need" = 1 ] && cfg_prob "$label ($nm) is bound to '${r#BAD }' in controls.ini, which the test cannot press (it needs buttons of the TRIMUI pad: d-pad, A B X Y, L1 R1, select, start): rebind it in PPSSPP's Controls > Hotkeys or set $var"
                 ;;
             esac
         fi
-        eval "$var=\$val"
-        HOTKEY_INFO="$HOTKEY_INFO$label: $val ($src)
+        eval "$var=\$v"
+        HOTKEY_INFO="$HOTKEY_INFO$label: ${v:-(none)} ($src)
 "
     }
-    cfg_one SAVE_KEYS "Save State hotkey" "SaveState" "$CFG_DEFAULT_SAVE_KEYS" "$([ -n "${SAVE_KEYS+x}" ] && echo 1 || echo 0)"
-    cfg_one NEXT_SLOT_KEYS "Next Slot hotkey" "NextSlot" "$CFG_DEFAULT_NEXT_SLOT_KEYS" "$([ -n "${NEXT_SLOT_KEYS+x}" ] && echo 1 || echo 0)"
-    cfg_one EXIT_KEYS "Exit hotkey" "ExitApp,Exit" "$CFG_DEFAULT_EXIT_KEYS" "$([ -n "${EXIT_KEYS+x}" ] && echo 1 || echo 0)"
-    for r in SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS; do
-        eval "val=\${$r}"
+    cfg_one SAVE_KEYS save "Save State hotkey" "Save State" "$([ -n "${SAVE_KEYS+x}" ] && echo 1 || echo 0)"
+    cfg_one NEXT_SLOT_KEYS next "Next Slot hotkey" "Next Slot" "$([ -n "${NEXT_SLOT_KEYS+x}" ] && echo 1 || echo 0)"
+    cfg_one EXIT_KEYS exit "Exit hotkey" "Exit App" "$([ -n "${EXIT_KEYS+x}" ] && echo 1 || echo 0)"
+    for r in SAVE_KEYS:save NEXT_SLOT_KEYS:next EXIT_KEYS:exit; do
+        eval "val=\${${r%%:*}}"
+        case " $needs " in *" ${r##*:} "*) ;; *) continue ;; esac
         [ -n "$val" ] || continue
         if ! bad="$(cfg_keys_valid "$val")"; then
-            HOTKEY_PROBLEMS="$HOTKEY_PROBLEMS${HOTKEY_PROBLEMS:+
-}$r='$val' has a step the test cannot press: '$bad' (buttons: up down left right a b x y l1 r1 select start)"
+            cfg_prob "${r%%:*}='$val' has a step the test cannot press: '$bad' (buttons: up down left right a b x y l1 r1 select start)"
         fi
     done
-    unset -f cfg_one
+    unset -f cfg_one cfg_prob
     return 0
 }
 
 # NextUI's start-up screen setting. The tests do not depend on it (every check of the Game
 # Switcher goes through open_switcher, the rest looks at processes and files), so this only
-# reports the lines of minuisettings.txt that look like a start screen setting, for the log.
+# reports key=value lines of minuisettings.txt that look like a start screen setting, for the
+# log. Only those keys are printed, never the rest of the file (it holds RetroAchievements
+# credentials).
 cfg_start_mode_info() { # cfg_start_mode_info <minuisettings.txt>
     local lines
-    lines="$(grep -i -E 'view|startup|start_in|switcher|boot' "$1" 2>/dev/null | tr '\n' ' ')"
+    lines="$(grep -i -E '^[A-Za-z_]*(view|startup|boot|switcher)[A-Za-z_]*=' "$1" 2>/dev/null |
+        grep -v -i -E 'token|password|user|auth' | tr -d '\r' | tr '\n' ' ')"
     printf '%s' "${lines:-no start screen setting found in $1 (NextUI default)}"
 }
 

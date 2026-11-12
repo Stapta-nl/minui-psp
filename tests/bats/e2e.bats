@@ -27,8 +27,8 @@
 #              (select+r1) | sleep<sec> | shot
 #              Default: save, next slot, save, using the hotkeys of the DEVICE: the Save State,
 #              Next Slot and Exit App bindings are read from the pak's controls.ini (see
-#              tests/helpers/devconfig.bash) and the documented defaults select+r1,
-#              select+right and select+start are used only for a hotkey that is not set there.
+#              tests/helpers/devconfig.bash). PPSSPP has no default for them: a hotkey that is
+#              not bound there is reported by the preflight (bind it, or set the variables).
 #              PSP_KEYS="" skips saving: then there must be no preview (NextUI shows No Preview).
 #   SAVE_KEYS, NEXT_SLOT_KEYS  override the two hotkeys above (same step syntax, one chord).
 #   EXIT_KEYS  how the emulator is quit (default: the Exit App hotkey; "" kills PPSSPP instead).
@@ -63,8 +63,9 @@ setup_file() {
     PAD="$(awk '/^N: Name="TRIMUI Player1"/{f=1} f&&/^H: Handlers=/{for(i=1;i<=NF;i++) if($i ~ /^event/){print "/dev/input/" $i; exit}}' /proc/bus/input/devices)"
     INI="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
     CONTROLS="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini"
-    cfg_init_hotkeys "$CONTROLS"
-    # (EXIT_KEYS may be "" on purpose: kill PPSSPP instead)
+    # The Exit hotkey is always needed (EXIT_KEYS="" kills PPSSPP instead); Save State and
+    # Next Slot only when PSP_KEYS is not given.
+    cfg_init_hotkeys "$CONTROLS" "exit$([ -z "${PSP_KEYS+x}" ] && echo ' save next')"
     if [ -z "${PSP_KEYS+x}" ]; then
         PSP_KEYS="$SAVE_KEYS sleep3 shot $NEXT_SLOT_KEYS sleep1 shot $SAVE_KEYS sleep3 shot"
     elif [ -n "$PSP_KEYS" ] && ! bad="$(cfg_keys_valid "$PSP_KEYS")"; then
@@ -235,7 +236,8 @@ teardown_file() {
     sleep "$UI_WAIT"
     ls -l --full-time "$STATE_DIR" >"$OUT/e2-states.txt" 2>/dev/null || ls -l "$STATE_DIR" >"$OUT/e2-states.txt" 2>&1
     cp "$LOGS/PSP.txt" "$OUT/e2-PSP.log" 2>/dev/null
-    [ "$exit_ok" = 1 ] || fail "PPSSPP did not exit on the Exit hotkey ($EXIT_KEYS, read from $CONTROLS) and had to be killed. Check the Exit App binding in PPSSPP (or set EXIT_KEYS)"
+    [ "$exit_ok" = 1 ] || fail "PPSSPP did not exit on the Exit hotkey ($EXIT_KEYS) and had to be killed. Hotkeys used:
+$HOTKEY_INFO Check the Exit App binding in PPSSPP's Controls > Hotkeys (or set EXIT_KEYS)"
 }
 
 @test "E2 no save state: no slot file, no preview image" {
@@ -258,7 +260,8 @@ teardown_file() {
     local n
     n="$(new_state_thumbs | wc -l)"
     info "new states: $n"
-    [ "$n" -ge 2 ] || fail "$n new state(s), expected 2: PPSSPP did not react to the Save State hotkey ($SAVE_KEYS) and Next Slot hotkey ($NEXT_SLOT_KEYS), which were read from $CONTROLS. Check the bindings in PPSSPP (or set SAVE_KEYS/NEXT_SLOT_KEYS)"
+    [ "$n" -ge 2 ] || fail "$n new state(s), expected 2: PPSSPP did not react to the keys that were pressed. Hotkeys used:
+$HOTKEY_INFO Check the bindings in PPSSPP's Controls > Hotkeys (or set SAVE_KEYS/NEXT_SLOT_KEYS)"
 }
 
 @test "E2 slot file holds the newest state's slot" {

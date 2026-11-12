@@ -161,7 +161,7 @@ teardown_file() {
 @test "R1 quit with the Exit hotkey: a state and its preview are saved, no auto-resume marker" {
     start_game True
     dev_kit 30 rb_quit_game
-    await 40 "PPSSPP to exit after the Exit hotkey (see the hotkeys in the log: read from controls.ini)" dev_ok 20 rb_no_game
+    await 40 "PPSSPP to exit after the Exit hotkey (hotkeys: see the log)" dev_ok 20 rb_no_game
     await 90 "NextUI to be back" dev_ok 20 rb_nextui_up
     await 60 "a new save state (.ppst) from the exit" dev_ok 20 rb_has_new_state
     await 40 "the Game Switcher preview of the newest state" dev_ok 20 rb_has_new_preview
@@ -249,7 +249,7 @@ teardown_file() {
 @test "R7 forced reboot without the handshake (power cut analogue): no auto-resume, states intact" {
     start_game True
     dev_kit 30 rb_save_state
-    await 30 "a state saved with the Save State hotkey (see the hotkeys in the log: read from controls.ini)" dev_ok 20 rb_has_new_state
+    await 30 "a state saved with the Save State hotkey (hotkeys: see the log)" dev_ok 20 rb_has_new_state
     dev_kit 30 rb_save_snapshot
     local old
     old="$(rb_boot_id)"

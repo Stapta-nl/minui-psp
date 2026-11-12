@@ -5,7 +5,7 @@
 # Usage: run-reboot.sh <platform> <stage dir>
 # Environment: DEVICE_HOST (ssh target), DEVICE_SSH_OPTS (extra ssh options): set by run-device.sh.
 #   SKIP_REBOOT_TESTS=1  do not run them (exit 0): for when the device must not be rebooted.
-# Everything else (SDCARD_PATH ROM_DIR ROM EXIT_KEYS BOOT_WAIT UI_WAIT KEEPAWAKE_* REBOOT_*
+# Everything else (SDCARD_PATH ROM_DIR ROM SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS BOOT_WAIT UI_WAIT KEEPAWAKE_* REBOOT_*
 # ...) is read from the environment by the tests, see tests/bats/reboot.bats and tests/helpers/reboot.bash.
 #
 # Writes <stage dir>/reboot/ (output.tap, junit/report.xml, logs/, exit-code) and

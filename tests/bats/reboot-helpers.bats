@@ -70,6 +70,7 @@ make_device() {
     printf '#!/bin/sh\n' >"$pak/bin/jpg2bmp"
     chmod +x "$pak/bin/jpg2bmp"
     cp "$REPO_DIR/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini" "$pak/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
+    printf '[ControlMapping]\nSelect = 10-196\nStart = 10-197\nR = 10-192\nSave State = 10-196:10-192\nExit App = 10-196:10-197\n' >"$pak/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini"
     : >"$SD/Roms/Sony PSP (PSP)/game.iso"
     : >"$T/tmp/nextui_exec"
     # The code that runs on the device, sourced here as the kit is there.
@@ -635,16 +636,16 @@ SHIM
 }
 
 @test "rb_preflight: a hotkey bound to something the test cannot press is one clear FAIL line" {
-    printf '[ControlMapping]\nSelect = 10-196\nSaveState = 1-133\n' >"$CONTROLS"
+    printf '[ControlMapping]\nSelect = 10-196\nSave State = 1-133\n' >"$CONTROLS"
     unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS # rb_init in setup set them
     rb_init
     RB_REBOOT_CMD=/bin/true run rb_preflight
     assert_failure
-    assert_output --partial "FAIL: Save State hotkey is bound to '1-133'"
+    assert_output --partial "FAIL: Save State hotkey (Save State) is bound to '1-133'"
 }
 
 @test "rb_save_state and rb_quit_game press the hotkeys read from the device's controls.ini" {
-    printf '[ControlMapping]\nSelect = 10-196\nStart = 10-197\nL = 10-193\nR = 10-192\nSaveState = 10-197:10-193\nExitApp = 10-196:10-192\n' >"$CONTROLS"
+    printf '[ControlMapping]\nSelect = 10-196\nStart = 10-197\nL = 10-193\nR = 10-192\nSave State = 10-197:10-193\nExit App = 10-196:10-192\n' >"$CONTROLS"
     unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS # rb_init in setup set them
     rb_init
     press() { echo "$1" >>"$T/pressed"; }
@@ -656,7 +657,7 @@ select+r1"
 }
 
 @test "dev_kit: the kit has devconfig.bash, so the hotkeys are resolved on the device" {
-    printf '[ControlMapping]\nSelect = 10-196\nStart = 10-197\nExitApp = 10-197:10-196\n' >"$CONTROLS"
+    printf '[ControlMapping]\nSelect = 10-196\nStart = 10-197\nExit App = 10-197:10-196\nSave State = 10-196:10-192\nR = 10-192\n' >"$CONTROLS"
     unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS # set by rb_init in setup; the device resolves its own
     run dev_install_kit
     assert_success
