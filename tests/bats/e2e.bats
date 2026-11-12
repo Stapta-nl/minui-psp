@@ -38,14 +38,14 @@
 #              an unbound hotkey is then a preflight failure.
 #   EXIT_KEYS  how the emulator is quit (default: the Exit App hotkey; "" kills PPSSPP instead).
 #   BOOT_WAIT (20)  UI_WAIT (6)  KEY_GAP (0.5)  CHORD_HOLD (0.3)
-#   BOOT_SETTLE (6)  UI_SETTLE (6)  how long the waits are quiet, in seconds. After a game start the test
+#   BOOT_SETTLE (6)  UI_SETTLE (2)  how long the waits are quiet, in seconds. After a game start the test
 #              polls (every second) until PPSSPP has run the ROM (argv from /proc, and
 #              /tmp/emulator_pid naming it when minui-power-control wrote it) as the SAME process for
 #              BOOT_SETTLE seconds; a game that dies while starting ends the wait at once. After a NextUI
 #              start until the same nextui.elf has been up for UI_SETTLE seconds with no game and no
 #              auto-resume marker. No verified signal says "PPSSPP takes hotkeys" or "NextUI has drawn",
-#              so these defaults come from the maintainer's observation (a game starts within about 5 s
-#              including the state load), not from measurements by the test. Raise them for a slow
+#              so these defaults come from the maintainer's observations (a game starts within about 5 s
+#              including the state load, the Game Switcher loads in about 1 s), not from measurements by the test. Raise them for a slow
 #              device, lower them once verified. BOOT_WAIT and UI_WAIT are the upper bounds (each plus the
 #              quiet time); a default larger than the bound is cut to it.
 #              KEY_GAP and CHORD_HOLD are spacing of the injected key presses: no signal exists

@@ -331,14 +331,26 @@ rb_snapshot_states() {
         printf '%s %s %s\n' "${f##*/}" "$(wc -c <"$f" | tr -d ' ')" "$(rb_sum "$f")"
     done | sort
 }
-# Waits (up to ~30 s) until two reads one second apart are equal: PPSSPP may still be writing
-# (this IS the deterministic signal: the files stopped changing; the 30 s are the backup).
+# One line per state file (.ppst and .jpg, no undo copies): "<name> <size>": cheap (no checksum), for
+# watching whether PPSSPP still writes.
+rb_state_sizes() {
+    local f
+    for f in "$STATE_DIR"/*.ppst "$STATE_DIR"/*.jpg; do
+        [ -f "$f" ] || continue
+        case "$f" in *undo*) continue ;; esac
+        printf '%s %s\n' "${f##*/}" "$(wc -c <"$f" | tr -d ' ')"
+    done | sort
+}
+# Waits (up to ~30 s) until the names and sizes of the state files are the same in two consecutive
+# one second reads: PPSSPP may still be writing (this IS the signal; the 30 s are the backup). The
+# expensive checksums are made once afterwards, by the caller: reading every state file for each poll
+# (several MB each, on an SD card) used to cost seconds per poll.
 rb_wait_states_stable() {
     local a b n=0
-    a="$(rb_snapshot_states)"
+    a="$(rb_state_sizes)"
     while [ "$n" -lt 30 ]; do
         sleep 1
-        b="$(rb_snapshot_states)"
+        b="$(rb_state_sizes)"
         [ "$a" = "$b" ] && return 0
         a="$b"
         n=$((n + 1))
@@ -468,7 +480,7 @@ rb_tick() {
 # rb_keepawake_dev: rb_tick at most every KEEPAWAKE_INTERVAL seconds (0 = never, RB_TICK=0 = never);
 # called on every poll of a settle loop that runs on the device. Never fails.
 rb_keepawake_dev() {
-    local every="${KEEPAWAKE_INTERVAL:-10}"
+    local every="${KEEPAWAKE_INTERVAL:-3}"
     [ "${RB_TICK:-1}" = 1 ] || return 0
     case "$every" in "" | *[!0-9]*) return 0 ;; esac
     [ "$every" -gt 0 ] || return 0

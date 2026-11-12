@@ -471,12 +471,12 @@ wait_game_settled() {
     done
 }
 
-# The default quiet times (seconds), chosen from the maintainer's observation that a game starts
-# (including its state load) within about 5 s, and from NextUI's source (autoResume() runs first thing
-# in main()); NOT measured by the tests. BOOT_SETTLE / UI_SETTLE / NOGAME_SETTLE override them (raise
+# The default quiet times (seconds), chosen from the maintainer's observations (a game starts, state load
+# included, within about 5 s; the Game Switcher loads in about 1 s; a save state takes about 3 s) and from
+# NextUI's source (autoResume() runs first thing in main()); NOT measured by the tests. BOOT_SETTLE / UI_SETTLE / NOGAME_SETTLE override them (raise
 # or lower); BOOT_WAIT / UI_WAIT / NOGAME_WAIT are the upper bounds (and cap a default that is larger).
 E2E_DEFAULT_BOOT_SETTLE=6
-E2E_DEFAULT_UI_SETTLE=6
+E2E_DEFAULT_UI_SETTLE=2
 E2E_DEFAULT_NOGAME_SETTLE=6
 
 # e2e_whole <n>: the whole seconds of a wait ("6.5" gives 6, junk gives 0).
@@ -503,6 +503,13 @@ ui_settle() {
     local n
     n="$(e2e_settle_count "${UI_SETTLE:-}" "$E2E_DEFAULT_UI_SETTLE" "${UI_WAIT:-6}")"
     wait_ui_settled "$n" "$((n + $(e2e_whole "${UI_WAIT:-6}")))"
+}
+# ui_game_settle: a game that was started by NextUI itself (auto-resume) keeps running: the quiet time of a
+# NextUI settle (UI_SETTLE), applied to the game process.
+ui_game_settle() {
+    local n
+    n="$(e2e_settle_count "${UI_SETTLE:-}" "$E2E_DEFAULT_UI_SETTLE" "${UI_WAIT:-6}")"
+    wait_game_settled "$n" "$((n + $(e2e_whole "${BOOT_WAIT:-20}")))"
 }
 nogame_settle() {
     local n
@@ -609,18 +616,28 @@ not_fixture() {
 # An absolute path is not found and NextUI drops it, rewriting recent.txt empty.
 seed_recent() { mkdir -p "$(dirname "$RECENT")" && printf '%s\n' "${ROM#"$SD"}" >"$RECENT"; }
 
+# e2e_phase <label> <seconds>: one wait of this test, in the TAP output (fd 3 under bats) and in
+# $OUT/timings.txt, so that a report shows where a test spends its time.
+e2e_phase() {
+    { [ -w /dev/fd/3 ] && echo "# wait: $1 ${2}s" >&3; } 2>/dev/null || true
+    [ -z "${OUT:-}" ] || echo "$(date '+%H:%M:%S') wait: $1 ${2}s" >>"$OUT/timings.txt" 2>/dev/null || true
+}
+
 # restart_ui: kills NextUI and waits until the NEW process is up and settled (the same pid for
-# UI_SETTLE polls, default 6 s: the render delay of the old fixed wait is kept, because no signal says
-# "NextUI has drawn" that is verified on a device). The old process being gone is detected by its pid.
+# UI_SETTLE polls, default 2 s: the maintainer sees the Game Switcher load in about 1 s; the screenshot
+# after it has its own 1 s delay). No "NextUI has drawn" signal is verified on a device, so this is
+# the observed time plus margin. The old process being gone is detected by its pid.
 restart_ui() {
-    local old
+    local old t0=$SECONDS
     old="$(first_pid nextui.elf)"
     kill_ui
     wait_for 40 sh -c "p=\$(pgrep nextui.elf | head -n 1); [ -n \"\$p\" ] && [ \"\$p\" != '$old' ]" || {
         echo "NextUI did not come back within 40 s of being restarted" >&2
         return 1
     }
+    e2e_phase "NextUI restarted (new pid)" $((SECONDS - t0))
     ui_settle
+    e2e_phase "restart_ui total" $((SECONDS - t0))
 }
 open_switcher() { # restarts NextUI directly into the Game Switcher
     printf unused >"$PERSIST"

@@ -94,7 +94,7 @@ pak_log() { dev_kit 60 'grep -v "^+" "$LOGS/PSP.txt"'; }
 # start_game <SaveStateOnExit value>: a fresh game start, as NextUI does it, with PPSSPP's
 # settings set for the case (auto-load newest state always on).
 start_game() {
-    dev_kit 240 "rb_settle; rb_ini_set SaveStateOnExit $1; rb_ini_set AutoLoadSaveState 2; rb_mark; rb_launch_game"
+    rb_timed "start_game: stop, ini, mark, launch" dev_kit 240 "rb_settle; rb_ini_set SaveStateOnExit $1; rb_ini_set AutoLoadSaveState 2; rb_mark; rb_launch_game"
     await 90 "PPSSPP to start the test game" probe rb_rom_running
     settle_boot
 }
@@ -126,6 +126,12 @@ refute_dev() { # refute_dev <script>: the script fails on the device (not an ssh
 # Arrays are not exported from setup_file into the tests, so the ssh setup runs for every test.
 setup() {
     rb_ssh_setup
+    rb_test_begin
+}
+
+# One line per test in the TAP output: the total and where the time went (every wait and every ssh call of 2 s or more).
+teardown() {
+    rb_test_end
 }
 
 setup_file() {
@@ -232,7 +238,7 @@ teardown_file() {
     local old
     old="$(rb_boot_id)"
     [ -n "$old" ] || fail "could not read the device's boot id"
-    dev_kit 30 rb_trigger_poweroff
+    rb_trigger rb_trigger_poweroff
     await_reboot "$old"
     # The kit is installed again; the evidence was written to the SD card at the final power-off call.
     fetch_evidence R3
@@ -298,7 +304,7 @@ teardown_file() {
     old="$(rb_boot_id)"
     [ -n "$old" ] || fail "could not read the device's boot id"
     ref="$(rb_launch_ref)" # the pak log of this game: a launch after the boot would rewrite it
-    dev_kit 30 rb_hard_reboot
+    rb_trigger rb_hard_reboot
     await_reboot "$old"
     await "${RESUME_TIMEOUT:-180}" "NextUI to be up after the boot" probe rb_nextui_up
     settle_nogame "$ref"
@@ -317,14 +323,13 @@ teardown_file() {
     dev_kit 30 rb_quit_game
     await 40 "PPSSPP to exit" probe rb_no_game
     await 90 "NextUI to be back" probe rb_nextui_up
-    settle_ui_short "$(rb_launch_ref)"
-    start_game False
+    start_game False # (its rb_settle waits for NextUI: no settle of its own here)
     dev_kit 30 rb_save_snapshot # all states that exist now, none of them may change
     dev_kit 30 rb_install_wrapper
     local old
     old="$(rb_boot_id)"
     [ -n "$old" ] || fail "could not read the device's boot id"
-    dev_kit 30 rb_trigger_poweroff
+    rb_trigger rb_trigger_poweroff
     await_reboot "$old"
     fetch_evidence R8
     assert_dev '[ -f "$BAK/evidence-called" ]'

@@ -44,6 +44,13 @@ fi
 if [ -n "${FAKE_SSH_NEWBOOT_AT:-}" ] && [ "$n" -ge "$FAKE_SSH_NEWBOOT_AT" ]; then
     echo newboot >"$BOOT_ID_FILE"
 fi
+if [ -n "${FAKE_SSH_BG_HOLD:-}" ]; then sleep "$FAKE_SSH_BG_HOLD" & fi # a persistent master that holds the stdout pipe
+if [ -n "${FAKE_SSH_LINGER:-}" ]; then
+    sh -c "$*"
+    rc=$?
+    sleep "$FAKE_SSH_LINGER" # the connection stays open after the remote command ended
+    exit "$rc"
+fi
 exec sh -c "$*"
 SSH
     chmod +x "$T/bin/ssh"
@@ -56,7 +63,7 @@ SSH
     export RB_KIT_PATH="$T/kit.sh"
     export POLL_INTERVAL=0.2 KEEPAWAKE_INTERVAL=0
     export RB_TIMINGS_FILE="$T/timings.txt"
-    export RB_PORT_PROBE=fake_port FAKE_PORT_STATE="$T/port.count"
+    export RB_PORT_PROBE=fake_port FAKE_PORT_STATE="$T/port.count" RB_PING_PROBE="return 2" # ping: "not available" unless a test says otherwise
     : >"$FAKE_PORT_STATE"
     rb_ssh_setup
     make_device
@@ -69,6 +76,15 @@ fake_port() {
     n=$(($(cat "$FAKE_PORT_STATE" 2>/dev/null || echo 0) + 1))
     echo "$n" >"$FAKE_PORT_STATE"
     [ -n "${FAKE_PORT_DOWN_FROM:-}" ] && [ "$n" -ge "$FAKE_PORT_DOWN_FROM" ] && [ "$n" -le "${FAKE_PORT_DOWN_TO:-0}" ] && return 1
+    return 0
+}
+
+# The fake ping: call n fails from FAKE_PING_DOWN_FROM to FAKE_PING_DOWN_TO, answers otherwise.
+fake_ping() {
+    local n
+    n=$(($(cat "$T/ping.count" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$T/ping.count"
+    [ -n "${FAKE_PING_DOWN_FROM:-}" ] && [ "$n" -ge "$FAKE_PING_DOWN_FROM" ] && [ "$n" -le "${FAKE_PING_DOWN_TO:-0}" ] && return 1
     return 0
 }
 
@@ -196,36 +212,45 @@ make_device() {
 }
 
 # --- the reboot: down, then up, each detected and timed ----------------------------------------
-@test "await_reboot: port closes, port opens but ssh does not answer yet, then a NEW boot id: timings are logged" {
-    # port probes 1..: open at 1 is not needed (down is seen at the first closed probe); closed 2..4;
-    # ssh calls: the port is open from probe 5 but ssh refuses calls 1-2, then answers with a new id.
-    export FAKE_PORT_DOWN_FROM=2 FAKE_PORT_DOWN_TO=4 FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=3
+@test "await_reboot: the port closes, opens but ssh does not answer yet, then a NEW boot id: down/up logged with their way and the traces" {
+    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=3 FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=3
     export REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20
     mkdir -p "$BAK"
     : >"$BAK/active"
     run await_reboot oldboot
     assert_success
-    assert_output --partial "reboot: triggered, watching"
-    assert_output --partial "reboot: down (ssh port closed) after"
-    assert_output --partial "then ssh with a new boot_id"
-    assert_output --partial "reboot timing: down after"
-    assert_output --partial "SD card mounted at"
+    assert_output --partial "reboot: trigger call took"
+    assert_output --partial "watching ping and the ssh port"
+    assert_output --partial "reboot: down (the ssh port closed)"
+    assert_output --partial "reboot: back via: ping + port open, then ssh with a new boot_id"
+    assert_output --partial "reboot timing (from the trigger call's return): down after"
     assert_file_exist "$RB_KIT_PATH"
     [ "$(cat "$BOOT_ID_FILE")" = newboot ]
     run cat "$T/timings.txt"
-    assert_output --partial "reboot timing: down after"
+    assert_output --partial "down poll 1: t="
+    assert_output --partial "ping=n/a  tcp=fail"
+    assert_output --partial "up poll"
+    assert_output --partial "ping=n/a  tcp=ok"
     refute_output --partial "brick.example"
 }
 
-@test "await_reboot: a port that closes at once is detected at the first probe (no 5-10 s granularity)" {
-    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20
+@test "await_reboot: the clock starts when the trigger call RETURNED (a fake clock): earlier work is never counted, no false SLOW" {
+    export RB_CLOCK_FILE="$T/clock" FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=1
+    export REBOOT_DOWN_TIMEOUT=90 REBOOT_UP_TIMEOUT=300
+    echo 1000000 >"$RB_CLOCK_FILE"
+    # shellcheck disable=SC2317 # replaces sleep: every poll step is one fake second
+    sleep() { echo $(($(cat "$RB_CLOCK_FILE") + 1000)) >"$RB_CLOCK_FILE"; }
     mkdir -p "$BAK"
     : >"$BAK/active"
+    echo 1138000 >"$RB_CLOCK_FILE" # 138 s of earlier work in the test (game start, state save, ...)
+    RB_T_TRIGGER_RET=1138000 RB_TRIGGER_MS=400
+    echo 1140000 >"$RB_CLOCK_FILE" # the first probe is 2 s after the trigger call returned
     run await_reboot oldboot
     assert_success
-    # (no wall-clock assertion: the port probe and the ssh fake are counted, not timed)
-    [ "$(cat "$FAKE_PORT_STATE")" -ge 1 ]
-    assert_output --partial "down (ssh port closed) after"
+    assert_output --partial "trigger call took 400ms; 2000ms from its return to this wait"
+    assert_output --partial "reboot: down after 2s"
+    refute_output --partial "after 138s"
+    refute_output --partial "SLOW"
 }
 
 @test "await_reboot: also waits for the SD card (the backup flag) after the boot" {
@@ -237,7 +262,7 @@ make_device() {
     assert_file_exist "$BAK/active"
 }
 
-@test "await_reboot: a device that never goes down (port stays open, same boot id) is an error naming the phase" {
+@test "await_reboot: a device that never goes down (port open, same boot id) is an error naming the phase" {
     export REBOOT_DOWN_TIMEOUT=1 REBOOT_UP_TIMEOUT=2
     run await_reboot oldboot
     assert_failure
@@ -245,12 +270,13 @@ make_device() {
     assert_output --partial "was not seen going down"
 }
 
-@test "await_reboot: a reboot the port probe never saw is still found by the boot id that changed" {
+@test "await_reboot: a device that already rebooted before the first probe is found by ssh at the first poll (new boot id)" {
     export FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=10
     mkdir -p "$BAK"
     : >"$BAK/active"
     run await_reboot oldboot
     assert_success
+    assert_output --partial "already rebooted when the polls started"
 }
 
 @test "await_reboot: the port goes down and comes back with the SAME boot id: not a reboot" {
@@ -258,14 +284,14 @@ make_device() {
     run await_reboot oldboot
     assert_failure
     assert_output --partial "the device to come back"
-    assert_output --partial "ssh port open: yes; new boot_id: no"
+    assert_output --partial "last poll: ping=n/a port=ok; new boot_id: no"
 }
 
 @test "await_reboot: the port never opens again: an error after the backup timeout" {
     export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=100000 REBOOT_DOWN_TIMEOUT=3 REBOOT_UP_TIMEOUT=1
     run await_reboot oldboot
     assert_failure
-    assert_output --partial "ssh port open: no"
+    assert_output --partial "port=fail"
 }
 
 @test "await_reboot: a phase that used more than half of its backup time is flagged SLOW" {
@@ -273,6 +299,159 @@ make_device() {
     assert_output --partial "SLOW"
     run rb_phase_note "down" 3 10
     refute_output --partial "SLOW"
+}
+
+@test "await_reboot: ping fails while the port still accepts (a tunnel that always connects): DOWN by ping, UP only by the new boot id" {
+    export RB_PING_PROBE=fake_ping FAKE_PING_DOWN_FROM=2 FAKE_PING_DOWN_TO=100000 FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    run await_reboot oldboot
+    assert_success
+    assert_output --partial "ping baseline ok"
+    assert_output --partial "reboot: down (ping failed)"
+    assert_output --partial "back via: ssh with a new boot_id ONLY (ping=fail, port=ok"
+}
+
+@test "await_reboot: ping and port both come back, then the new boot id: all three signals" {
+    export RB_PING_PROBE=fake_ping FAKE_PING_DOWN_FROM=2 FAKE_PING_DOWN_TO=3 FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    run await_reboot oldboot
+    assert_success
+    assert_output --partial "back via: ping + port open, then ssh with a new boot_id"
+}
+
+@test "await_reboot: no ping command / ICMP filtered: ping is not used, the port and the boot id decide" {
+    export RB_PING_PROBE=false FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    run await_reboot oldboot
+    assert_success
+    assert_output --partial "ping baseline not used"
+    run cat "$T/timings.txt"
+    assert_output --partial "ping=n/a"
+}
+
+@test "await_reboot: a WRONG port probe (never open) with working ssh: found by the new boot id, which signal is logged" {
+    export RB_PORT_PROBE=false FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    run await_reboot oldboot
+    assert_success
+    assert_output --partial "reboot: back via: ssh with a new boot_id ONLY (ping=n/a, port=fail"
+}
+
+@test "await_reboot: a wrong port probe and ssh that answers the OLD id is still not a reboot" {
+    export RB_PORT_PROBE=false REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=2
+    run await_reboot oldboot
+    assert_failure
+    assert_output --partial "the device to come back"
+}
+
+@test "await_reboot: keep-awake is off while the device power-cycles and on again the moment it is back (a tap right after the kit install)" {
+    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20 KEEPAWAKE_INTERVAL=3
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    export RB_TICK=1
+    run await_reboot oldboot
+    assert_success
+    [ "$(grep -c 'rb_tick' "$FAKE_SSH_LOG")" -ge 1 ]
+    # no tap before the device was seen back: the first rb_tick call comes after the kit stream (the cat > kit call)
+    local first_tick first_kit
+    first_tick="$(grep -n 'rb_tick' "$FAKE_SSH_LOG" | head -n 1 | cut -d: -f1)"
+    first_kit="$(grep -n 'psp-reboot-kit\|kit.sh' "$FAKE_SSH_LOG" | head -n 1 | cut -d: -f1)"
+    [ "$first_tick" -gt "$first_kit" ]
+}
+
+@test "the keep-awake interval defaults to 3 s (NextUI suspends the device after about 10 s without input)" {
+    unset KEEPAWAKE_INTERVAL
+    grep -q 'KEEPAWAKE_INTERVAL:-3' "$HELPERS/reboot.bash"
+    grep -q 'KEEPAWAKE_INTERVAL:-3' "$HELPERS/reboot-device.bash"
+    run await 4 "nothing" false
+    assert_failure
+    [ "$(grep -c 'rb_tick' "$FAKE_SSH_LOG")" -ge 1 ]
+}
+
+@test "rb_trigger: returns at once although the ssh call stays open (cut after the linger time, children killed), clock origin recorded" {
+    dev_install_kit
+    export FAKE_SSH_LINGER=37 RB_TRIGGER_LINGER=1
+    local t0=$SECONDS
+    rb_trigger true
+    [ $((SECONDS - t0)) -lt 12 ]
+    [ -n "$RB_T_TRIGGER_RET" ]
+    [ "$RB_TRIGGER_MS" -lt 8000 ]
+    if pgrep -f 'sleep 37' >/dev/null; then echo "a lingering ssh child is still running"; return 1; fi
+}
+
+@test "rb_trigger: a call that ends at once returns the device's status and does not wait" {
+    dev_install_kit
+    run rb_trigger 'exit 3'
+    assert_failure 3
+    rb_trigger true
+    [ "$RB_TRIGGER_MS" -lt 8000 ]
+    grep -q 'ControlPath=none' <<<"${RB_SSH[*]}"
+}
+
+@test "ssh calls never multiplex (ControlMaster=no, ControlPath=none) and these options come before the user's" {
+    local all="${RB_SSH[*]}"
+    [[ "$all" == *"ControlMaster=no"*"ControlPath=none"*"-p 2222"* ]]
+}
+
+@test "rb_boot_id: a process that keeps the ssh call's stdout open (a multiplexing master) does not block the command substitution" {
+    export FAKE_SSH_BG_HOLD=25
+    local t0=$SECONDS id
+    id="$(rb_boot_id)"
+    [ "$id" = oldboot ]
+    [ $((SECONDS - t0)) -lt 12 ]
+    pkill -f 'sleep 25' || true
+}
+
+@test "rb_device_retry: a device that does not answer (255, kit missing) is retried; any other status is final" {
+    export RB_DEFINITE_TRIES=5
+    echo 0 >"$T/n"
+    # shellcheck disable=SC2317 # called through rb_device_retry
+    flaky() { local n; n=$(($(cat "$T/n") + 1)); echo "$n" >"$T/n"; [ "$n" -ge 3 ] && return 0; return 255; }
+    run rb_device_retry flaky
+    assert_success
+    [ "$(cat "$T/n")" = 3 ]
+    run rb_device_retry false
+    assert_failure 1
+    run rb_device_retry bash -c 'exit 255'
+    assert_failure 255
+}
+
+@test "per-test timing breakdown: every wait is recorded; the summary line has the total and the waits of 0.3 s or more" {
+    export RB_CLOCK_FILE="$T/clock" OUT="$T/out2"
+    mkdir -p "$OUT"
+    echo 5000000 >"$RB_CLOCK_FILE"
+    # shellcheck disable=SC2317 # replaces sleep: one fake second per poll
+    sleep() { echo $(($(cat "$RB_CLOCK_FILE") + 1000)) >"$RB_CLOCK_FILE"; }
+    rb_test_begin
+    echo 0 >"$T/n"
+    # shellcheck disable=SC2317 # called through await
+    third() { local n; n=$(($(cat "$T/n") + 1)); echo "$n" >"$T/n"; [ "$n" -ge 4 ]; }
+    await 30 "the third thing" third
+    await 30 "an instant thing" true
+    run rb_test_end
+    assert_success
+    assert_output --partial ": total 3.0 s: the third thing 3.0 s (signal)"
+    refute_output --partial "an instant thing"
+    run cat "$T/timings.txt"
+    assert_output --partial "wait: the third thing (signal) 3.0 s"
+    assert_output --partial "wait: an instant thing (signal) 0.0 s"
+}
+
+@test "a wait that times out is recorded as TIMEOUT" {
+    export RB_CLOCK_FILE="$T/clock" OUT="$T/out3"
+    mkdir -p "$OUT"
+    echo 100000 >"$RB_CLOCK_FILE"
+    # shellcheck disable=SC2317
+    sleep() { echo $(($(cat "$RB_CLOCK_FILE") + 1000)) >"$RB_CLOCK_FILE"; }
+    rb_test_begin
+    run await 3 "the moon" false
+    assert_failure
+    run rb_test_end
+    assert_output --partial "the moon 3.0 s (TIMEOUT)"
 }
 
 @test "rb_net_setup: the ssh port of the device (ssh -G, then -p in the options), the jump host case, no address in the description" {
@@ -404,7 +583,7 @@ FAKE
     nogame_settle
     run cat "$T/calls"
     assert_output "game 6 26
-ui 6 12
+ui 2 8
 ui 6 31"
     : >"$T/calls"
     BOOT_SETTLE=2 BOOT_WAIT=40 game_settle # lowered quiet time, raised bound
@@ -545,22 +724,6 @@ game 3 6"
     run awk '/^ensure_game\(\) \{/{f=1} f{print} /^\}/{f=0}' "$TESTS_DIR/bats/reboot.bats"
     assert_output --partial "dev_definite"
     refute_output --partial "! probe rb_rom_running"
-}
-
-@test "await_reboot: a WRONG port probe (never open) with working ssh: found by the new boot id, which signal is logged" {
-    export RB_PORT_PROBE=false FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20
-    mkdir -p "$BAK"
-    : >"$BAK/active"
-    run await_reboot oldboot
-    assert_success
-    assert_output --partial "reboot: back via: ssh with a new boot_id (the port probe never saw the port open"
-}
-
-@test "await_reboot: a wrong port probe and ssh that answers the OLD id is still not a reboot" {
-    export RB_PORT_PROBE=false REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=2
-    run await_reboot oldboot
-    assert_failure
-    assert_output --partial "the device to come back"
 }
 
 @test "await_reboot: a false 'down' (port closed for a moment) does not leave a misleading port time" {
