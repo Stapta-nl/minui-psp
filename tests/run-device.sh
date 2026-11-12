@@ -23,7 +23,7 @@
 #
 # Host side only: PAK_MISMATCH=fail (default warn).
 # Forwarded to the device when set: SDCARD_PATH ROM_DIR ROM PSP_KEYS SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS BOOT_WAIT
-# UI_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT.
+# UI_WAIT BOOT_SETTLE UI_SETTLE KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT.
 #
 # Before the tests it compares the installed pak with this checkout (or SRC_PAK) and warns if
 # they differ (tests/pakcheck.sh); PAK_MISMATCH=fail makes that fatal. The result is in the summary.
@@ -220,7 +220,7 @@ sd="${SDCARD_PATH:-/mnt/SDCARD}"
 pak_name="${PAK_NAME:-$(jq -r '.name // empty' pak.json 2>/dev/null)}"
 pak_name="${pak_name:-PSP}"
 assignments="PLATFORM=$(q "$platform") PAK_NAME=$(q "$pak_name") SRC_PAK=$(q "$sd/Emus/$platform/$pak_name.pak") RESULT_DIR=$(q "$remote_tmp/result") DEVICE_COLLECT=1"
-for v in SDCARD_PATH ROM_DIR ROM PSP_KEYS SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS BOOT_WAIT UI_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT; do
+for v in SDCARD_PATH ROM_DIR ROM PSP_KEYS SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS BOOT_WAIT UI_WAIT BOOT_SETTLE UI_SETTLE KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT; do
     if [ -n "${!v+x}" ]; then
         assignments="$assignments $v=$(q "${!v}")"
     fi

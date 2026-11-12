@@ -40,6 +40,7 @@ rb_init() {
     NEXT="$RB_TMP/next"
     WRAPPER="$RB_TMP/psp-test-poweroff"
     UI_WAIT="${UI_WAIT:-6}"
+    E2E_POLL_HOOK=rb_keepawake_dev # the settle loops of e2e.bash keep the device awake through this
     [ -n "${EXIT_KEYS:-}" ] || unset EXIT_KEYS # empty = not set here (there is no kill mode)
     # The hotkeys of the DEVICE (controls.ini), the documented defaults where unset: devconfig.bash
     cfg_init_hotkeys "$CONTROLS" "save exit" # Next Slot is never pressed here
@@ -252,10 +253,9 @@ rb_ini_get() {
 }
 
 # --- the game ----------------------------------------------------------------------------
-# Marks "now" (states newer than this are new). FAT mtimes have 2 s resolution.
+# Marks "now" (states newer than this are new); returns when the file clock has moved past the mark (touch_marker).
 rb_mark() {
-    touch "$BAK/marker"
-    sleep 2
+    touch_marker "$BAK/marker"
 }
 
 # Starts the game the way NextUI does: /tmp/next, then NextUI is restarted (SIGKILL, never SIGTERM).
@@ -267,23 +267,6 @@ rb_launch_game() {
 }
 
 rb_ppsspp_pid() { pgrep PPSSPPSDL 2>/dev/null | head -n 1; }
-
-# True if the emulator runs with the test ROM as its argument. The command lines are read from
-# /proc and matched on argv[0] and the arguments, never on the whole text: the ssh call that
-# runs this contains the ROM's name too.
-rb_rom_running() {
-    local p first line args
-    for p in /proc/[0-9]*/cmdline; do
-        [ -r "$p" ] || continue
-        args="$(tr '\0' '\n' <"$p" 2>/dev/null)"
-        first="${args%%$'\n'*}"
-        case "${first##*/}" in PPSSPPSDL*) ;; *) continue ;; esac
-        while IFS= read -r line; do
-            [ "$line" = "$ROM" ] && return 0
-        done <<<"$args"
-    done
-    return 1
-}
 
 rb_nextui_up() { pgrep nextui.elf >/dev/null 2>&1; }
 rb_no_game() { ! pgrep PPSSPPSDL >/dev/null 2>&1; }
@@ -348,7 +331,8 @@ rb_snapshot_states() {
         printf '%s %s %s\n' "${f##*/}" "$(wc -c <"$f" | tr -d ' ')" "$(rb_sum "$f")"
     done | sort
 }
-# Waits (up to ~30 s) until two reads one second apart are equal: PPSSPP may still be writing.
+# Waits (up to ~30 s) until two reads one second apart are equal: PPSSPP may still be writing
+# (this IS the deterministic signal: the files stopped changing; the 30 s are the backup).
 rb_wait_states_stable() {
     local a b n=0
     a="$(rb_snapshot_states)"
@@ -427,7 +411,7 @@ rb_hard_reboot() {
     sync
     (
         trap '' HUP
-        sleep 1
+        sleep 1 # lets the calling ssh session return (status 0) before the reboot cuts it; the sync above already ran
         # shellcheck disable=SC2086 # command and its flag
         $c
     ) >/dev/null 2>&1 </dev/null &
@@ -466,7 +450,7 @@ rb_wake() {
     [ -c "$dev" ] || { echo "no power key device found (POWER_DEV_NAME)" >&2; return 1; }
     PAD="$dev" pad 1 116 1
     PAD="$dev" syn
-    sleep 0.2
+    sleep 0.2 # a short key tap (input injection): no signal exists
     PAD="$dev" pad 1 116 0
     PAD="$dev" syn
 }
@@ -479,6 +463,19 @@ rb_tick() {
     else
         press "${KEEPAWAKE_KEY:-l1}"
     fi
+}
+
+# rb_keepawake_dev: rb_tick at most every KEEPAWAKE_INTERVAL seconds (0 = never, RB_TICK=0 = never);
+# called on every poll of a settle loop that runs on the device. Never fails.
+rb_keepawake_dev() {
+    local every="${KEEPAWAKE_INTERVAL:-10}"
+    [ "${RB_TICK:-1}" = 1 ] || return 0
+    case "$every" in "" | *[!0-9]*) return 0 ;; esac
+    [ "$every" -gt 0 ] || return 0
+    [ $((SECONDS - ${RB_DEV_LAST_TICK:--99999})) -ge "$every" ] || return 0
+    RB_DEV_LAST_TICK=$SECONDS
+    rb_tick >/dev/null 2>&1 || true
+    return 0
 }
 
 # Best-effort screenshot kept as evidence (the Screenshot Monitor pak is optional here).

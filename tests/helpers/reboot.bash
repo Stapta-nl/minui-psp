@@ -12,14 +12,21 @@
 # tests/run-reboot.sh from <PLATFORM>_HOST / <PLATFORM>_SSH_OPTS. The device's address is
 # never printed by these helpers (ssh's own error text is scrubbed).
 #   SSH_CONNECT_TIMEOUT (5)   per ssh call; polling during a reboot needs it short
-#   POLL_INTERVAL (3)         seconds between polls of every wait
+#   POLL_INTERVAL (1)         seconds between polls of every wait
+#   RB_PROBE_TIMEOUT (10)     limit of one ssh probe inside a wait (a hung ssh must not eat the wait)
 #   KEEPAWAKE_INTERVAL (10)   seconds between keep-awake steps during a wait (0 = off)
-#   REBOOT_DOWN_TIMEOUT (90)  after the power-off request: the device must go down within this
-#   REBOOT_UP_TIMEOUT (300)   ... and be back (ssh, new boot id) within this
-#   RESUME_TIMEOUT (180)      after boot: NextUI must be up and relaunch the game within this
+#   REBOOT_DOWN_TIMEOUT (90)  BACKUP only: after the power-off request the device must be seen going
+#                             down (ssh port closed) within this; normally it takes a few seconds
+#   REBOOT_UP_TIMEOUT (300)   BACKUP only: ... and be back (port open, ssh answers with a NEW boot id)
+#   RESUME_TIMEOUT (180)      BACKUP only: after boot NextUI must be up and relaunch the game within this
+#   RB_PORT_PROBE             a command (run with eval) that succeeds when the device's ssh port is open;
+#                             replaces the built-in probe (host unit tests, odd networks)
+#   RB_TIMINGS_FILE           where the reboot timings are appended (default: $OUT/reboot-timings.txt)
+# Every wait polls a condition and ends as soon as it holds; the durations above and in reboot.bats
+# are only the time-outs after which a wait gives up.
 
 RB_KIT_PATH="${RB_KIT_PATH:-/tmp/psp-reboot-kit.sh}"
-RB_ENV_VARS="SD PLATFORM PAK_NAME ROM_DIR ROM SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS PSP_RUN_ID UI_WAIT CHORD_HOLD KEEPAWAKE_KEY POWER_DEV_NAME SLEEP_PROBE RB_TMP RB_OUT RB_REBOOT_CMD RB_HARD_REBOOT_CMD BOOT_ID_FILE"
+RB_ENV_VARS="SD PLATFORM PAK_NAME ROM_DIR ROM SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS PSP_RUN_ID UI_WAIT CHORD_HOLD KEEPAWAKE_KEY KEEPAWAKE_INTERVAL POWER_DEV_NAME SLEEP_PROBE RB_TMP RB_OUT RB_REBOOT_CMD RB_HARD_REBOOT_CMD BOOT_ID_FILE"
 
 # Quotes a value for the remote shell.
 rb_q() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
@@ -96,19 +103,29 @@ dev_install_kit() {
 }
 
 # --- waiting, with the device kept awake --------------------------------------------------
+# Logs a line: to stderr, to the TAP output (fd 3 under bats) and to the timings file.
+rb_log() {
+    local f="${RB_TIMINGS_FILE:-${OUT:+$OUT/reboot-timings.txt}}"
+    echo "$*" >&2
+    { [ -w /dev/fd/3 ] && echo "# $*" >&3; } 2>/dev/null || true
+    [ -z "$f" ] || echo "$(date '+%H:%M:%S') $*" >>"$f" 2>/dev/null || true
+}
+
 # One keep-awake step if KEEPAWAKE_INTERVAL seconds have passed since the last one. The step
 # wakes a device that sleeps, otherwise taps a harmless button (see rb_tick). It never fails
-# the test: a device that is rebooting simply does not answer.
+# the test: a device that is rebooting simply does not answer. (The interval is how often input
+# is sent to keep NextUI's idle timer from running out, not a wait for anything.)
 rb_keepawake_maybe() {
     local every="${KEEPAWAKE_INTERVAL:-10}"
     [ "${RB_TICK:-1}" = 1 ] && [ "$every" -gt 0 ] || return 0
     [ $((SECONDS - ${RB_LAST_TICK:--99999})) -ge "$every" ] || return 0
     RB_LAST_TICK=$SECONDS
-    dev_kit 20 rb_tick >/dev/null 2>&1 || true
+    dev_kit "${RB_PROBE_TIMEOUT:-10}" rb_tick >/dev/null 2>&1 || true
 }
 
-# await <timeout s> <what> <command...>: runs the command every POLL_INTERVAL seconds until it
-# succeeds (0) or the time is up (1, saying what was waited for). Keeps the device awake.
+# await <timeout s> <what> <command...>: runs the command every POLL_INTERVAL seconds (1) until it
+# succeeds (0) or the time is up (1, saying what was waited for). The time is only the backup.
+# Keeps the device awake.
 await() {
     local limit="$1" what="$2" start=$SECONDS
     shift 2
@@ -119,21 +136,37 @@ await() {
             return 1
         fi
         rb_keepawake_maybe
-        sleep "${POLL_INTERVAL:-3}"
+        sleep "${POLL_INTERVAL:-1}"
     done
 }
 
-# pause <seconds>: a wait that cannot end early, in polling steps, keeping the device awake.
-pause() {
-    local until=$((SECONDS + $1))
-    while [ "$SECONDS" -lt "$until" ]; do
-        rb_keepawake_maybe
-        sleep "${POLL_INTERVAL:-3}"
-    done
+# probe <script>: dev_ok with the short per-probe limit, for use in a wait.
+probe() { dev_ok "${RB_PROBE_TIMEOUT:-10}" "$1"; }
+
+# The settle checks run ON the device (a local one second loop: no ssh call per poll), keep the
+# device awake there, and give up after the old fixed duration (plus the count). See
+# wait_ui_settled / wait_game_settled in e2e.bash.
+# settle_ui <stable s> <old wait s>: NextUI up and quiet. settle_game likewise for the game.
+settle_ui() {
+    local n limit
+    n="$(e2e_settle_count "$1" "$2")"
+    limit=$((${2%%.*} + n))
+    dev_kit $((limit + 30)) "wait_ui_settled $n $limit"
 }
+settle_game() {
+    local n limit
+    n="$(e2e_settle_count "$1" "$2")"
+    limit=${2%%.*}
+    dev_kit $((limit + 30)) "wait_game_settled $n $limit"
+}
+# The same with the defaults of the three cases the tests have (README: BOOT_SETTLE, UI_SETTLE, NOGAME_SETTLE).
+settle_boot() { settle_game "${BOOT_SETTLE:-10}" "${BOOT_WAIT:-20}"; }
+settle_resumed() { settle_game "${UI_SETTLE:-4}" "${UI_WAIT:-6}"; }
+settle_ui_short() { settle_ui "${UI_SETTLE:-4}" "${UI_WAIT:-6}"; }
+settle_nogame() { settle_ui "${NOGAME_SETTLE:-10}" "${NOGAME_WAIT:-25}"; }
 
 # --- reboots -------------------------------------------------------------------------------
-rb_boot_id() { dev_run 20 'cat "${BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"' 2>/dev/null; }
+rb_boot_id() { dev_run "${RB_PROBE_TIMEOUT:-10}" 'cat "${BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"' 2>/dev/null; }
 
 # True once the device does not answer or answers with another boot id than $1.
 rb_went_down() {
@@ -148,17 +181,109 @@ rb_is_back() {
     [ -n "$now" ] && [ "$now" != "$1" ]
 }
 
-# await_reboot <old boot id>: the device must go down (REBOOT_DOWN_TIMEOUT) and come back
-# (REBOOT_UP_TIMEOUT: ssh works and the boot id is new), then the kit is installed again.
+# How the device is watched on the network. The ssh port is what matters (it is what the tests
+# need, and ICMP may be filtered or the host may be behind a jump host), so:
+#   tcp   the host and port ssh would use (ssh -G resolves ~/.ssh/config, else DEVICE_HOST and a
+#         -p / -o Port= in DEVICE_SSH_OPTS) are connected to with bash's /dev/tcp, 2 s limit;
+#   nc    the same with `nc -z -w2` where bash has no /dev/tcp;
+#   ping  `ping -c1 -W1`, only where neither exists and the host is a plain address or name;
+#   ssh   a ProxyJump/ProxyCommand is in use: the port is not reachable from here, so "is
+#         up" means that a (5 s limit) ssh call succeeds.
+# Sets RB_NET_VIA, RB_NET_HOST, RB_NET_PORT and RB_NET_DESC (no address in the description).
+rb_net_setup() {
+    local cfg host="" port="" proxy="" opts=" ${DEVICE_SSH_OPTS:-} "
+    rb_ssh_ready || true
+    cfg="$("${RB_SSH[@]}" -G "$DEVICE_HOST" 2>/dev/null)" || cfg=""
+    host="$(printf '%s\n' "$cfg" | sed -n 's/^hostname //p' | head -n 1)"
+    port="$(printf '%s\n' "$cfg" | sed -n 's/^port //p' | head -n 1)"
+    proxy="$(printf '%s\n' "$cfg" | sed -n -e 's/^proxyjump //p' -e 's/^proxycommand //p' | grep -v '^none$' | head -n 1)"
+    if [ -z "$host" ]; then # no ssh -G: read the target ourselves
+        host="${DEVICE_HOST//[[:space:]]/}"
+        host="${host#*@}"
+        port="$(printf '%s' "$opts" | sed -n -e 's/.* -p *\([0-9][0-9]*\) .*/\1/p' -e 's/.*[Pp]ort=\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+        case "$opts" in *[Pp]roxy[Jj]ump*|*[Pp]roxy[Cc]ommand*|*" -J "*) proxy=1 ;; esac
+    fi
+    RB_NET_HOST="$host"
+    RB_NET_PORT="${port:-22}"
+    if [ -n "$proxy" ]; then
+        RB_NET_VIA=ssh
+    elif bash -c 'exec 3<>/dev/tcp/127.0.0.1/9' 2>&1 | grep -qi 'no such file\|not supported'; then
+        if command -v nc >/dev/null 2>&1; then RB_NET_VIA=nc; else RB_NET_VIA=ping; fi
+    else
+        RB_NET_VIA=tcp
+    fi
+    case "$RB_NET_VIA" in
+    ssh) RB_NET_DESC="ssh answering (a jump host is in use, the port is not reachable from here)" ;;
+    ping) RB_NET_DESC="ping" ;;
+    *) RB_NET_DESC="the ssh port (port $RB_NET_PORT, $RB_NET_VIA)" ;;
+    esac
+}
+
+# True when the device's ssh port accepts a connection (see rb_net_setup). Every probe has a short limit.
+rb_port_open() {
+    if [ -n "${RB_PORT_PROBE:-}" ]; then
+        eval "$RB_PORT_PROBE"
+        return
+    fi
+    case "${RB_NET_VIA:-}" in
+    tcp) timeout -k 1 2 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$RB_NET_HOST" "$RB_NET_PORT" >/dev/null 2>&1 ;;
+    nc) timeout -k 1 3 nc -z -w 2 "$RB_NET_HOST" "$RB_NET_PORT" >/dev/null 2>&1 ;;
+    ping) ping -c1 -W1 "$RB_NET_HOST" >/dev/null 2>&1 ;;
+    ssh) dev_run 5 true >/dev/null 2>&1 ;;
+    *) return 1 ;;
+    esac
+}
+
+# The checks of the two phases (state in globals: a wait runs the check in this shell).
+# Down: the port is closed. Every 5th poll the boot id is read as well, for a device that
+# rebooted while the port probe did not see it close (a boot id that changed, or ssh that fails).
+rb_down_check() {
+    RB_DOWN_N=$((RB_DOWN_N + 1))
+    rb_port_open || return 0
+    [ $((RB_DOWN_N % 5)) -eq 0 ] || return 1
+    rb_went_down "$RB_OLD_ID"
+}
+# Up: the port is open (the time is noted), AND ssh answers with a boot id that is not the old one.
+# A port that is open while ssh does not answer yet, or answers with the OLD id (the device did not
+# go down after all, or is still shutting down), is not "back".
+rb_up_check() {
+    rb_port_open || return 1
+    [ -n "$RB_T_PORT" ] || RB_T_PORT=$SECONDS
+    rb_is_back "$RB_OLD_ID"
+}
+
+# rb_phase_note <what> <seconds> <backup timeout>: a line for the log, with a warning when a phase
+# used more than half of its backup time (so that a slow device shows up before it fails).
+rb_phase_note() {
+    local note=""
+    [ $(($2 * 2)) -le "$3" ] || note=" (SLOW: more than half of the ${3}s backup timeout)"
+    rb_log "reboot: $1 after ${2}s$note"
+}
+
+# await_reboot <old boot id>: after the reboot was triggered, (1) the device must be seen going down
+# (the ssh port closes; REBOOT_DOWN_TIMEOUT is the backup), (2) come back (the port opens, then
+# ssh answers with a NEW boot id; REBOOT_UP_TIMEOUT is the backup), (3) the kit is installed again
+# and (4) the SD card is mounted. All polled every second; the time of each phase is logged
+# ("reboot: down after 4s, ..." and a summary line), so that the backups can be tuned.
 # No keep-awake steps meanwhile: the device is about to power-cycle.
 await_reboot() {
-    local old="$1" tick="${RB_TICK:-1}"
+    local old="$1" tick="${RB_TICK:-1}" t0=$SECONDS t_down t_up t_kit t_sd
     RB_TICK=0
-    await "${REBOOT_DOWN_TIMEOUT:-90}" "the device to go down (reboot)" rb_went_down "$old" || { RB_TICK=$tick; return 1; }
-    await "${REBOOT_UP_TIMEOUT:-300}" "the device to come back (ssh and a new boot id)" rb_is_back "$old" || { RB_TICK=$tick; return 1; }
+    RB_OLD_ID="$old" RB_DOWN_N=0 RB_T_PORT=""
+    rb_net_setup
+    rb_log "reboot: triggered, watching $RB_NET_DESC"
+    await "${REBOOT_DOWN_TIMEOUT:-90}" "the device to go down (reboot)" rb_down_check || { RB_TICK=$tick; rb_log "reboot: the device was not seen going down after $((SECONDS - t0))s"; return 1; }
+    t_down=$((SECONDS - t0))
+    rb_phase_note "down (ssh port closed)" "$t_down" "${REBOOT_DOWN_TIMEOUT:-90}"
+    await "${REBOOT_UP_TIMEOUT:-300}" "the device to come back (ssh port open, ssh answering with a new boot_id)" rb_up_check || { RB_TICK=$tick; rb_log "reboot: the device did not come back within $((SECONDS - t0 - t_down))s of going down (ssh port open: $([ -n "$RB_T_PORT" ] && echo yes || echo no); new boot_id: no)"; return 1; }
+    t_up=$((SECONDS - t0 - t_down))
     RB_TICK=$tick
+    rb_phase_note "back (port open ${RB_T_PORT:+$((RB_T_PORT - t0 - t_down))}s, then ssh with a new boot_id) ${t_up}s after going down; total" "$((SECONDS - t0))" "$((${REBOOT_DOWN_TIMEOUT:-90} + ${REBOOT_UP_TIMEOUT:-300}))"
     await 60 "the kit to be installed after the reboot" dev_install_kit || return 1
+    t_kit=$((SECONDS - t0))
     # The SD card is mounted a little after ssh is up: the backup flag lives on it, and the
     # evidence the power-off wrapper recorded too.
-    await 120 "the SD card to be mounted after the reboot" dev_ok 20 '[ -f "$BAK/active" ]'
+    await 120 "the SD card to be mounted after the reboot" probe '[ -f "$BAK/active" ]' || return 1
+    t_sd=$((SECONDS - t0))
+    rb_log "reboot timing: down after ${t_down}s, up (new boot_id) after ${t_up}s more, kit installed at ${t_kit}s, SD card mounted at ${t_sd}s since the trigger (backups: down ${REBOOT_DOWN_TIMEOUT:-90}s, up ${REBOOT_UP_TIMEOUT:-300}s)"
 }

@@ -330,6 +330,115 @@ wait_for() { # wait_for <seconds> <command...>
 running() { pgrep "$1" >/dev/null 2>&1; }
 not_running() { ! pgrep "$1" >/dev/null 2>&1; }
 
+# --- deterministic "settled" signals (instead of fixed sleeps) ---------------------------------
+# E2E_POLL_HOOK (a command, set by the reboot kit) runs on every poll of the settle loops, to keep
+# the device awake. All loops poll every second; the limits are only backups.
+
+# touch_marker <file>: touches the file and returns once the file system clock has moved past
+# its mtime, so that anything written afterwards is NEWER than the file (FAT mtimes have 2 s
+# resolution: a state written within the same 2 s would not count as new). Polls a second
+# probe file instead of sleeping 2 s: ends as soon as the clock ticks (no wait at all on
+# file systems with finer timestamps). The 10 s limit is a backup.
+touch_marker() {
+    local f="$1" p="$1.tick.$$" n=0
+    touch "$f" || return 1
+    while [ "$n" -lt 50 ]; do
+        touch "$p"
+        if [ "$p" -nt "$f" ]; then rm -f "$p"; return 0; fi
+        sleep 0.2 # poll step of the loop above
+        n=$((n + 1))
+    done
+    rm -f "$p"
+    echo "the file system clock did not move past $f within 10 s" >&2
+    return 1
+}
+
+# The pid of the newest process of that name ("" if none).
+first_pid() { pgrep "$1" 2>/dev/null | head -n 1; }
+
+# wait_ui_settled <stable s> <limit s>: NextUI is up, and it and its launcher are quiet: the SAME
+# nextui.elf process for <stable> consecutive polls (a NextUI that restarts, or that exits to
+# launch a game through /tmp/next, starts the count again) and no emulator. This is the "nothing
+# happened" signal for the absence checks (no auto-launch, no marker): an auto-resume acts
+# within a second or two of NextUI's start. Fails after <limit> s (the old fixed wait is the
+# backup) and says what it saw.
+wait_ui_settled() {
+    local stable="$1" limit="$2" n=0 ok=0 pid last="" game=""
+    while :; do
+        "${E2E_POLL_HOOK:-:}" || true
+        pid="$(first_pid nextui.elf)"
+        game=""
+        pgrep PPSSPPSDL >/dev/null 2>&1 && game=1
+        if [ -n "$pid" ] && [ "$pid" = "$last" ] && [ -z "$game" ]; then ok=$((ok + 1)); else ok=0; fi
+        last="$pid"
+        [ "$ok" -ge "$stable" ] && return 0
+        if [ "$n" -ge "$limit" ]; then
+            echo "NextUI did not settle within ${limit}s (nextui.elf pid: ${pid:-none}${game:+, a game is running}; quiet polls: $ok of $stable)" >&2
+            return 1
+        fi
+        sleep 1
+        n=$((n + 1))
+    done
+}
+
+# True if the emulator runs with the test ROM as its argument. The command lines are read from
+# /proc and matched on argv[0] and the arguments, never on the whole text: the ssh call that
+# runs this contains the ROM's name too.
+rb_rom_running() {
+    local p first line args
+    for p in /proc/[0-9]*/cmdline; do
+        [ -r "$p" ] || continue
+        args="$(tr '\0' '\n' <"$p" 2>/dev/null)"
+        first="${args%%$'\n'*}"
+        case "${first##*/}" in PPSSPPSDL*) ;; *) continue ;; esac
+        while IFS= read -r line; do
+            [ "$line" = "$ROM" ] && return 0
+        done <<<"$args"
+    done
+    return 1
+}
+
+# wait_game_settled <stable s> <limit s>: the emulator runs the test ROM and has done so, as the
+# SAME process, for <stable> consecutive polls. There is no log line or file that says "PPSSPP can
+# take hotkeys now", so the settle count stays (see BOOT_SETTLE in the README), but what the old
+# fixed sleep could not do: a game that dies while starting ends the wait at once, with an error.
+# Waits up to <limit> s for the game to appear (the old fixed wait is the backup).
+wait_game_settled() {
+    local stable="$1" limit="$2" n=0 ok=0 pid last="" seen=""
+    while :; do
+        "${E2E_POLL_HOOK:-:}" || true
+        pid=""
+        rb_rom_running && pid="$(first_pid PPSSPPSDL)"
+        if [ -n "$pid" ]; then
+            seen=1
+            if [ "$pid" = "$last" ]; then ok=$((ok + 1)); else ok=0; fi
+        else
+            ok=0
+            if [ -n "$seen" ]; then
+                echo "the game exited or was restarted while it was starting (see PSP.txt)" >&2
+                return 1
+            fi
+        fi
+        last="$pid"
+        [ "$ok" -ge "$stable" ] && return 0
+        if [ "$n" -ge "$limit" ]; then
+            echo "the game was not running steadily within ${limit}s (pid: ${pid:-none}; steady polls: $ok of $stable)" >&2
+            return 1
+        fi
+        sleep 1
+        n=$((n + 1))
+    done
+}
+
+# e2e_settle_count <wanted> <old fixed wait>: how many quiet polls to ask for: the wanted count,
+# never more than the old fixed wait that this replaces (a user who lowered UI_WAIT gets less).
+e2e_settle_count() {
+    local w="${1%%.*}" cap="${2%%.*}"
+    case "$w" in "" | *[!0-9]*) w=0 ;; esac
+    case "$cap" in "" | *[!0-9]*) cap="$w" ;; esac
+    [ "$w" -le "$cap" ] && echo "$w" || echo "$cap"
+}
+
 octal_byte() { printf '\\%03o' $(($1 & 255)); }
 
 # Write one evdev event (24 bytes: 16 zero timestamp bytes, type, code, value) to the pad.
@@ -373,7 +482,7 @@ press() {
         pad "$ev_type" "$ev_code" "$ev_val"
         syn
     done
-    sleep "$hold"
+    sleep "$hold" # input injection: the buttons must be down for a moment (a chord needs them together); no signal exists
     for k in $keys; do
         btn_set "$k"
         pad "$ev_type" "$ev_code" 0
@@ -387,7 +496,9 @@ colour() { "$PNGCOLOR" "$1" 2>/dev/null; } # prints "R G B"
 # $OUT/<label>.png and the name the pak gave it in $OUT/<label>.shotname.
 shot() {
     local before newest
-    sleep 1 # the pak names files by the second
+    # The pak names files by the second: only wait if the previous shot was taken in this very second.
+    while [ "$(date +%s)" = "$(cat "$OUT/.lastshot" 2>/dev/null)" ]; do sleep 0.1; done # poll step
+    date +%s >"$OUT/.lastshot" 2>/dev/null
     before="$(ls "$SHOTDIR" 2>/dev/null)"
     SDCARD_PATH="$SD" PATH="$MON/bin/$PLATFORM:$MON/bin:$PATH" sh "$MON/bin/screenshot" >"$OUT/$1.shot.log" 2>&1
     # shellcheck disable=SC2012 # names come from the screenshot pak (date based), ls -t is fine
@@ -426,14 +537,18 @@ not_fixture() {
 # An absolute path is not found and NextUI drops it, rewriting recent.txt empty.
 seed_recent() { mkdir -p "$(dirname "$RECENT")" && printf '%s\n' "${ROM#"$SD"}" >"$RECENT"; }
 
+# restart_ui: kills NextUI and waits until the NEW process is up and settled (same pid for
+# UI_SETTLE polls, at most UI_WAIT more seconds). The old process being gone is detected by its
+# pid, not by a fixed pause.
 restart_ui() {
+    local old
+    old="$(first_pid nextui.elf)"
     kill_ui
-    sleep 1
-    wait_for 40 running nextui.elf || {
+    wait_for 40 sh -c "p=\$(pgrep nextui.elf | head -n 1); [ -n \"\$p\" ] && [ \"\$p\" != '$old' ]" || {
         echo "NextUI did not come back within 40 s of being restarted" >&2
         return 1
     }
-    sleep "$UI_WAIT"
+    wait_ui_settled "$(e2e_settle_count "${UI_SETTLE:-4}" "$UI_WAIT")" "$((${UI_WAIT%%.*} + 4))"
 }
 
 open_switcher() { # restarts NextUI directly into the Game Switcher

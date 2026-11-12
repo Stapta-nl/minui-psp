@@ -24,6 +24,7 @@ setup() {
     # that the device is down for a window of calls and that it booted again at some call.
     cat >"$T/bin/ssh" <<'SSH'
 #!/bin/sh
+case " $* " in *" -G "*) printf 'hostname brick.example\nport 2222\nproxyjump none\n'; exit 0 ;; esac
 n=$(($(cat "$FAKE_SSH_STATE" 2>/dev/null || echo 0) + 1))
 echo "$n" >"$FAKE_SSH_STATE"
 while [ $# -gt 0 ]; do
@@ -54,8 +55,21 @@ SSH
     echo oldboot >"$BOOT_ID_FILE"
     export RB_KIT_PATH="$T/kit.sh"
     export POLL_INTERVAL=0.2 KEEPAWAKE_INTERVAL=0
+    export RB_TIMINGS_FILE="$T/timings.txt"
+    export RB_PORT_PROBE=fake_port FAKE_PORT_STATE="$T/port.count"
+    : >"$FAKE_PORT_STATE"
     rb_ssh_setup
     make_device
+}
+
+# The fake network: the port probe call n is closed from FAKE_PORT_DOWN_FROM to FAKE_PORT_DOWN_TO
+# (calls are counted), open otherwise.
+fake_port() {
+    local n
+    n=$(($(cat "$FAKE_PORT_STATE" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$FAKE_PORT_STATE"
+    [ -n "${FAKE_PORT_DOWN_FROM:-}" ] && [ "$n" -ge "$FAKE_PORT_DOWN_FROM" ] && [ "$n" -le "${FAKE_PORT_DOWN_TO:-0}" ] && return 1
+    return 0
 }
 
 # A device tree like the real one, in $T/sd.
@@ -147,7 +161,7 @@ make_device() {
     [ $((SECONDS - start)) -le 4 ]
 }
 
-@test "keep-awake: every interval a tap is sent during await and pause; off with interval 0 or RB_TICK=0" {
+@test "keep-awake: every interval a tap is sent during await; off with interval 0 or RB_TICK=0" {
     export KEEPAWAKE_INTERVAL=1
     run await 3 "nothing" false
     assert_failure
@@ -155,24 +169,65 @@ make_device() {
     n="$(grep -c 'rb_tick' "$FAKE_SSH_LOG")"
     [ "$n" -ge 2 ]
     : >"$FAKE_SSH_LOG"
-    RB_LAST_TICK="" pause 3
-    n="$(grep -c 'rb_tick' "$FAKE_SSH_LOG")"
-    [ "$n" -ge 2 ]
-    : >"$FAKE_SSH_LOG"
-    RB_TICK=0 pause 2
+    RB_TICK=0 run await 2 "nothing" false
     [ "$(grep -c 'rb_tick' "$FAKE_SSH_LOG")" = 0 ]
-    KEEPAWAKE_INTERVAL=0 pause 2
+    KEEPAWAKE_INTERVAL=0 run await 2 "nothing" false
     [ "$(grep -c 'rb_tick' "$FAKE_SSH_LOG")" = 0 ]
 }
 
 @test "keep-awake: a failing step (device down) never fails the wait" {
     export KEEPAWAKE_INTERVAL=1 FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=999
-    run pause 2
+    local n=0
+    # shellcheck disable=SC2317 # called through await
+    third() { n=$((n + 1)); [ "$n" -ge 6 ]; }
+    run await 5 "the 6th poll" third
     assert_success
 }
 
+@test "await polls every second by default (POLL_INTERVAL) and returns as soon as the condition holds" {
+    unset POLL_INTERVAL
+    local start=$SECONDS n=0
+    # shellcheck disable=SC2317 # called through await
+    third() { n=$((n + 1)); [ "$n" -ge 3 ]; }
+    await 30 "the third poll" third
+    [ $((SECONDS - start)) -le 4 ]
+}
+
+# --- the reboot: down, then up, each detected and timed ----------------------------------------
+@test "await_reboot: port closes, port opens but ssh does not answer yet, then a NEW boot id: timings are logged" {
+    # port probes 1..: open at 1 is not needed (down is seen at the first closed probe); closed 2..4;
+    # ssh calls: the port is open from probe 5 but ssh refuses calls 1-2, then answers with a new id.
+    export FAKE_PORT_DOWN_FROM=2 FAKE_PORT_DOWN_TO=4 FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=3
+    export REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    run await_reboot oldboot
+    assert_success
+    assert_output --partial "reboot: triggered, watching"
+    assert_output --partial "reboot: down (ssh port closed) after"
+    assert_output --partial "then ssh with a new boot_id"
+    assert_output --partial "reboot timing: down after"
+    assert_output --partial "SD card mounted at"
+    assert_file_exist "$RB_KIT_PATH"
+    [ "$(cat "$BOOT_ID_FILE")" = newboot ]
+    run cat "$T/timings.txt"
+    assert_output --partial "reboot timing: down after"
+    refute_output --partial "brick.example"
+}
+
+@test "await_reboot: a port that closes at once is detected at the first probe (no 5-10 s granularity)" {
+    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    local start=$SECONDS
+    run await_reboot oldboot
+    assert_success
+    [ $((SECONDS - start)) -le 5 ]
+    assert_output --partial "down (ssh port closed) after 0s"
+}
+
 @test "await_reboot: also waits for the SD card (the backup flag) after the boot" {
-    export FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=3 REBOOT_DOWN_TIMEOUT=5 REBOOT_UP_TIMEOUT=10
+    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=5 REBOOT_UP_TIMEOUT=10
     rm -f "$BAK/active"
     ( sleep 2; mkdir -p "$BAK"; : >"$BAK/active" ) 3>&- &
     run await_reboot oldboot
@@ -180,29 +235,183 @@ make_device() {
     assert_file_exist "$BAK/active"
 }
 
-@test "await_reboot: down, then up with a new boot id, then the kit is installed again" {
-    export FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=3 FAKE_SSH_NEWBOOT_AT=4
-    export REBOOT_DOWN_TIMEOUT=5 REBOOT_UP_TIMEOUT=10
-    mkdir -p "$BAK"
-    : >"$BAK/active"
-    run await_reboot oldboot
-    assert_success
-    assert_file_exist "$RB_KIT_PATH"
-    [ "$(cat "$BOOT_ID_FILE")" = newboot ]
-}
-
-@test "await_reboot: a device that never goes down is an error" {
+@test "await_reboot: a device that never goes down (port stays open, same boot id) is an error naming the phase" {
     export REBOOT_DOWN_TIMEOUT=1 REBOOT_UP_TIMEOUT=2
     run await_reboot oldboot
     assert_failure
     assert_output --partial "the device to go down"
+    assert_output --partial "was not seen going down"
 }
 
-@test "await_reboot: a connection that drops and returns with the SAME boot id is not a reboot" {
-    export FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=2 REBOOT_DOWN_TIMEOUT=3 REBOOT_UP_TIMEOUT=2
+@test "await_reboot: a reboot the port probe never saw is still found by the boot id that changed" {
+    export FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=10
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    run await_reboot oldboot
+    assert_success
+}
+
+@test "await_reboot: the port goes down and comes back with the SAME boot id: not a reboot" {
+    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=3 REBOOT_DOWN_TIMEOUT=3 REBOOT_UP_TIMEOUT=2
     run await_reboot oldboot
     assert_failure
     assert_output --partial "the device to come back"
+    assert_output --partial "ssh port open: yes; new boot_id: no"
+}
+
+@test "await_reboot: the port never opens again: an error after the backup timeout" {
+    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=100000 REBOOT_DOWN_TIMEOUT=3 REBOOT_UP_TIMEOUT=1
+    run await_reboot oldboot
+    assert_failure
+    assert_output --partial "ssh port open: no"
+}
+
+@test "await_reboot: a phase that used more than half of its backup time is flagged SLOW" {
+    run rb_phase_note "down" 8 10
+    assert_output --partial "SLOW"
+    run rb_phase_note "down" 3 10
+    refute_output --partial "SLOW"
+}
+
+@test "rb_net_setup: the ssh port of the device (ssh -G, then -p in the options), the jump host case, no address in the description" {
+    unset RB_PORT_PROBE
+    rb_net_setup
+    [ "$RB_NET_HOST" = brick.example ] && [ "$RB_NET_PORT" = 2222 ]
+    [ "$RB_NET_VIA" = tcp ]
+    [[ "$RB_NET_DESC" != *brick.example* ]]
+    # without ssh -G: the target and -p are read from the settings
+    printf '#!/bin/sh\nexit 1\n' >"$T/bin/ssh"
+    rb_net_setup
+    [ "$RB_NET_HOST" = brick.example ] && [ "$RB_NET_PORT" = 2222 ]
+    DEVICE_SSH_OPTS="-J jump.example" rb_net_setup
+    [ "$RB_NET_VIA" = ssh ]
+}
+
+@test "rb_port_open: a real TCP connect (bash /dev/tcp) sees an open port and a closed one" {
+    unset RB_PORT_PROBE
+    bash -c 'exec 3<>/dev/tcp/127.0.0.1/9' 2>&1 | grep -qi 'no such file' && skip "this bash has no /dev/tcp"
+    require_tools python3
+    local port
+    port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+    RB_NET_VIA=tcp RB_NET_HOST=127.0.0.1 RB_NET_PORT="$port"
+    run rb_port_open
+    assert_failure
+    python3 -c 'import socket,sys,time; s=socket.socket(); s.bind(("127.0.0.1",int(sys.argv[1]))); s.listen(5); time.sleep(8)' "$port" 3>&- &
+    local i=0
+    while [ "$i" -lt 30 ] && ! rb_port_open; do sleep 0.2; i=$((i + 1)); done
+    rb_port_open
+    kill %1 2>/dev/null
+    true
+}
+
+# --- settle signals instead of fixed sleeps --------------------------------------------------------
+fake_settle_tools() {
+    mkdir -p "$T/fs"
+    cat >"$T/fs/pgrep" <<'FAKE'
+#!/bin/sh
+case "$1" in
+nextui.elf) [ -f "$FS/nextui.pid" ] && { cat "$FS/nextui.pid"; exit 0; }; exit 1 ;;
+PPSSPPSDL) [ -f "$FS/game.pid" ] && { cat "$FS/game.pid"; exit 0; }; exit 1 ;;
+esac
+exit 1
+FAKE
+    chmod +x "$T/fs/pgrep"
+    export FS="$T/fs" PATH="$T/fs:$PATH"
+    # shellcheck disable=SC1091
+    . "$HELPERS/e2e.bash"
+    # shellcheck disable=SC2317
+    rb_rom_running() { [ -f "$FS/game.pid" ]; }
+}
+
+@test "wait_ui_settled: returns after N quiet polls, early (not after the old fixed wait)" {
+    fake_settle_tools
+    echo 100 >"$FS/nextui.pid"
+    local start=$SECONDS
+    run wait_ui_settled 2 30
+    assert_success
+    [ $((SECONDS - start)) -le 5 ]
+}
+
+@test "wait_ui_settled: a NextUI that restarts (new pid) or exits to launch a game is not settled; the limit is the backup" {
+    fake_settle_tools
+    echo 100 >"$FS/nextui.pid"
+    ( for p in 101 102 103 104 105 106 107 108; do sleep 0.6; echo "$p" >"$FS/nextui.pid"; done ) &
+    run wait_ui_settled 3 4
+    assert_failure
+    assert_output --partial "did not settle within 4s"
+    wait
+    echo 200 >"$FS/nextui.pid"
+    echo 300 >"$FS/game.pid"
+    run wait_ui_settled 2 3
+    assert_failure
+    assert_output --partial "a game is running"
+    rm -f "$FS/nextui.pid" "$FS/game.pid"
+    run wait_ui_settled 1 2
+    assert_failure
+    assert_output --partial "pid: none"
+}
+
+@test "wait_game_settled: the same game process for N polls; a game that dies while starting ends the wait at once" {
+    fake_settle_tools
+    echo 300 >"$FS/game.pid"
+    run wait_game_settled 2 30
+    assert_success
+    ( sleep 1; rm -f "$FS/game.pid" ) &
+    local start=$SECONDS
+    run wait_game_settled 10 30
+    assert_failure
+    assert_output --partial "exited or was restarted"
+    [ $((SECONDS - start)) -le 6 ]
+    wait
+    rm -f "$FS/game.pid"
+    run wait_game_settled 1 2
+    assert_failure
+    assert_output --partial "not running steadily within 2s"
+}
+
+@test "the settle loops call E2E_POLL_HOOK (the keep-awake) on the device" {
+    fake_settle_tools
+    echo 100 >"$FS/nextui.pid"
+    hook() { echo x >>"$T/hook.log"; }
+    E2E_POLL_HOOK=hook run wait_ui_settled 2 30
+    [ "$(wc -l <"$T/hook.log")" -ge 3 ]
+}
+
+@test "e2e_settle_count: the wanted count, capped by the old fixed wait (a lowered UI_WAIT wins), junk is 0" {
+    run e2e_settle_count 10 20
+    assert_output 10
+    run e2e_settle_count 10 6
+    assert_output 6
+    run e2e_settle_count 4 6.5
+    assert_output 4
+    run e2e_settle_count x 6
+    assert_output 0
+}
+
+@test "settle_ui / settle_game / settle_nogame: run the wait on the device through the kit, with the old wait as the bound" {
+    fake_settle_tools
+    echo 100 >"$FS/nextui.pid"
+    echo 300 >"$FS/game.pid"
+    dev_install_kit
+    # the device here is this machine: the fake pgrep is in PATH of the fake ssh
+    run settle_ui 1 5
+    assert_failure # a game is running: NextUI is not "settled"
+    rm -f "$FS/game.pid"
+    run settle_ui 1 5
+    assert_success
+    NOGAME_SETTLE=1 NOGAME_WAIT=5 run settle_nogame
+    assert_success
+    grep -q 'wait_ui_settled 1 6' "$FAKE_SSH_LOG"
+    run settle_game 1 5 # (the game check reads /proc here: only the call is checked)
+    grep -q 'wait_game_settled 1 5' "$FAKE_SSH_LOG"
+}
+
+@test "touch_marker: returns once the clock moved past the marker, so a later write is newer" {
+    touch_marker "$T/marker"
+    : >"$T/later"
+    [ "$T/later" -nt "$T/marker" ] || [ "$(stat -c %Y "$T/later")" -gt "$(stat -c %Y "$T/marker")" ]
+    run touch_marker "$T/nodir/marker"
+    assert_failure
 }
 
 @test "dev_run works inside a bats test when only setup_file ran rb_ssh_setup (arrays are not exported)" {

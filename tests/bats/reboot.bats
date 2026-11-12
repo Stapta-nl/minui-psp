@@ -55,8 +55,15 @@
 # put back at the end like the other files; SAVE_KEYS/EXIT_KEYS override and are never written.
 #
 # Env: DEVICE_HOST, DEVICE_SSH_OPTS (set by run-reboot.sh), SDCARD_PATH, PLATFORM, ROM_DIR, ROM,
-# SET_HOTKEYS, SAVE_KEYS, EXIT_KEYS, BOOT_WAIT (20), UI_WAIT (6), NOGAME_WAIT (25: how long "no auto-launch" is watched),
+# SET_HOTKEYS, SAVE_KEYS, EXIT_KEYS, BOOT_WAIT (20), UI_WAIT (6), NOGAME_WAIT (25),
 # and the timeouts and intervals listed in tests/helpers/reboot.bash.
+#
+# Waits are signals, not sleeps: a reboot is watched on the network (port closes, port opens, ssh
+# answers with a new boot_id; the time of each phase is logged), a game start by the process
+# running the ROM steadily (BOOT_SETTLE, 10 s: the same pid for that long, a game that dies ends
+# the wait at once), "NextUI did nothing" (no auto-launch) by the same nextui.elf staying up with no
+# game for NOGAME_SETTLE (10 s) / UI_SETTLE (4 s) polls. BOOT_WAIT, UI_WAIT, NOGAME_WAIT and the
+# REBOOT_* / RESUME_TIMEOUT values are the upper bounds after which a wait gives up.
 
 load '../helpers/common'
 load '../helpers/reboot'
@@ -80,13 +87,13 @@ pak_log() { dev_kit 60 'grep -v "^+" "$LOGS/PSP.txt"'; }
 # settings set for the case (auto-load newest state always on).
 start_game() {
     dev_kit 240 "rb_settle; rb_ini_set SaveStateOnExit $1; rb_ini_set AutoLoadSaveState 2; rb_mark; rb_launch_game"
-    await 90 "PPSSPP to start the test game" dev_ok 20 rb_rom_running
-    pause "$BOOT_WAIT"
+    await 90 "PPSSPP to start the test game" probe rb_rom_running
+    settle_boot
 }
 
 # The game runs (a case that follows an auto-resume keeps it), else start it.
 ensure_game() {
-    if ! dev_ok 20 rb_rom_running; then start_game "$1"; fi
+    if ! probe rb_rom_running; then start_game "$1"; fi
 }
 
 assert_dev() { # assert_dev <script>: the script succeeds on the device
@@ -158,7 +165,7 @@ teardown_file() {
     [ -n "${RB_STARTED:-}" ] || return 0
     rb_ssh_setup || return 0
     # A case that was cut short in the middle of a reboot: wait for the device first.
-    RB_TICK=0 await "${REBOOT_UP_TIMEOUT:-300}" "the device to be reachable for the restore" dev_run 20 true || {
+    RB_TICK=0 await "${REBOOT_UP_TIMEOUT:-300}" "the device to be reachable for the restore" dev_run "${RB_PROBE_TIMEOUT:-10}" true || {
         echo "# the device is not reachable: its backup stays on the SD card and is restored by the next run" >&3
         return 0
     }
@@ -178,13 +185,13 @@ teardown_file() {
 @test "R1 quit with the Exit hotkey: a state and its preview are saved, no auto-resume marker" {
     start_game True
     dev_kit 30 rb_quit_game
-    await 40 "PPSSPP to exit after the Exit hotkey (hotkeys: see the log)" dev_ok 20 rb_no_game
-    await 90 "NextUI to be back" dev_ok 20 rb_nextui_up
-    await 60 "a new save state (.ppst) from the exit" dev_ok 20 rb_has_new_state
-    await 40 "the Game Switcher preview of the newest state" dev_ok 20 rb_has_new_preview
+    await 40 "PPSSPP to exit after the Exit hotkey (hotkeys: see the log)" probe rb_no_game
+    await 90 "NextUI to be back" probe rb_nextui_up
+    await 60 "a new save state (.ppst) from the exit" probe rb_has_new_state
+    await 40 "the Game Switcher preview of the newest state" probe rb_has_new_preview
     assert_dev '[ "$(rb_slot_file_slot)" = "$(rb_newest_new_slot)" ]'
     refute_dev rb_marker_exists
-    pause "$UI_WAIT"
+    settle_ui_short
     refute_dev rb_marker_exists
     assert_dev rb_nextui_up
     fetch_log R1
@@ -194,8 +201,8 @@ teardown_file() {
 @test "R2 NextUI is up after a quit and after a restart and launches no game (no auto-launch)" {
     need_step r1-quit
     dev_kit 30 kill_ui # SIGKILL: NextUI starts again, and would run autoResume() if a marker existed
-    await 90 "NextUI to be back" dev_ok 20 rb_nextui_up
-    pause "$NOGAME_WAIT"
+    await 90 "NextUI to be back" probe rb_nextui_up
+    settle_nogame
     assert_dev rb_nextui_up
     assert_dev rb_no_game
     refute_dev rb_marker_exists
@@ -226,8 +233,8 @@ teardown_file() {
 
 @test "R4 after the reboot NextUI relaunches the game (auto-resume)" {
     need_step r3-rebooted
-    await "${RESUME_TIMEOUT:-180}" "PPSSPP to run the test game after the boot" dev_ok 20 rb_rom_running
-    pause "$UI_WAIT"
+    await "${RESUME_TIMEOUT:-180}" "PPSSPP to run the test game after the boot" probe rb_rom_running
+    settle_resumed
     assert_dev rb_rom_running
     run pak_log
     assert_success
@@ -239,7 +246,7 @@ teardown_file() {
 
 @test "R5 the auto-resume marker was consumed by NextUI" {
     need_step r3-rebooted
-    await 60 "the marker to be consumed" dev_ok 20 '! rb_marker_exists'
+    await 60 "the marker to be consumed" probe '! rb_marker_exists'
     refute_dev rb_marker_exists
 }
 
@@ -247,9 +254,9 @@ teardown_file() {
 @test "R6 crash (kill -9 PPSSPP): no marker, back at the menu, no auto-launch" {
     ensure_game True
     dev_kit 30 'killall -9 "PPSSPPSDL_$PLATFORM"'
-    await 40 "PPSSPP to be gone" dev_ok 20 rb_no_game
-    await 90 "NextUI to be back" dev_ok 20 rb_nextui_up
-    pause "$NOGAME_WAIT"
+    await 40 "PPSSPP to be gone" probe rb_no_game
+    await 90 "NextUI to be back" probe rb_nextui_up
+    settle_nogame
     assert_dev rb_nextui_up
     assert_dev rb_no_game
     refute_dev rb_marker_exists
@@ -257,8 +264,8 @@ teardown_file() {
     assert_success
     assert_output --partial "No power-off detected"
     dev_kit 30 kill_ui
-    await 90 "NextUI to be back after its restart" dev_ok 20 rb_nextui_up
-    pause "$NOGAME_WAIT"
+    await 90 "NextUI to be back after its restart" probe rb_nextui_up
+    settle_nogame
     assert_dev rb_no_game
     fetch_log R6
 }
@@ -266,15 +273,15 @@ teardown_file() {
 @test "R7 forced reboot without the handshake (power cut analogue): no auto-resume, states intact" {
     start_game True
     dev_kit 30 rb_save_state
-    await 30 "a state saved with the Save State hotkey (hotkeys: see the log)" dev_ok 20 rb_has_new_state
+    await 30 "a state saved with the Save State hotkey (hotkeys: see the log)" probe rb_has_new_state
     dev_kit 30 rb_save_snapshot
     local old
     old="$(rb_boot_id)"
     [ -n "$old" ] || fail "could not read the device's boot id"
     dev_kit 30 rb_hard_reboot
     await_reboot "$old"
-    await "${RESUME_TIMEOUT:-180}" "NextUI to be up after the boot" dev_ok 20 rb_nextui_up
-    pause "$NOGAME_WAIT"
+    await "${RESUME_TIMEOUT:-180}" "NextUI to be up after the boot" probe rb_nextui_up
+    settle_nogame
     assert_dev rb_nextui_up
     assert_dev rb_no_game
     refute_dev rb_marker_exists
@@ -286,11 +293,11 @@ teardown_file() {
     # A state to resume: made with the setting on, by the hotkey and then the exit.
     start_game True
     dev_kit 30 rb_save_state
-    await 30 "a state saved with the hotkey" dev_ok 20 rb_has_new_state
+    await 30 "a state saved with the hotkey" probe rb_has_new_state
     dev_kit 30 rb_quit_game
-    await 40 "PPSSPP to exit" dev_ok 20 rb_no_game
-    await 90 "NextUI to be back" dev_ok 20 rb_nextui_up
-    pause "$UI_WAIT"
+    await 40 "PPSSPP to exit" probe rb_no_game
+    await 90 "NextUI to be back" probe rb_nextui_up
+    settle_ui_short
     start_game False
     dev_kit 30 rb_save_snapshot # all states that exist now, none of them may change
     dev_kit 30 rb_install_wrapper
@@ -315,8 +322,8 @@ teardown_file() {
 
 @test "R9 setting off: after the reboot the game is relaunched and the marker consumed" {
     need_step r8-rebooted
-    await "${RESUME_TIMEOUT:-180}" "PPSSPP to run the test game after the boot" dev_ok 20 rb_rom_running
-    pause "$UI_WAIT"
+    await "${RESUME_TIMEOUT:-180}" "PPSSPP to run the test game after the boot" probe rb_rom_running
+    settle_resumed
     assert_dev rb_rom_running
     refute_dev rb_marker_exists
     assert_dev rb_states_intact
