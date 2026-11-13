@@ -41,11 +41,12 @@
 #
 # The device is kept awake for the whole run: a detached keep-awake loop on the device (started by run-device.sh
 # before the on-device tests and kept, or started in setup_file, and again after every boot) taps a harmless
-# button (KEEPAWAKE_KEY, default l1) and checks the screen every second; the waits and long calls tap too.
-# A screen that NextUI turned off anyway (its hybrid sleep, seen as keymon.elf stopped; or a backlight node
-# bl_power that says powered down; never on a guess) is woken with a short power key tap: an L1 tap does not end
-# NextUI's screen-off. A device in DEEP sleep does not answer ssh, so it cannot be woken from here: prevention
-# is what the tests rely on. Long calls (preflight, backup, clean start, restore) run as detached jobs on the
+# button (KEEPAWAKE_KEY, default l1; never inside a test's key press: the input lock) and looks at the screen
+# every second; the waits and long calls tap too. The loop has a lease the host renews (every test's setup, the
+# waits, the job polls), so it never outlives a run by long. A screen that NextUI turned off anyway (its hybrid
+# sleep, seen as keymon.elf stopped) is only REPORTED ("press the power button"): an L1 tap does not end it,
+# and an automatic power tap is off unless RB_POWER_WAKE=1 (rb_wake_guarded). A device in DEEP sleep does not
+# answer ssh, so it cannot be woken from here: prevention is what the tests rely on. Long calls (preflight, backup, clean start, restore) run as detached jobs on the
 # device that the host polls (rb_job): a Wi-Fi drop does not end them. Whether the device suspended is read from
 # its suspend counter (suspend-ledger.txt), never guessed from ping.
 #
@@ -154,6 +155,8 @@ refute_dev() { # refute_dev <script>: the script fails on the device (not an ssh
 setup() {
     rb_ssh_setup
     rb_test_begin
+    # renews the lease of the device's keep-awake loop (it ends by itself when nobody does; best effort)
+    dev_kit 10 rb_keepawake_renew >/dev/null 2>&1 || true
 }
 
 # One line per test in the TAP output: the total and where the time went (every wait and every ssh call of 2 s or more).
@@ -239,12 +242,22 @@ setup_file() {
     [ "$rc" = 0 ] || fail "could not bring the device to a clean start (status $rc): $out"
 }
 
+# rb_end_keepawake: the end of the device's keep-awake loop (best effort; its lease ends it anyway): its log
+# (the screen state at every tick since the last boot) is kept, then it is stopped.
+rb_end_keepawake() {
+    dev_kit 30 'cat "$RB_TMP/psp-keepawake.log"' >"$OUT/keepawake-device.log" 2>/dev/null || true
+    dev_kit 30 rb_keepawake_stop >/dev/null 2>&1 || true
+}
+
 teardown_file() {
-    [ -n "${RB_STARTED:-}" ] || return 0
     rb_ssh_setup || return 0
+    if [ -z "${RB_STARTED:-}" ]; then # setup_file failed before the backup: nothing to restore
+        rb_end_keepawake
+        return 0
+    fi
     # A case that was cut short in the middle of a reboot: wait for the device first.
     RB_TICK=0 await "${REBOOT_UP_TIMEOUT:-120}" "the device to be reachable for the restore" dev_run "${RB_PROBE_TIMEOUT:-10}" true || {
-        echo "# the device is not reachable ($(rb_unreachable_note 255)): its backup stays on the SD card and is restored by the next run" >&3
+        echo "# the device is not reachable ($(rb_unreachable_note 255)): its backup stays on the SD card and is restored by the next run; its keep-awake loop ends with its lease (${RB_KEEPAWAKE_LEASE:-600} s)" >&3
         return 0
     }
     rb_device_retry dev_install_kit
@@ -257,12 +270,10 @@ teardown_file() {
     else
         echo "# the restore failed: run again, the next run restores from the backup on the SD card ($restored)" >&3
     fi
-    # Did the device sleep during the run? (tells whether the keep-awake works) Then the loop is stopped and its
-    # log (the screen state at every tick since the last boot) kept.
+    # Did the device sleep during the run? (tells whether the keep-awake works)
     rb_suspend_record "end of the reboot suite"
     echo "# $(rb_suspend_total)" >&3
-    dev_kit 30 'cat "$RB_TMP/psp-keepawake.log"' >"$OUT/keepawake-device.log" 2>/dev/null || true
-    dev_kit 30 rb_keepawake_stop >/dev/null 2>&1 || true
+    rb_end_keepawake
 }
 
 # --- R1/R2: quit paths --------------------------------------------------------------------

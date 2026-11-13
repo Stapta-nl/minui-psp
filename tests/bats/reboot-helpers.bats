@@ -62,6 +62,7 @@ SSH
     echo oldboot >"$BOOT_ID_FILE"
     export RB_KIT_PATH="$T/kit.sh"
     export POLL_INTERVAL=0.2 KEEPAWAKE_INTERVAL=0
+    export RB_MOUNT_DEBUGFS=0 RB_DEBUGFS_DIR="$T/no-debugfs" # never mount anything on this machine
     export RB_TIMINGS_FILE="$T/timings.txt"
     export RB_PORT_PROBE=fake_port FAKE_PORT_STATE="$T/port.count" RB_PING_PROBE="return 2" # ping: "not available" unless a test says otherwise
     : >"$FAKE_PORT_STATE"
@@ -1734,10 +1735,11 @@ fake_game_up() { # a NextUI that is up and no game: what e2e_stop_game wants to 
     SLEEP_PROBE=false KEEPAWAKE_KEY=y CHORD_HOLD=0.1 rb_tick
     [ -s "$PAD" ] # (the pad here is a plain file: it holds the last event written)
     : >"$PAD"
-    SLEEP_PROBE=true POWER_DEV_NAME='nonexistent-device' run rb_tick
-    assert_failure # no power key device: it says so, and does not touch the pad
-    assert_output --partial "no power key device"
-    [ ! -s "$PAD" ]
+    SLEEP_PROBE=true run rb_tick
+    assert_output --partial "the screen is OFF"
+    assert_output --partial "press the power button"
+    assert_output --partial "automatic power taps are off"
+    [ ! -s "$PAD" ] # no key at all
 }
 
 @test "rb_asleep: only bl_power != 0 counts; brightness 0 or no node never does" {
@@ -1996,6 +1998,10 @@ two"
     grep -q 'rb_suspend_record "start of the reboot suite"' "$f"
     grep -q 'rb_suspend_total' "$f"
     grep -q 'rb_keepawake_stop' "$f"
+    # the loop is stopped also when setup_file failed before the backup; every test renews its lease
+    [ "$(grep -c '^    *rb_end_keepawake$' "$f")" -ge 2 ]
+    grep -q 'dev_kit 10 rb_keepawake_renew' "$f"
+    grep -q 'keepawake_renew' "$TESTS_DIR/bats/e2e.bats"
     grep -q "rb_awake 'rb_settle; rb_ini_set" "$f"
     grep -q 'rb_awake "$(cat "$d/script")"' "$HELPERS/reboot-device.bash" # every job runs under rb_awake
     run grep -c 'rb_backup_call\|probably ASLEEP' "$f" "$HELPERS/reboot.bash"
@@ -2011,8 +2017,13 @@ two"
     [ -n "$start" ] && [ "$start" -lt "$tests" ] && [ "$tests" -lt "$keep" ] && [ "$keep" -lt "$reboot" ]
     run grep -c 'rb_keepawake_stop' "$f"
     assert_output 0 # not stopped between the suites; reboot.bats stops it, cleanup() too:
-    grep -q 'kill -TERM .*psp-keepawake.pid\|psp-keepawake.pid.*kill -TERM' "$f"
+    grep -q 'rm -f /tmp/psp-keepawake.until; p=.*psp-keepawake.d/pid.*kill -TERM' "$f"
     grep -q 'keepawake-ondevice.log' "$f"
+    grep -q 'rb_init || exit 98; $2' "$f" # nothing runs after a failed rb_init
+    grep -q '^renew_lease &' "$f"
+    # run-reboot.sh alone stops it too
+    grep -q "trap 'stop_keepawake' EXIT" "$TESTS_DIR/run-reboot.sh"
+    grep -q 'psp-keepawake.d/pid' "$TESTS_DIR/run-reboot.sh"
 }
 
 # --- detached jobs, the suspend counter, the screen-off state, the keep-awake loop -------------
@@ -2084,6 +2095,28 @@ fail_next() {
     assert_line --index 0 0
 }
 
+@test "rb_job_poll: a job that has not written its pid yet is starting (running) for RB_JOB_START_GRACE s, then gone" {
+    mkdir -p "$RB_TMP/psp-test-jobs/j1"
+    date +%s >"$RB_TMP/psp-test-jobs/j1/started"
+    run rb_job_poll j1
+    assert_failure 3
+    RB_JOB_START_GRACE=0 run rb_job_poll j1
+    assert_failure 4
+    run rb_job_poll nosuchjob
+    assert_failure 4
+}
+
+@test "rb_job: a start cut by its limit (124) is retried: the start is idempotent" {
+    grep -q 'RB_RETRY_ALSO=124 rb_device_retry dev_kit 20 "rb_keepawake_renew; rb_job_start' "$HELPERS/reboot.bash"
+    calls=0
+    flaky() { calls=$((calls + 1)); [ "$calls" -ge 2 ] || return 124; }
+    RB_RETRY_ALSO=124 rb_device_retry flaky
+    [ "$calls" = 2 ]
+    calls=0
+    run rb_device_retry flaky
+    assert_failure 124
+}
+
 @test "rb_job: a host that gives up leaves the job running with its lock: a restore waits for it and refuses next to it, then works" {
     job_env
     seed_files
@@ -2135,11 +2168,61 @@ fail_next() {
     chmod +x "$T/bin/dmesg"
     RB_SUSPEND_STATS="$T/none" RB_SUSPEND_DEBUGFS="$T/none" run rb_suspend_count
     assert_output "2 dmesg"
+    # kernel 4.9: no "suspend entry" line; each suspend syncs and freezes
+    printf '#!/bin/sh\nprintf "[9.0] PM: Syncing filesystems ... done.\\n[9.1] Freezing user space processes ... (elapsed 0.01 seconds) done.\\n[9.9] Restarting tasks ... done.\\n[20.0] PM: Syncing filesystems ... done.\\n[20.1] Freezing user space processes ... done.\\n"\n' >"$T/bin/dmesg"
+    RB_SUSPEND_STATS="$T/none" RB_SUSPEND_DEBUGFS="$T/none" run rb_suspend_count
+    assert_output "2 dmesg"
+    RB_SUSPEND_STATS="$T/none" RB_SUSPEND_DEBUGFS="$T/none" run rb_power_info
+    assert_line --index 0 "oldboot 2 dmesg"
+    assert_output --partial "pm: [20.1] Freezing user space processes"
+    # no power-management line at all: unknown, not "0 suspends"
+    printf '#!/bin/sh\nprintf "[1.0] boot\\n"\n' >"$T/bin/dmesg"
+    RB_SUSPEND_STATS="$T/none" RB_SUSPEND_DEBUGFS="$T/none" run rb_suspend_count
+    assert_output "0 dmesg-nopm"
     printf '#!/bin/sh\nexit 1\n' >"$T/bin/dmesg"
     RB_SUSPEND_STATS="$T/none" RB_SUSPEND_DEBUGFS="$T/none" run rb_suspend_count
     assert_failure
     RB_SUSPEND_STATS="$T/none" RB_SUSPEND_DEBUGFS="$T/none" run rb_power_info
-    assert_output "oldboot - none"
+    assert_line --index 0 "oldboot - none"
+    refute_output --partial "No such file"
+}
+
+@test "rb_debugfs_mount: mounts debugfs only on an existing, empty, unmounted mount point, and never with RB_MOUNT_DEBUGFS=0" {
+    printf '#!/bin/sh\necho "$*" >>"%s/mounts"\n' "$T" >"$T/bin/mount"
+    chmod +x "$T/bin/mount"
+    mkdir -p "$T/dbg"
+    RB_DEBUGFS_DIR="$T/dbg" run rb_debugfs_mount
+    assert_file_not_exist "$T/mounts" # RB_MOUNT_DEBUGFS=0 (this machine's setup)
+    RB_MOUNT_DEBUGFS=1 RB_DEBUGFS_DIR="$T/dbg" run rb_debugfs_mount
+    assert_success
+    run cat "$T/mounts"
+    assert_output "-t debugfs none $T/dbg"
+    : >"$T/dbg/x"
+    rm -f "$T/mounts"
+    RB_MOUNT_DEBUGFS=1 RB_DEBUGFS_DIR="$T/dbg" run rb_debugfs_mount
+    assert_file_not_exist "$T/mounts"
+    RB_MOUNT_DEBUGFS=1 RB_DEBUGFS_DIR="$T/nonexistent" run rb_debugfs_mount
+    assert_file_not_exist "$T/mounts"
+}
+
+@test "rb_suspend_verdict / rb_suspend_total: a dmesg without power-management lines is UNKNOWN (kernel 4.9 may not log suspends), never 'did not suspend'; the ledger keeps the dmesg lines" {
+    dev_install_kit
+    export RB_SUSPEND_LEDGER="$T/ledger" RB_SUSPEND_STATS="$T/none" RB_SUSPEND_DEBUGFS="$T/none"
+    printf '#!/bin/sh\nprintf "[1.0] boot\\n"\n' >"$T/bin/dmesg"
+    chmod +x "$T/bin/dmesg"
+    rb_suspend_record start
+    run rb_suspend_verdict "ping lost too"
+    assert_output --partial "UNKNOWN whether the device suspended"
+    refute_output --partial "did not suspend"
+    run rb_suspend_total
+    assert_output --partial "UNKNOWN whether the device suspended during the run"
+    # then the kernel logs a suspend: proven
+    printf '#!/bin/sh\nprintf "[9.0] PM: Syncing filesystems ... done.\\n[9.1] Freezing user space processes ... done.\\n"\n' >"$T/bin/dmesg"
+    run rb_suspend_verdict
+    assert_output --partial "SUSPENDED 1 time(s)"
+    grep -q '^#   dmesg: \[9.0\] PM: Syncing filesystems' "$T/ledger"
+    run rb_suspend_total
+    assert_output --partial "SUSPENDED 1 time(s) during the run"
 }
 
 @test "rb_suspend_verdict / rb_suspend_total: per boot id; a reboot, a missing counter and a counter that went down are said as such" {
@@ -2180,7 +2263,7 @@ fail_next() {
     assert_output --partial "still unreachable (Wi-Fi drop or sleep"
 }
 
-@test "rb_asleep: NextUI's screen-off state (keymon.elf stopped) counts; a running keymon does not; the screen state is logged at every tick" {
+@test "rb_asleep: NextUI's screen-off state (keymon.elf stopped) counts; a running keymon does not; a tick REPORTS it loudly and sends no key" {
     export RB_BACKLIGHT_DIR="$T/bl" RB_FB_DIR="$T/fb"
     mkdir -p "$T/bl/backlight0" "$T/fb"
     echo 0 >"$T/bl/backlight0/bl_power"
@@ -2195,61 +2278,180 @@ fail_next() {
     echo '123 (keymon.elf) T 1 123 123 0' >"$T/keymon.stat"
     run rb_asleep
     assert_success
-    # a tick on an off screen tries the power key (none here) and logs what it saw
-    POWER_DEV_NAME='nonexistent-device' run rb_tick
+    rb_wake() { echo tap >>"$T/taps"; }
+    PAD="$T/pad"
+    : >"$PAD"
+    run rb_tick
     assert_output --partial "keymon=T"
-    assert_output --partial "SCREEN OFF: power tap"
-    grep -q 'SCREEN OFF' "$RB_TMP/psp-keepawake.log"
+    assert_output --partial "the screen is OFF (keymon stopped by NextUI"
+    assert_output --partial "press the power button"
+    grep -q 'press the power button' "$RB_TMP/psp-keepawake.log"
+    assert_file_not_exist "$T/taps"
+    [ ! -s "$PAD" ]
+    # also in the boot report (failure evidence) and the power info
+    run rb_boot_report
+    assert_output --partial "press the power button"
+    run rb_power_info
+    assert_line --index 1 --partial "screen: keymon=T"
     # no keymon at all: not asleep (no guess)
     : >"$T/keymon.stat"
     run rb_asleep
     assert_failure
 }
 
-@test "rb_wake: one power tap at a time on the device: a second one right after is skipped (a woken screen is never put back to sleep)" {
-    mkdir -p "$T/proc"
-    pad() { echo "$*" >>"$T/keys"; }
-    awk() { echo "$T/pwr"; }
-    mknod "$T/pwr" c 1 3 2>/dev/null || skip "cannot make a character device here"
-    rb_wake &
-    sleep 0.3
-    rb_wake
-    wait
-    [ "$(grep -c '116 1' "$T/keys")" = 1 ]
+@test "rb_wake_guarded: off by default; with RB_POWER_WAKE=1 only with NextUI up and no game, the screen off on two reads, 10 s apart and at most 2 a minute (a stamp that stays)" {
+    rb_wake() { echo tap >>"$T/taps"; }
+    running() { case "$1" in nextui.elf) [ -f "$T/nextui" ] ;; PPSSPPSDL) [ -f "$T/game" ] ;; *) false ;; esac; }
+    export SLEEP_PROBE=true
+    run rb_wake_guarded
+    assert_failure
+    assert_output --partial "automatic power taps are off"
+    export RB_POWER_WAKE=1
+    run rb_wake_guarded
+    assert_output --partial "NextUI does not run"
+    : >"$T/nextui"
+    : >"$T/game"
+    run rb_wake_guarded
+    assert_output --partial "a game or minui-power-control runs"
+    rm -f "$T/game"
+    # the screen is on again at the second read (1.5 s later)
+    SLEEP_PROBE="n=\$(cat '$T/reads' 2>/dev/null || echo 0); echo \$((n + 1)) >'$T/reads'; [ \"\$n\" = 0 ]" run rb_wake_guarded
+    assert_output --partial "on again at the second read"
+    assert_file_not_exist "$T/taps"
+    run rb_wake_guarded
+    assert_success
+    assert_output --partial "power tap sent"
+    [ "$(wc -l <"$T/taps")" = 1 ]
+    # right after: refused (10 s), and the stamp stays (it is never removed)
+    run rb_wake_guarded
+    assert_failure
+    assert_output --partial "at least 10 s apart"
+    [ "$(wc -l <"$T/taps")" = 1 ]
+    assert_file_exist "$RB_TMP/psp-wake.stamp"
+    # two in the last minute (none in the last 10 s): refused
+    local now
+    now="$(date +%s)"
+    printf '%s\n%s\n' $((now - 50)) $((now - 20)) >"$RB_TMP/psp-wake.stamp"
+    run rb_wake_guarded
+    assert_output --partial "2 in the last 60 s"
+    printf '%s\n' $((now - 70)) $((now - 20)) >"$RB_TMP/psp-wake.stamp"
+    run rb_wake_guarded
+    assert_success
+    # a lock held by another tap (fresh): refused
+    mkdir "$RB_TMP/psp-wake.lock"
+    printf '%s\n' $((now - 100)) >"$RB_TMP/psp-wake.stamp"
+    run rb_wake_guarded
+    assert_output --partial "another one is being sent"
 }
 
-@test "keep-awake loop: one per device (a second start keeps it), taps at its interval, ends cooperatively on stop or at its deadline" {
+@test "rb_keymon_orphan: a keymon.elf left STOPPED with no NextUI (killed with -9 during screen-off) gets SIGCONT, logged; with NextUI up it is left alone" {
+    cp "$(command -v sleep)" "$T/bin/keymon.elf"
+    "$T/bin/keymon.elf" 30 &
+    local p=$!
+    sleep 0.2
+    kill -STOP "$p"
+    unset RB_KEYMON_STAT
+    running() { [ "$1" = nextui.elf ] && [ -f "$T/nextui" ]; }
+    : >"$T/nextui"
+    run rb_keymon_orphan
+    assert_failure
+    [ "$(rb_keymon_state)" = T ]
+    rm -f "$T/nextui"
+    run rb_keymon_orphan
+    assert_success
+    sleep 0.2
+    [ "$(rb_keymon_state)" != T ]
+    grep -q 'was STOPPED with no NextUI running' "$RB_TMP/psp-keepawake.log"
+    kill "$p" 2>/dev/null || true
+}
+
+@test "input lock: a keep-awake tap never lands inside a test's chord (it is skipped); a stale lock (holder gone) is taken over" {
+    PAD=/dev/null
+    export SLEEP_PROBE=false
+    CHORD_HOLD=1.5 press select+r1 &
+    local p=$!
+    sleep 0.4
+    run rb_tick
+    assert_output --partial "skipped (a test is pressing keys)"
+    wait "$p"
+    assert_file_not_exist "$(input_lock_dir)"
+    run rb_tick
+    assert_output --partial "l1 tap"
+    # a holder that is gone
+    mkdir "$(input_lock_dir)" && echo 999999 >"$(input_lock_dir)/pid"
+    run rb_tick
+    assert_output --partial "l1 tap"
+    assert_file_not_exist "$(input_lock_dir)"
+}
+
+@test "preflight: a keep-awake key that is part of a hotkey (or of any chord) in controls.ini is refused, naming it; the PSP button mapping L = l1 is fine" {
+    export KEEPAWAKE_INTERVAL=3
+    printf '[ControlMapping]\nL = 10-193\nSave State = 10-196:10-192\nExit App = 10-196:10-197\n' >"$CONTROLS"
+    run rb_keepawake_key_clash
+    assert_failure
+    printf '[ControlMapping]\nL = 10-193\nLoad State = 10-193\nRewind = 10-197:10-193\n' >"$CONTROLS"
+    run rb_keepawake_key_clash
+    assert_success
+    assert_output --partial "keep-awake key l1 (10-193) is part of hotkeys"
+    assert_output --partial "Load State = 10-193"
+    assert_output --partial "Rewind = 10-197:10-193"
+    refute_output --partial "L = 10-193;"
+    KEEPAWAKE_KEY=y run rb_keepawake_key_clash
+    assert_failure
+    KEEPAWAKE_INTERVAL=0 run rb_keepawake_key_clash
+    assert_failure
+    KEEPAWAKE_INTERVAL=3 run rb_preflight
+    assert_output --partial "keep-awake key l1"
+}
+
+@test "keep-awake loop: one per device (a second start keeps it, a second loop ends), taps at its interval, ends on stop, at the end of an unrenewed lease, or when its claim is taken" {
     export RB_KIT_SOURCES="" KEEPAWAKE_INTERVAL=3 RB_KEEPAWAKE_EVERY=1
     rb_tick() { echo t >>"$T/ticks"; }
     run rb_keepawake_start 30
     assert_output --partial "started"
-    sleep 0.5
     local p
     p="$(rb_keepawake_pid)"
     [ -n "$p" ]
     run rb_keepawake_start 30
     assert_output --partial "already running (pid $p)"
+    # a second loop (a start retried at the same moment) ends at once: the claim is held
+    run rb_keepawake_loop
+    assert_success
+    [ "$(rb_keepawake_pid)" = "$p" ]
     sleep 2.2
     [ "$(wc -l <"$T/ticks")" -ge 2 ]
+    # renew moves the lease of a running loop only
+    run rb_keepawake_renew 30
+    assert_file_exist "$RB_TMP/psp-keepawake.until"
     run rb_keepawake_stop
     assert_success
     if kill -0 "$p" 2>/dev/null; then fail "the loop still runs"; fi
     grep -q "keep-awake loop $p: stopped" "$RB_TMP/psp-keepawake.log"
-    # the deadline ends it by itself
+    assert_file_not_exist "$RB_TMP/psp-keepawake.until"
+    rb_keepawake_renew
+    assert_file_not_exist "$RB_TMP/psp-keepawake.until" # a stopped loop stays stopped
+    # an unrenewed lease ends it by itself
     rb_keepawake_start 1 >/dev/null
-    sleep 0.5
     p="$(rb_keepawake_pid)"
     [ -n "$p" ]
     local n=0
     while kill -0 "$p" 2>/dev/null && [ "$n" -lt 40 ]; do sleep 0.1; n=$((n + 1)); done
-    if kill -0 "$p" 2>/dev/null; then fail "the loop did not end at its deadline"; fi
-    grep -q "keep-awake loop $p: deadline reached" "$RB_TMP/psp-keepawake.log"
+    if kill -0 "$p" 2>/dev/null; then fail "the loop did not end with its lease"; fi
+    grep -q "keep-awake loop $p: lease ended" "$RB_TMP/psp-keepawake.log"
+    # the claim taken by another loop: this one ends
+    rb_keepawake_start 30 >/dev/null
+    p="$(rb_keepawake_pid)"
+    echo 1 >"$(rb_keepawake_dir)/pid"
+    n=0
+    while kill -0 "$p" 2>/dev/null && [ "$n" -lt 30 ]; do sleep 0.1; n=$((n + 1)); done
+    if kill -0 "$p" 2>/dev/null; then fail "the loop did not give up its claim"; fi
+    grep -q "keep-awake loop $p: another loop has the claim" "$RB_TMP/psp-keepawake.log"
     # off
     KEEPAWAKE_INTERVAL=0 run rb_keepawake_start
     assert_output --partial "off"
 }
 
-@test "rb_keepawake_every: a third of NextUI's screentimeout, 3..20 s, 10 s when unknown, RB_KEEPAWAKE_EVERY wins" {
+@test "rb_keepawake_every: a third of NextUI's screentimeout, 3..20 s, 10 s for 0, 5 s while minuisettings.txt cannot be read (before the SD card is mounted), RB_KEEPAWAKE_EVERY wins" {
     printf 'screentimeout=60\r\n' >"$SHARED/minuisettings.txt"
     run rb_keepawake_every
     assert_output 20
@@ -2259,6 +2461,9 @@ fail_next() {
     printf 'screentimeout=0\n' >"$SHARED/minuisettings.txt"
     run rb_keepawake_every
     assert_output 10
+    rm -f "$SHARED/minuisettings.txt"
+    run rb_keepawake_every
+    assert_output 5
     RB_KEEPAWAKE_EVERY=2 run rb_keepawake_every
     assert_output 2
 }

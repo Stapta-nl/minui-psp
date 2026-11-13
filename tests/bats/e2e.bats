@@ -152,6 +152,12 @@ $HOTKEY_PROBLEMS"
     printf 0 >"$SLOT_FILE"
 }
 
+# Before every test: renew the lease of the keep-awake loop that run-device.sh runs on the device (it ends by
+# itself when nobody renews it).
+setup() {
+    keepawake_renew
+}
+
 # After every test: undo a preview that a test renamed to .off, even when the test aborted.
 teardown() {
     local off

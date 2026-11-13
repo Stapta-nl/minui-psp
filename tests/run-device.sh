@@ -32,8 +32,11 @@
 # rb_keepawake_start, from the test bundle): NextUI turns the screen off after its screentimeout without input and
 # suspends the device suspendTimeout later, and several on-device tests send no input for minutes. The loop taps a
 # harmless button (KEEPAWAKE_KEY, l1) every third of screentimeout (RB_KEEPAWAKE_EVERY), wakes a screen that went
-# off anyway (power tap), runs on across the hand-off to the reboot tests and is stopped (cooperatively) at the
-# end; KEEPAWAKE_INTERVAL=0 turns it off. Its log (the screen state at every tick) is keepawake-ondevice.log.
+# off anyway is logged loudly (automatic power taps only with RB_POWER_WAKE=1), it runs on across the hand-off to
+# the reboot tests and is stopped (cooperatively) at the end. It has a lease (RB_KEEPAWAKE_LEASE, 600 s) that this
+# script renews every 2 minutes while the on-device tests run (e2e.bats renews it per test too, the reboot tests
+# while they work), so it ends by itself soon after a run that went away. KEEPAWAKE_INTERVAL=0 turns it off. Its
+# log (the screen state at every tick) is keepawake-ondevice.log.
 #
 # Afterwards the tests tagged "reboot" (tests/bats/reboot.bats: they REBOOT the device) run on
 # this machine over ssh, see tests/run-reboot.sh; SKIP_REBOOT_TESTS=1 leaves them out. They
@@ -117,6 +120,7 @@ redact() {
 
 remote_tmp=""
 run_pid=""
+renew_pid=""
 finishing=0
 # Best-effort removal of the remote temp dir: BatchMode, a connect timeout and an overall
 # timeout (CLEANUP_TIMEOUT, default 20 s), so an interrupted run never hangs on it.
@@ -125,7 +129,7 @@ cleanup() {
     case "$remote_tmp" in
     /tmp/psp-tests.*)
         # also the keep-awake loop: SIGTERM, which it handles cooperatively (never in the middle of a tap)
-        cmd="p=\$(cat /tmp/psp-keepawake.pid 2>/dev/null); [ -z \"\$p\" ] || kill -TERM \"\$p\" 2>/dev/null; rm -rf '$remote_tmp'"
+        cmd="rm -f /tmp/psp-keepawake.until; p=\$(cat /tmp/psp-keepawake.d/pid 2>/dev/null); [ -z \"\$p\" ] || kill -TERM \"\$p\" 2>/dev/null; rm -rf '$remote_tmp'"
         if command -v timeout >/dev/null 2>&1; then
             timeout -k 2 "${CLEANUP_TIMEOUT:-20}" "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "$cmd" >/dev/null 2>&1 </dev/null
         else
@@ -143,6 +147,7 @@ finish() {
     finishing=1
     trap '' INT TERM HUP
     trap - EXIT
+    [ -z "$renew_pid" ] || kill "$renew_pid" 2>/dev/null
     if [ -n "${2:-}" ]; then
         printf '%s\n' "$2" | redact >"$stage/error.txt"
         printf 'ERROR %s: %s\n' "$platform" "$2" | redact >&2
@@ -268,10 +273,10 @@ fi
 device_kit() {
     local cmd kit v env=""
     kit="$remote_tmp/tests/helpers/e2e.bash $remote_tmp/tests/helpers/devconfig.bash $remote_tmp/tests/helpers/reboot-device.bash"
-    for v in KEEPAWAKE_INTERVAL KEEPAWAKE_KEY RB_KEEPAWAKE_EVERY RB_KEEPAWAKE_MAX POWER_DEV_NAME SLEEP_PROBE; do
+    for v in KEEPAWAKE_INTERVAL KEEPAWAKE_KEY RB_KEEPAWAKE_EVERY RB_KEEPAWAKE_LEASE RB_POWER_WAKE POWER_DEV_NAME SLEEP_PROBE; do
         [ -z "${!v+x}" ] || env="$env $v=$(q "${!v}")"
     done
-    cmd="cd '$remote_tmp' && PLATFORM=$(q "$platform") PAK_NAME=$(q "$pak_name") SD=$(q "$sd") RB_KIT_SOURCES=$(q "$kit")$env bash -c $(q "for f in \$RB_KIT_SOURCES; do . \"\$f\" || exit 97; done; rb_init && $2")"
+    cmd="cd '$remote_tmp' && PLATFORM=$(q "$platform") PAK_NAME=$(q "$pak_name") SD=$(q "$sd") RB_KIT_SOURCES=$(q "$kit")$env bash -c $(q "for f in \$RB_KIT_SOURCES; do . \"\$f\" || exit 97; done; rb_init || exit 98; $2")"
     if command -v timeout >/dev/null 2>&1; then
         timeout -k 2 "$1" "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "$cmd" </dev/null
     else
@@ -289,8 +294,21 @@ run_tests() {
         tee "$stage/console.log"
     return "${PIPESTATUS[0]}"
 }
+# renews the keep-awake loop's lease while the tests run (a plain shell command: the kit is not needed)
+renew_lease() {
+    while sleep 120; do
+        if command -v timeout >/dev/null 2>&1; then
+            timeout -k 2 20 "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "f=/tmp/psp-keepawake.until; [ ! -f \$f ] || echo \$((\$(date +%s) + ${RB_KEEPAWAKE_LEASE:-600})) >\$f" >/dev/null 2>&1 </dev/null
+        fi
+    done
+}
+renew_lease &
+renew_pid=$!
 run_step /dev/null run_tests
 rc=$?
+kill "$renew_pid" 2>/dev/null
+wait "$renew_pid" 2>/dev/null
+renew_pid=""
 
 # The reboot tests follow: the keep-awake loop is still running (the reboot tests keep it); its deadline is
 # moved and a tap is sent now (best effort), and its log of the on-device run is kept.

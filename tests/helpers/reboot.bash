@@ -45,7 +45,7 @@
 # are only the time-outs after which a wait gives up.
 
 RB_KIT_PATH="${RB_KIT_PATH:-/tmp/psp-reboot-kit.sh}"
-RB_ENV_VARS="SD PLATFORM PAK_NAME ROM_DIR ROM SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS PSP_RUN_ID UI_WAIT BOOT_WAIT NOGAME_WAIT BOOT_SETTLE UI_SETTLE NOGAME_SETTLE CHORD_HOLD KEEPAWAKE_KEY KEEPAWAKE_INTERVAL POWER_DEV_NAME SLEEP_PROBE RB_TMP RB_OUT RB_REBOOT_CMD RB_HARD_REBOOT_CMD BOOT_ID_FILE RB_KIT_PATH RB_KEEPAWAKE_EVERY RB_KEEPAWAKE_MAX RB_KEYMON_STAT RB_SUSPEND_STATS RB_SUSPEND_DEBUGFS"
+RB_ENV_VARS="SD PLATFORM PAK_NAME ROM_DIR ROM SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS PSP_RUN_ID UI_WAIT BOOT_WAIT NOGAME_WAIT BOOT_SETTLE UI_SETTLE NOGAME_SETTLE CHORD_HOLD KEEPAWAKE_KEY KEEPAWAKE_INTERVAL POWER_DEV_NAME SLEEP_PROBE RB_TMP RB_OUT RB_REBOOT_CMD RB_HARD_REBOOT_CMD BOOT_ID_FILE RB_KIT_PATH RB_KEEPAWAKE_EVERY RB_KEEPAWAKE_LEASE RB_POWER_WAKE RB_KEYMON_STAT RB_SUSPEND_STATS RB_SUSPEND_DEBUGFS RB_DEBUGFS_DIR RB_MOUNT_DEBUGFS"
 
 # Quotes a value for the remote shell.
 rb_q() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
@@ -223,7 +223,8 @@ rb_test_end() {
 # that sleeps, otherwise taps a harmless button (see rb_tick). NextUI suspends the device after about
 # 10 s without input, and a suspended device does not answer ssh (and cannot be woken from here), so the
 # taps are dense. The step runs in the BACKGROUND (never delays a poll, one at a time) and never fails
-# the test: a device that is rebooting simply does not answer. What the device answered (the screen state:
+# the test: a device that is rebooting simply does not answer. It also renews the lease of the device's keep-awake
+# loop (rb_keepawake_start). What the device answered (the screen state:
 # keymon, backlight, fb0 blank, and the key it tapped) is traced in the timings file.
 rb_keepawake_maybe() {
     local every="${KEEPAWAKE_INTERVAL:-3}" now
@@ -233,7 +234,7 @@ rb_keepawake_maybe() {
     if [ -n "${RB_TICK_PID:-}" ] && kill -0 "$RB_TICK_PID" 2>/dev/null; then return 0; fi
     RB_LAST_TICK=$now
     (
-        out="$(dev_kit "${RB_PROBE_TIMEOUT:-10}" rb_tick 2>/dev/null)" || out="${out:+$out }(no answer: status $?)"
+        out="$(dev_kit "${RB_PROBE_TIMEOUT:-10}" "rb_keepawake_renew; rb_tick" 2>/dev/null)" || out="${out:+$out }(no answer: status $?)"
         rb_trace "keep-awake $out"
     ) >/dev/null 2>&1 3>&- </dev/null &
     RB_TICK_PID=$!
@@ -266,13 +267,14 @@ probe() { dev_ok "${RB_PROBE_TIMEOUT:-10}" "$1"; }
 
 # rb_device_retry <command...>: runs a call to the device and retries it while the device does not
 # answer (ssh failed 255, kit missing 97/98: a device that was asleep or is still coming up), at most
-# RB_DEFINITE_TRIES (20) times, one second apart. Any other status is the answer of the device.
+# RB_DEFINITE_TRIES (20) times, one second apart. Any other status is the answer of the device. RB_RETRY_ALSO:
+# more statuses to retry (124 for an idempotent call that may be cut by its limit).
 rb_device_retry() {
     local rc tries=0
     while :; do
         rc=0
         "$@" || rc=$?
-        case "$rc" in 255 | 97 | 98) ;; *) return "$rc" ;; esac
+        case " 255 97 98 ${RB_RETRY_ALSO:-} " in *" $rc "*) ;; *) return "$rc" ;; esac
         tries=$((tries + 1))
         if [ "$tries" -ge "${RB_DEFINITE_TRIES:-20}" ]; then return "$rc"; fi
         rb_trace "the device did not answer (status $rc), retrying ($tries)"
@@ -321,15 +323,31 @@ rb_unreachable_note() {
 # counts since the boot, so it is compared only within one boot id.
 rb_ledger_file() { printf '%s' "${RB_SUSPEND_LEDGER-${OUT:+$OUT/suspend-ledger.txt}}"; }
 # rb_power_read: one short call (RB_PROBE_TIMEOUT) to the device; sets RB_PW_BOOT, RB_PW_COUNT ("-" without a
-# counter) and RB_PW_SRC. 1 when the device does not answer.
+# counter), RB_PW_SRC (sysfs, debugfs, dmesg, dmesg-nopm: no power-management line in dmesg, none), RB_PW_SCREEN
+# (the screen state, with the warning when it is off) and RB_PW_PM (the last power-management lines of dmesg).
+# 1 when the device does not answer.
 rb_power_read() {
     local f out=""
     f="$(mktemp "${TMPDIR:-/tmp}/rb-power.XXXXXX")" || return 1
-    dev_kit "${RB_PROBE_TIMEOUT:-10}" rb_power_info >"$f" 2>/dev/null </dev/null && out="$(head -n 1 "$f")"
+    if dev_kit "${RB_PROBE_TIMEOUT:-10}" rb_power_info >"$f" 2>/dev/null </dev/null; then
+        out="$(head -n 1 "$f")"
+        RB_PW_SCREEN="$(sed -n 's/^screen: //p' "$f" | head -n 1)"
+        RB_PW_PM="$(sed -n 's/^pm: //p' "$f")"
+    fi
     rm -f "$f"
     [ -n "$out" ] || return 1
     read -r RB_PW_BOOT RB_PW_COUNT RB_PW_SRC <<<"$out"
     [ -n "$RB_PW_SRC" ] || return 1
+}
+# rb_ledger_add <ledger> <label>: the reading of rb_power_read as a line, then the screen and the dmesg
+# power-management lines as comments ("# ...": what this kernel prints, for the next report).
+rb_ledger_add() {
+    local l
+    {
+        echo "$(date +%H:%M:%S) $RB_PW_BOOT $RB_PW_COUNT $RB_PW_SRC $2"
+        [ -z "${RB_PW_SCREEN:-}" ] || echo "#   screen: $RB_PW_SCREEN"
+        while IFS= read -r l; do [ -z "$l" ] || echo "#   dmesg: $l"; done <<<"${RB_PW_PM:-}"
+    } >>"$1" 2>/dev/null
 }
 # rb_suspend_record <label>: a reading in the ledger (best effort; nothing without a ledger).
 rb_suspend_record() {
@@ -337,7 +355,7 @@ rb_suspend_record() {
     led="$(rb_ledger_file)"
     [ -n "$led" ] || return 0
     rb_power_read || return 0
-    echo "$(date +%H:%M:%S) $RB_PW_BOOT $RB_PW_COUNT $RB_PW_SRC ${1:-reading}" >>"$led" 2>/dev/null
+    rb_ledger_add "$led" "${1:-reading}"
     return 0
 }
 # rb_suspend_verdict [ping note]: after the device was unreachable and answers again: did it SUSPEND since the
@@ -345,15 +363,22 @@ rb_suspend_record() {
 # network dropped)? One sentence; the new reading is recorded. The ping note (rb_ping_note, taken while it was
 # unreachable) is only added to a "did not suspend".
 rb_suspend_verdict() {
-    local ping="${1:-}" led last="" lt="" lb="" lc="" d
+    local ping="${1:-}" led last="" lt="" lb="" lc="" txt
     if ! rb_power_read; then
         echo "the device is still unreachable (Wi-Fi drop or sleep; a suspend counter will tell once it answers)"
         return 0
     fi
     led="$(rb_ledger_file)"
-    [ -z "$led" ] || last="$(grep -v '^ *$' "$led" 2>/dev/null | tail -n 1)"
-    [ -z "$led" ] || echo "$(date +%H:%M:%S) $RB_PW_BOOT $RB_PW_COUNT $RB_PW_SRC after it was unreachable" >>"$led" 2>/dev/null
+    [ -z "$led" ] || last="$(grep -v -e '^ *$' -e '^#' "$led" 2>/dev/null | tail -n 1)"
+    [ -z "$led" ] || rb_ledger_add "$led" "after it was unreachable"
     read -r lt lb lc _ <<<"$last"
+    txt="$(rb_suspend_verdict_text)"
+    case "${RB_PW_SCREEN:-}" in *"screen is OFF"*) txt="$txt; NOW: $RB_PW_SCREEN" ;; esac
+    echo "$txt"
+}
+# (the sentence of rb_suspend_verdict, from its variables)
+rb_suspend_verdict_text() {
+    local d
     if [ "$RB_PW_SRC" = none ]; then
         echo "the device answers again; it has no suspend counter (no /sys/power/suspend_stats, no debugfs suspend_stats, no dmesg), so sleep cannot be told from a network drop${ping:+ ($ping)}"
     elif [ -z "$last" ]; then
@@ -364,7 +389,9 @@ rb_suspend_verdict() {
         echo "the device answers again; the earlier reading had no suspend counter: cannot compare"
     else
         d=$((RB_PW_COUNT - lc))
-        if [ "$d" -gt 0 ]; then
+        if [ "$d" = 0 ] && [ "$RB_PW_SRC" = dmesg-nopm ]; then
+            echo "UNKNOWN whether the device suspended: dmesg has no power-management lines at all (this kernel may not log suspends; no /sys/power/suspend_stats, no debugfs suspend_stats)${ping:+; $ping}"
+        elif [ "$d" -gt 0 ]; then
             echo "the device SUSPENDED $d time(s) since $lt (suspend counter, $RB_PW_SRC: $lc -> $RB_PW_COUNT): it was ASLEEP, and the keep-awake did not prevent it ($(rb_idle_note))"
         elif [ "$d" = 0 ]; then
             echo "the device did not suspend (suspend counter, $RB_PW_SRC: $RB_PW_COUNT, unchanged since $lt): the network dropped (Wi-Fi)${ping:+, $ping}"
@@ -384,13 +411,15 @@ rb_suspend_total() {
         return 0
     fi
     awk '
-        $3 == "-" { nocount = 1; next }
-        { if (!($2 in first)) { first[$2] = $3; order[++n] = $2; src = $4 } last[$2] = $3 }
+        /^#/ || NF < 4 { next }
+        $3 == "-" { next }
+        { if (!($2 in first)) { first[$2] = $3; order[++n] = $2 } last[$2] = $3; src = $4; if ($4 != "dmesg-nopm") known = 1 }
         END {
             if (n == 0) { print "suspend counter: this device has none (no /sys/power/suspend_stats, debugfs or dmesg): cannot tell whether it slept"; exit }
             total = 0; bad = 0
             for (i = 1; i <= n; i++) { d = last[order[i]] - (i == 1 ? first[order[i]] : 0); if (d < 0) bad = 1; else total += d }
             if (bad) print "suspend counter (" src "): went down during the run (the dmesg ring buffer wrapped?): unknown"
+            else if (total == 0 && !known) printf "suspend counter: UNKNOWN whether the device suspended during the run: dmesg has no power-management lines at all (this kernel may not log suspends) (%d boot(s))\n", n
             else if (total > 0) printf "suspend counter (%s): the device SUSPENDED %d time(s) during the run (%d boot(s)): the keep-awake did not prevent it\n", src, total, n
             else printf "suspend counter (%s): the device did not suspend during the run (%d boot(s)): the keep-awake worked\n", src, n
         }' "$led"
@@ -412,8 +441,9 @@ rb_job() {
     f="$(mktemp "${TMPDIR:-/tmp}/rb-job.XXXXXX")" || return 2
     t0="$(rb_now_ms)"
     rc=0
-    # the start is idempotent (the job's directory is claimed with mkdir): a start whose answer was lost is retried
-    rb_device_retry dev_kit "${RB_JOB_POLL_TIMEOUT:-10}" "rb_job_start $(rb_q "$id") $(rb_q "$script")" >"$f" 2>&1 || rc=$?
+    # the start is idempotent (the job's directory is claimed with mkdir): a start whose answer was lost, or that
+    # was cut by its limit, is retried
+    RB_RETRY_ALSO=124 rb_device_retry dev_kit 20 "rb_keepawake_renew; rb_job_start $(rb_q "$id") $(rb_q "$script")" >"$f" 2>&1 || rc=$?
     if [ "$rc" != 0 ]; then
         cat "$f"
         rm -f "$f"
@@ -422,7 +452,7 @@ rb_job() {
     fi
     while :; do
         rc=0
-        dev_kit "${RB_JOB_POLL_TIMEOUT:-10}" "rb_job_poll $(rb_q "$id")" >"$f" 2>/dev/null || rc=$?
+        dev_kit "${RB_JOB_POLL_TIMEOUT:-10}" "rb_keepawake_renew; rb_job_poll $(rb_q "$id")" >"$f" 2>/dev/null || rc=$?
         now="$(rb_now_ms)"
         case "$rc" in
         0 | 3 | 4)

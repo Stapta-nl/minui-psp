@@ -610,8 +610,57 @@ btn_set() {
     esac
 }
 
-# press <button>[+<button>...]: a tap, or a chord (all held together, then released).
+# The input lock: one key press (or chord) at a time on the device, across processes (the tests and the
+# keep-awake taps of tests/helpers/reboot-device.bash): a keep-awake tap inside a held chord (select+r1) would make
+# another chord (select+l1, l1+r1) and fire another hotkey. A directory (mkdir) with the holder's pid; a lock whose
+# holder is gone, or held longer than 10 s (no press takes that long), is stale and taken over.
+input_lock_dir() { echo "${RB_TMP:-/tmp}/psp-input.lock"; }
+input_trylock() {
+    local d p="" t now
+    d="$(input_lock_dir)"
+    if mkdir "$d" 2>/dev/null; then
+        echo "${BASHPID:-$$}" >"$d/pid"
+        return 0
+    fi
+    { read -r p <"$d/pid"; } 2>/dev/null
+    t="$(date -r "$d" +%s 2>/dev/null)"
+    now="$(date +%s)"
+    case "$t" in "" | *[!0-9]*) t="$now" ;; esac
+    if { [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; } || [ $((now - t)) -ge 10 ]; then
+        rm -rf "$d"
+        mkdir "$d" 2>/dev/null || return 1
+        echo "${BASHPID:-$$}" >"$d/pid"
+        return 0
+    fi
+    return 1
+}
+# input_lock: waits (up to about 12 s: a stale lock is taken over after 10 s) for the input lock.
+input_lock() {
+    local n=0
+    until input_trylock; do
+        n=$((n + 1))
+        [ "$n" -lt 120 ] || return 1
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+}
+input_unlock() {
+    local d p=""
+    d="$(input_lock_dir)"
+    { read -r p <"$d/pid"; } 2>/dev/null
+    [ "$p" != "${BASHPID:-$$}" ] || rm -rf "$d"
+    return 0
+}
+
+# press <button>[+<button>...]: a tap, or a chord (all held together, then released), under the input lock.
 press() {
+    local rc=0 locked=0
+    input_lock && locked=1
+    press_raw "$1" || rc=$?
+    [ "$locked" = 0 ] || input_unlock
+    return "$rc"
+}
+# press_raw: the same without the lock (for a caller that holds it).
+press_raw() {
     local keys k hold=0.05 # short, or NextUI's key repeat moves the selection more than once
     keys="$(printf '%s' "$1" | tr '+' ' ')"
     case "$1" in *+*) hold="${CHORD_HOLD:-0.3}" ;; esac
@@ -626,6 +675,14 @@ press() {
         pad "$ev_type" "$ev_code" 0
         syn
     done
+}
+
+# keepawake_renew: moves the end of the lease of the keep-awake loop of tests/helpers/reboot-device.bash, when one
+# runs on this device (run-device.sh starts it; it ends by itself when its lease is not renewed). Never fails.
+keepawake_renew() {
+    local f="${RB_TMP:-/tmp}/psp-keepawake.until"
+    [ -f "$f" ] && echo $(($(date +%s) + ${RB_KEEPAWAKE_LEASE:-600})) >"$f" 2>/dev/null
+    return 0
 }
 
 colour() { "$PNGCOLOR" "$1" 2>/dev/null; } # prints "R G B"

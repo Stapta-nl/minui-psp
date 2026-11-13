@@ -128,6 +128,7 @@ rb_preflight() {
     while IFS= read -r p; do
         [ -n "$p" ] && fail_ "$p"
     done <<<"${HOTKEY_PROBLEMS:-}"
+    p="$(rb_keepawake_key_clash)" && fail_ "$p"
     [ -x "$PAK/bin/jpg2bmp" ] || fail_ "$PAK/bin/jpg2bmp missing (install a pak built by CI or make build)"
     [ -f "$PAK/bin/poweroff" ] || fail_ "$PAK/bin/poweroff (the shim) is missing: this pak has no auto-resume"
     # The shim must USE the override in code (not just mention it in a comment). If it does not,
@@ -158,6 +159,34 @@ rb_preflight() {
     return "$bad"
 }
 
+# rb_keepawake_key_clash: the keep-awake key (KEEPAWAKE_KEY, l1) must not be part of any hotkey of controls.ini:
+# a tap that lands while a test holds a chord is avoided by the input lock, but a hotkey OF the key itself (or a
+# chord with it that a user presses) would fire on every tap. Allowed: the plain PSP button mappings (one key).
+# Prints the problem and succeeds when there is one.
+rb_keepawake_key_clash() {
+    local code hits
+    [ "${KEEPAWAKE_INTERVAL:-3}" != 0 ] || return 1
+    code="$(cfg_button_code "${KEEPAWAKE_KEY:-l1}")" || { echo "KEEPAWAKE_KEY=${KEEPAWAKE_KEY:-} is not a pad button the tests can press"; return 0; }
+    [ -f "$CONTROLS" ] || return 1
+    hits="$(awk -v code="$code" '
+        { sub(/^\357\273\277/, ""); sub(/\r$/, "") }
+        /^[ \t]*\[/ { sec = ($0 ~ /^[ \t]*\[ControlMapping\][ \t]*$/); next }
+        sec && /=/ {
+            k = $0; sub(/[ \t]*=.*/, "", k); sub(/^[ \t]*/, "", k)
+            v = $0; sub(/^[^=]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v)
+            psp = (tolower(k) ~ /^(up|down|left|right|circle|cross|square|triangle|start|select|l|r|an\.(up|down|left|right)|analog limiter)$/)
+            n = split(v, alt, ",")
+            for (i = 1; i <= n; i++) {
+                m = split(alt[i], c, ":"); found = 0
+                for (j = 1; j <= m; j++) if (c[j] == code) found = 1
+                if (found && (m > 1 || !psp)) print k " = " alt[i]
+            }
+        }' "$CONTROLS")"
+    [ -n "$hits" ] || return 1
+    echo "the keep-awake key ${KEEPAWAKE_KEY:-l1} ($code) is part of hotkeys in $CONTROLS: $(printf '%s' "$hits" | tr '\n' ';' | sed 's/;$//; s/;/; /g'). A keep-awake tap would trigger them: set KEEPAWAKE_KEY to a button no hotkey uses"
+    return 0
+}
+
 # --- backup / restore ------------------------------------------------------------------
 # The backup is the one of e2e.bash (psp_backup / psp_restore, shared with e2e.bats): the same
 # files, plus controls.ini (the hotkeys the tests bind), ppsspp.ini and a copy of every save state.
@@ -181,7 +210,13 @@ rb_backup_steps() {
     fi
     # PPSSPP reads controls.ini when it starts: the hotkeys are bound before any game is launched,
     # and stay in place (the file is on the SD card) until rb_restore at the very end.
-    cfg_apply_hotkeys
+    cfg_apply_hotkeys || return 1
+    # a fallback chord the tests bound may use the keep-awake key
+    local clash
+    if clash="$(rb_keepawake_key_clash)"; then
+        echo "$clash" >&2
+        return 1
+    fi
 }
 
 # The size of the save state folder in KB (the host sizes the backup's timeout with it).
@@ -463,10 +498,10 @@ rb_hard_reboot() {
 rb_keymon_state() {
     local p st=""
     if [ -n "${RB_KEYMON_STAT:-}" ]; then
-        IFS= read -r st <"$RB_KEYMON_STAT" 2>/dev/null || st=""
+        { IFS= read -r st <"$RB_KEYMON_STAT"; } 2>/dev/null || st=""
     else
         p="$(pgrep keymon.elf 2>/dev/null | head -n 1)"
-        [ -n "$p" ] && IFS= read -r st <"/proc/$p/stat" 2>/dev/null
+        [ -n "$p" ] && { IFS= read -r st <"/proc/$p/stat"; } 2>/dev/null
     fi
     [ -n "$st" ] || return 0
     st="${st##*) }"
@@ -479,19 +514,19 @@ rb_screen_state() {
     out="keymon=$(rb_keymon_state)"
     for f in "${RB_BACKLIGHT_DIR:-/sys/class/backlight}"/*; do
         [ -d "$f" ] || continue
-        v=""; read -r v <"$f/bl_power" 2>/dev/null
+        v=""; { read -r v <"$f/bl_power"; } 2>/dev/null
         out="$out ${f##*/}:bl_power=$v"
-        v=""; read -r v <"$f/brightness" 2>/dev/null
+        v=""; { read -r v <"$f/brightness"; } 2>/dev/null
         out="$out,brightness=$v"
     done
-    v=""; read -r v <"${RB_FB_DIR:-/sys/class/graphics/fb0}/blank" 2>/dev/null
+    v=""; { read -r v <"${RB_FB_DIR:-/sys/class/graphics/fb0}/blank"; } 2>/dev/null
     printf '%s fb0_blank=%s' "$out" "$v"
 }
-# True if the screen is off. Only clear signals count, never a guess (a power tap on an AWAKE device would put
-# it to sleep: NextUI's manual sleep): SLEEP_PROBE (a command, true when asleep) when given; else keymon.elf
-# stopped (NextUI's hybrid sleep, see above), or a backlight node that says "powered down" (bl_power != 0, the
-# FB_BLANK values). A brightness of 0 proves nothing (it can be the user's setting, and NextUI does not use the
-# sysfs node on the tg5040).
+# True if the screen is off. Only clear signals count: SLEEP_PROBE (a command, true when asleep) when given;
+# else keymon.elf stopped (NextUI's hybrid sleep, see above), or a backlight node that says "powered down"
+# (bl_power != 0, the FB_BLANK values). A brightness of 0 proves nothing (it can be the user's setting, and NextUI
+# does not use the sysfs node on the tg5040). A DIAGNOSIS: it is logged loudly, and acted on (a power tap) only
+# when RB_POWER_WAKE=1 (rb_wake_guarded).
 rb_asleep() {
     local f v
     if [ -n "${SLEEP_PROBE:-}" ]; then
@@ -506,33 +541,84 @@ rb_asleep() {
     done
     return 1
 }
+RB_SCREEN_OFF_MSG="the screen is OFF (keymon stopped by NextUI: its screen-off before the idle suspend): press the power button"
+
+# rb_keymon_orphan: a keymon.elf left STOPPED with no NextUI (nextui.elf) or minarch running cannot be NextUI's
+# screen-off: its NextUI was killed (kill -9) while the screen was off, and nobody sends it SIGCONT any more. It
+# is sent SIGCONT here (and logged). 0 when it did so.
+rb_keymon_orphan() {
+    local p
+    [ -z "${RB_KEYMON_STAT:-}" ] || return 1 # (host unit tests: a fake state, no process)
+    [ "$(rb_keymon_state)" = T ] || return 1
+    running nextui.elf && return 1
+    running minarch.elf && return 1
+    p="$(pgrep keymon.elf 2>/dev/null | head -n 1)"
+    [ -n "$p" ] || return 1
+    kill -CONT "$p" 2>/dev/null || return 1
+    rb_keepawake_log "keymon.elf (pid $p) was STOPPED with no NextUI running (its NextUI was killed while the screen was off): sent SIGCONT"
+    return 0
+}
 
 # Taps KEY_POWER (code 116, a short tap, well under the 2 s long press that powers off) on the
-# power key's input device: POWER_DEV_NAME (regex) is matched against the device names. One power tap at a
-# time on the device (several keep-awake loops may see the screen off at once): a second one within a few
-# seconds is skipped, so a woken device is never put back to sleep by the next tap.
+# power key's input device: POWER_DEV_NAME (regex) is matched against the device names. The raw tap: callers
+# use rb_wake_guarded.
 rb_wake() {
-    local dev lk="${RB_TMP:-/tmp}/psp-wake.lock" t=""
+    local dev
     dev="$(awk -v re="${POWER_DEV_NAME:-axp|pek|power|gpio-keys}" '
         /^N: Name=/ { name = $0; sub(/^N: Name="/, "", name); sub(/"$/, "", name); use = (name ~ re && name !~ /TRIMUI Player/) }
         use && /^H: Handlers=/ { for (i = 1; i <= NF; i++) if ($i ~ /^event/) { print "/dev/input/" $i; exit } }
     ' /proc/bus/input/devices 2>/dev/null)"
     [ -c "$dev" ] || { echo "no power key device found (POWER_DEV_NAME)" >&2; return 1; }
-    if ! mkdir "$lk" 2>/dev/null; then
-        read -r t <"$lk/t" 2>/dev/null
-        case "$t" in "" | *[!0-9]*) t=0 ;; esac
-        [ $(($(date +%s) - t)) -ge 5 ] || return 0 # another loop's tap, just now
-        rm -rf "$lk"
-        mkdir "$lk" 2>/dev/null || return 0
-    fi
-    date +%s >"$lk/t"
     PAD="$dev" pad 1 116 1
     PAD="$dev" syn
     sleep 0.2 # a short key tap (input injection): no signal exists
     PAD="$dev" pad 1 116 0
     PAD="$dev" syn
-    sleep 1 # NextUI wakes on the release and sends keymon SIGCONT: then the next check sees it awake
+}
+
+# rb_wake_guarded: a power tap ONLY when it was asked for (RB_POWER_WAKE=1: off by default, a power tap at the
+# wrong moment is harmful: in a running PPSSPP game minui-power-control takes a short press for deep sleep, on an
+# awake NextUI it is the manual sleep) and every condition holds: NextUI (nextui.elf) runs and no PPSSPP and no
+# minui-power-control; the screen is off on two reads at least 1.5 s apart; and the persistent stamp
+# (RB_TMP/psp-wake.stamp, the time of every tap, never removed) allows it: at least 10 s since the last tap and
+# at most 2 taps in the last 60 s. Under a lock (mkdir; a lock older than 10 s is stale) that is taken BEFORE
+# the stamp and the screen are checked again. Prints what it did or why not; 0 only when it tapped.
+rb_wake_guarded() {
+    local lk="${RB_TMP:-/tmp}/psp-wake.lock" stamp="${RB_TMP:-/tmp}/psp-wake.stamp" now t n=0 last=0 rc=0
+    [ "${RB_POWER_WAKE:-0}" = 1 ] || { echo "automatic power taps are off (RB_POWER_WAKE=1 turns them on)"; return 1; }
+    running nextui.elf || { echo "no power tap: NextUI does not run"; return 1; }
+    if running PPSSPPSDL || running minui-power-control; then echo "no power tap: a game or minui-power-control runs"; return 1; fi
+    rb_asleep || { echo "no power tap: the screen is on"; return 1; }
+    sleep 1.5 2>/dev/null || sleep 2
+    rb_asleep || { echo "no power tap: the screen was on again at the second read"; return 1; }
+    if ! mkdir "$lk" 2>/dev/null; then
+        t="$(date -r "$lk" +%s 2>/dev/null)"
+        case "$t" in "" | *[!0-9]*) t=0 ;; esac
+        [ $(($(date +%s) - t)) -ge 10 ] || { echo "no power tap: another one is being sent"; return 1; }
+        rm -rf "$lk"
+        mkdir "$lk" 2>/dev/null || { echo "no power tap: another one is being sent"; return 1; }
+    fi
+    now="$(date +%s)"
+    while read -r t; do
+        case "$t" in "" | *[!0-9]*) continue ;; esac
+        [ "$t" -le "$last" ] || last="$t"
+        [ $((now - t)) -ge 60 ] || n=$((n + 1))
+    done <"$stamp" 2>/dev/null
+    if [ $((now - last)) -lt 10 ] || [ "$n" -ge 2 ]; then
+        rm -rf "$lk"
+        echo "no power tap: the last one was $((now - last)) s ago, $n in the last 60 s (at least 10 s apart, at most 2 a minute)"
+        return 1
+    fi
+    if ! rb_asleep; then
+        rm -rf "$lk"
+        echo "no power tap: the screen is on again"
+        return 1
+    fi
+    echo "$now" >>"$stamp"
+    rb_wake || rc=$?
     rm -rf "$lk"
+    echo "power tap sent (rc $rc)"
+    [ "$rc" = 0 ]
 }
 
 # rb_keepawake_log <line>: appended to the device's keep-awake log (RB_TMP/psp-keepawake.log; kept short).
@@ -545,18 +631,24 @@ rb_keepawake_log() {
     return 0
 }
 
-# One keep-awake step: wake the device if its screen is off (rb_asleep), otherwise a harmless tap on the pad
-# (any input restarts the idle timer of NextUI's auto sleep). Prints, and logs, the screen state and what
-# was done (the host's waits put it in reboot-timings.txt).
+# One keep-awake step: a harmless tap on the pad (any input restarts the idle timer of NextUI's auto sleep),
+# never in the middle of a test's key press (the input lock of e2e.bash: the tap is then skipped). A screen
+# that is off anyway (rb_asleep) is logged LOUDLY ("press the power button"); a power tap is sent only when
+# RB_POWER_WAKE=1 (rb_wake_guarded). A keymon left stopped without NextUI is sent SIGCONT (rb_keymon_orphan).
+# Prints, and logs, the screen state and what was done (the host's waits put it in reboot-timings.txt).
 rb_tick() {
-    local st line rc=0
+    local st line rc=0 w
+    rb_keymon_orphan || true
     st="$(rb_screen_state)"
     if rb_asleep; then
-        rb_wake || rc=$?
-        line="tick: $st -> SCREEN OFF: power tap (rc $rc)"
-    else
-        press "${KEEPAWAKE_KEY:-l1}" || rc=$?
+        w="$(rb_wake_guarded 2>&1)" || rc=$?
+        line="tick: $st -> $RB_SCREEN_OFF_MSG ($w)"
+    elif input_trylock; then
+        press_raw "${KEEPAWAKE_KEY:-l1}" || rc=$?
+        input_unlock
         line="tick: $st -> ${KEEPAWAKE_KEY:-l1} tap"
+    else
+        line="tick: $st -> skipped (a test is pressing keys)"
     fi
     rb_keepawake_log "$line"
     echo "$line"
@@ -649,15 +741,17 @@ rb_job_start() {
     d="$(rb_job_dir "$id")"
     mkdir -p "${d%/*}" || return 1
     if mkdir "$d" 2>/dev/null; then
+        date +%s >"$d/started"
         printf '%s' "$2" >"$d/script" || return 1
         : >"$d/log"
         rb_detach "$d/log" rb_job_run "$id"
     fi
-    # (well within the host's 10 s limit of this call)
+    # up to 10 s (the host's call has 20 s); a job that has not written its pid yet is "starting": rb_job_poll
+    # counts it as running for RB_JOB_START_GRACE s (30)
     while [ ! -s "$d/pid" ] && [ ! -f "$d/status" ]; do
-        if [ $((SECONDS - t0)) -ge 5 ]; then
-            echo "the job $id did not start: $(tail -n 5 "$d/log" 2>/dev/null)" >&2
-            return 1
+        if [ $((SECONDS - t0)) -ge 10 ]; then
+            echo "the job $id is still starting"
+            return 0
         fi
         sleep 0.1 2>/dev/null || sleep 1
     done
@@ -675,12 +769,17 @@ rb_job_run() {
 # rb_job_poll <id>: 0 when the job ended (prints its status on the first line, then its log), 3 while it
 # runs, 4 when it is gone without a status (killed, or a reboot cleared /tmp: then the directory is gone too).
 rb_job_poll() {
-    local d p=""
+    local d p="" t
     d="$(rb_job_dir "$1")"
     [ -d "$d" ] || { echo "no job $1 on the device (a reboot clears /tmp)"; return 4; }
     if [ ! -f "$d/status" ]; then
-        read -r p <"$d/pid" 2>/dev/null
+        { read -r p <"$d/pid"; } 2>/dev/null
         [ -n "$p" ] && kill -0 "$p" 2>/dev/null && return 3
+        if [ -z "$p" ]; then # starting (no pid yet), for a while
+            { read -r t <"$d/started"; } 2>/dev/null
+            case "$t" in "" | *[!0-9]*) t=0 ;; esac
+            [ $(($(date +%s) - t)) -ge "${RB_JOB_START_GRACE:-30}" ] || return 3
+        fi
         [ -f "$d/status" ] || { echo "the job ended without a status (killed?); its log:"; cat "$d/log" 2>/dev/null; return 4; }
     fi
     cat "$d/status"
@@ -697,23 +796,28 @@ rb_job_clean() {
 }
 
 # --- a keep-awake loop for a whole run ----------------------------------------------------------
-# rb_keepawake_start [max s]: makes sure ONE detached keep-awake loop runs on the device (run-device.sh starts
-# it before the on-device tests, reboot.bats keeps it and starts it again after every boot), for at most <max s>
-# (RB_KEEPAWAKE_MAX, 10800) from now: a loop that is already running is kept and its end moved. Every second the
-# loop checks the screen (rb_asleep: a screen that went off anyway is woken at once, before NextUI's
-# suspendTimeout), and every RB_KEEPAWAKE_EVERY seconds it taps KEEPAWAKE_KEY (default: a third of NextUI's
-# screentimeout, 3..20 s; 10 s when unknown; KEEPAWAKE_INTERVAL=0 turns the loop off). It ends cooperatively
-# (rb_keepawake_stop, or SIGTERM: never in the middle of a tap) or at its deadline. Log: RB_TMP/psp-keepawake.log.
-rb_keepawake_pidfile() { echo "${RB_TMP:-/tmp}/psp-keepawake.pid"; }
+# rb_keepawake_start [lease s]: makes sure ONE detached keep-awake loop runs on the device (run-device.sh starts
+# it before the on-device tests, reboot.bats keeps it and starts it again after every boot) and gives it a LEASE
+# of <lease s> (RB_KEEPAWAKE_LEASE, 600) from now: the loop ends by itself when the lease runs out, so it never
+# outlives a run whose host went away by more than that. The host renews the lease while it works
+# (rb_keepawake_renew: its waits, every test's setup, run-device.sh during the on-device tests). The loop taps
+# KEEPAWAKE_KEY every RB_KEEPAWAKE_EVERY seconds (default: a third of NextUI's screentimeout, 3..20 s; 5 s while
+# minuisettings.txt cannot be read yet, e.g. before the SD card is mounted after a boot, and read again every
+# step until it can) and looks at the screen every second (rb_tick: logged; see rb_wake_guarded).
+# KEEPAWAKE_INTERVAL=0 turns it off. It ends cooperatively (rb_keepawake_stop, or SIGTERM: never in the middle of
+# a tap), at the end of its lease, or when another loop claimed the device. Log: RB_TMP/psp-keepawake.log.
+# The claim: the directory RB_TMP/psp-keepawake.d (mkdir) with the loop's pid; a claim whose pid is gone is stale.
+rb_keepawake_dir() { echo "${RB_TMP:-/tmp}/psp-keepawake.d"; }
 rb_keepawake_pid() {
     local p=""
-    read -r p <"$(rb_keepawake_pidfile)" 2>/dev/null
+    { read -r p <"$(rb_keepawake_dir)/pid"; } 2>/dev/null
     [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "$p"
     return 0
 }
 rb_keepawake_every() {
     local st
     case "${RB_KEEPAWAKE_EVERY:-}" in "" | *[!0-9]*) ;; *) echo "$RB_KEEPAWAKE_EVERY"; return ;; esac
+    [ -r "$SHARED/minuisettings.txt" ] || { echo 5; return; }
     st="$(grep -E '^screentimeout=[0-9]+' "$SHARED/minuisettings.txt" 2>/dev/null | head -n 1 | tr -d '\r')"
     st="${st#screentimeout=}"
     case "$st" in "" | *[!0-9]* | 0) echo 10; return ;; esac
@@ -722,30 +826,53 @@ rb_keepawake_every() {
     [ "$st" -le 20 ] || st=20
     echo "$st"
 }
+# rb_keepawake_renew [lease s]: moves the end of a RUNNING loop's lease (a stopped loop stays stopped).
+rb_keepawake_renew() {
+    local f="${RB_TMP:-/tmp}/psp-keepawake.until"
+    [ -f "$f" ] && echo $(($(date +%s) + ${1:-${RB_KEEPAWAKE_LEASE:-600}})) >"$f"
+    return 0
+}
 rb_keepawake_start() {
-    local max="${1:-${RB_KEEPAWAKE_MAX:-10800}}" p
+    local lease="${1:-${RB_KEEPAWAKE_LEASE:-600}}" p n=0
     [ "${KEEPAWAKE_INTERVAL:-3}" != 0 ] || { echo "keep-awake loop: off (KEEPAWAKE_INTERVAL=0)"; return 0; }
-    echo $(($(date +%s) + max)) >"${RB_TMP:-/tmp}/psp-keepawake.until"
+    echo $(($(date +%s) + lease)) >"${RB_TMP:-/tmp}/psp-keepawake.until"
     p="$(rb_keepawake_pid)"
     if [ -n "$p" ]; then
-        echo "keep-awake loop: already running (pid $p), kept for ${max}s more"
+        echo "keep-awake loop: already running (pid $p), lease ${lease}s"
         return 0
     fi
     rb_detach /dev/null rb_keepawake_loop
-    echo "keep-awake loop: started (a tap every $(rb_keepawake_every) s, the screen checked every second)"
+    while [ -z "$(rb_keepawake_pid)" ] && [ "$n" -lt 30 ]; do
+        sleep 0.1 2>/dev/null || sleep 1
+        n=$((n + 1))
+    done
+    echo "keep-awake loop: started (pid $(rb_keepawake_pid); a tap every $(rb_keepawake_every) s, lease ${lease}s, renewed by the host)"
 }
 rb_keepawake_loop() {
-    local stop=0 until every last=-99999 pf
-    pf="$(rb_keepawake_pidfile)"
-    echo "${BASHPID:-$$}" >"$pf"
+    local stop=0 until every last=-99999 d me="${BASHPID:-$$}" p="" known=0
+    d="$(rb_keepawake_dir)"
+    # the claim: one loop per device; a stale claim (its pid gone) is taken over
+    if ! mkdir "$d" 2>/dev/null; then
+        { read -r p <"$d/pid"; } 2>/dev/null
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then return 0; fi
+        rm -rf "$d"
+        mkdir "$d" 2>/dev/null || return 0
+    fi
+    echo "$me" >"$d/pid"
     trap 'stop=1' TERM
     trap '' HUP PIPE
     every="$(rb_keepawake_every)"
-    rb_keepawake_log "keep-awake loop ${BASHPID:-$$}: started, a ${KEEPAWAKE_KEY:-l1} tap every ${every} s, the screen checked every second"
+    rb_keepawake_log "keep-awake loop $me: started, a ${KEEPAWAKE_KEY:-l1} tap every ${every} s, the screen looked at every second"
     while [ "$stop" = 0 ]; do
-        read -r until <"${RB_TMP:-/tmp}/psp-keepawake.until" 2>/dev/null
+        [ "$(cat "$d/pid" 2>/dev/null)" = "$me" ] || { rb_keepawake_log "keep-awake loop $me: another loop has the claim, ending"; return 0; }
+        { read -r until <"${RB_TMP:-/tmp}/psp-keepawake.until"; } 2>/dev/null
         case "$until" in "" | *[!0-9]*) until=0 ;; esac
-        [ "$(date +%s)" -lt "$until" ] || { rb_keepawake_log "keep-awake loop ${BASHPID:-$$}: deadline reached"; break; }
+        [ "$(date +%s)" -lt "$until" ] || { rb_keepawake_log "keep-awake loop $me: lease ended (not renewed)"; break; }
+        if [ "$known" = 0 ] && [ -r "$SHARED/minuisettings.txt" ]; then
+            known=1
+            every="$(rb_keepawake_every)"
+            rb_keepawake_log "keep-awake loop $me: a tap every ${every} s (minuisettings.txt)"
+        fi
         if rb_asleep || [ $((SECONDS - last)) -ge "$every" ]; then
             rb_tick >/dev/null 2>&1
             last=$SECONDS
@@ -754,12 +881,13 @@ rb_keepawake_loop() {
         sleep 1 &
         wait $! 2>/dev/null
     done
-    [ "$stop" = 0 ] || rb_keepawake_log "keep-awake loop ${BASHPID:-$$}: stopped"
-    [ "$(cat "$pf" 2>/dev/null)" != "${BASHPID:-$$}" ] || rm -f "$pf"
+    [ "$stop" = 0 ] || rb_keepawake_log "keep-awake loop $me: stopped"
+    [ "$(cat "$d/pid" 2>/dev/null)" != "$me" ] || rm -rf "$d"
 }
-# rb_keepawake_stop [wait s]: stops the loop cooperatively and waits (5 s) for it to end. 0 when none runs.
+# rb_keepawake_stop [wait s]: ends the lease and stops the loop cooperatively, waiting (5 s) for it. 0 when none runs.
 rb_keepawake_stop() {
     local p n=0
+    rm -f "${RB_TMP:-/tmp}/psp-keepawake.until"
     p="$(rb_keepawake_pid)"
     [ -n "$p" ] || return 0
     kill -TERM "$p" 2>/dev/null
@@ -768,37 +896,73 @@ rb_keepawake_stop() {
         [ "$n" -le $((${1:-5} * 5)) ] || { echo "the keep-awake loop (pid $p) did not stop" >&2; return 1; }
         sleep 0.2 2>/dev/null || sleep 1
     done
-    rm -f "$(rb_keepawake_pidfile)" "${RB_TMP:-/tmp}/psp-keepawake.until"
+    rm -rf "$(rb_keepawake_dir)"
 }
 
 # --- the suspend counter -------------------------------------------------------------------------
+# rb_debugfs_mount: debugfs is often not mounted: mount it (only when the mount point exists, is empty and nothing
+# is mounted there; logged; never fails). RB_DEBUGFS_DIR (/sys/kernel/debug); RB_MOUNT_DEBUGFS=0 never mounts.
+rb_debugfs_mount() {
+    local dir="${RB_DEBUGFS_DIR:-/sys/kernel/debug}"
+    [ "${RB_MOUNT_DEBUGFS:-1}" != 0 ] || return 0
+    [ -d "$dir" ] || return 0
+    grep -q " $dir debugfs " /proc/mounts 2>/dev/null && return 0
+    [ -z "$(ls -A "$dir" 2>/dev/null)" ] || return 0
+    if mount -t debugfs none "$dir" 2>/dev/null; then
+        echo "mounted debugfs on $dir (for its suspend_stats)" >&2
+    fi
+    return 0
+}
+# rb_dmesg_pm: the power-management lines of dmesg (the ones that count suspends, of old and new kernels).
+RB_PM_PATTERN='PM: suspend entry|PM: Syncing filesystems|Freezing user space processes|Restarting tasks|PM: suspend exit|PM: resume'
+rb_dmesg_pm() { dmesg 2>/dev/null | grep -E "$RB_PM_PATTERN"; }
 # rb_suspend_count: "<count> <source>": how often the kernel suspended since the boot: /sys/power/suspend_stats/
-# success (newer kernels), the "success:" line of /sys/kernel/debug/suspend_stats (debugfs), else the
-# "PM: suspend entry" lines of dmesg (the ring buffer can wrap: the count can then go DOWN). Fails (prints
-# nothing) when none exists. RB_SUSPEND_STATS / RB_SUSPEND_DEBUGFS (host unit tests): other paths.
+# success (newer kernels), the "success:" line of debugfs suspend_stats (mounted when it is not), else from dmesg:
+# the most of "PM: suspend entry" (newer kernels), "PM: Syncing filesystems" and "Freezing user space processes"
+# (each suspend prints them; 4.9 prints no "suspend entry"). dmesg's ring buffer can wrap (the count can then go
+# DOWN). A dmesg with NO power-management line is "unknown" (source dmesg-nopm: this kernel may not log them, or
+# it did not suspend); a count > 0 later still proves suspends. Fails (prints nothing) when no source works.
+# RB_SUSPEND_STATS / RB_SUSPEND_DEBUGFS (host unit tests): other paths.
 rb_suspend_count() {
-    local f v=""
+    local f v="" pm a b c
     f="${RB_SUSPEND_STATS:-/sys/power/suspend_stats/success}"
-    if [ -r "$f" ] && read -r v <"$f" 2>/dev/null; then
+    if [ -r "$f" ] && { read -r v <"$f"; } 2>/dev/null; then
         case "$v" in "" | *[!0-9]*) ;; *) echo "$v sysfs"; return 0 ;; esac
     fi
-    f="${RB_SUSPEND_DEBUGFS:-/sys/kernel/debug/suspend_stats}"
+    [ -n "${RB_SUSPEND_DEBUGFS:-}" ] || rb_debugfs_mount
+    f="${RB_SUSPEND_DEBUGFS:-${RB_DEBUGFS_DIR:-/sys/kernel/debug}/suspend_stats}"
     if [ -r "$f" ]; then
         v="$(sed -n 's/^success:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -n 1)"
         [ -z "$v" ] || { echo "$v debugfs"; return 0; }
     fi
     if command -v dmesg >/dev/null 2>&1 && v="$(dmesg 2>/dev/null)" && [ -n "$v" ]; then
-        echo "$(printf '%s\n' "$v" | grep -c 'PM: suspend entry') dmesg"
+        pm="$(printf '%s\n' "$v" | grep -E "$RB_PM_PATTERN")"
+        if [ -z "$pm" ]; then
+            echo "0 dmesg-nopm"
+            return 0
+        fi
+        a="$(printf '%s\n' "$pm" | grep -c 'PM: suspend entry')"
+        b="$(printf '%s\n' "$pm" | grep -c 'PM: Syncing filesystems')"
+        c="$(printf '%s\n' "$pm" | grep -c 'Freezing user space processes')"
+        [ "$b" -le "$a" ] || a="$b"
+        [ "$c" -le "$a" ] || a="$c"
+        echo "$a dmesg"
         return 0
     fi
     return 1
 }
-# rb_power_info: "<boot id> <suspend count or -> <source or none>", one line, for the host's ledger.
+# rb_power_info: "<boot id> <suspend count or -> <source or none>" on the first line, for the host's ledger;
+# then "screen: ..." (and the warning when it is off) and the last power-management lines of dmesg ("pm: ..."),
+# so that a report shows what this kernel prints.
 rb_power_info() {
-    local id c
+    local id c l
     id="$(cat "${BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}" 2>/dev/null)"
-    c="$(rb_suspend_count)" || c="- none"
+    c="$(rb_suspend_count 2>/dev/null)" || c="- none"
     echo "${id:-?} $c"
+    if rb_asleep; then echo "screen: $(rb_screen_state): $RB_SCREEN_OFF_MSG"; else echo "screen: $(rb_screen_state)"; fi
+    command -v dmesg >/dev/null 2>&1 || return 0
+    rb_dmesg_pm | tail -n 6 | while IFS= read -r l; do echo "pm: $l"; done
+    return 0
 }
 
 # --- one backup or restore at a time ------------------------------------------------------------
@@ -867,6 +1031,7 @@ rb_boot_report() {
     hz="$(getconf CLK_TCK 2>/dev/null)"
     case "$hz" in "" | *[!0-9]*) hz=100 ;; esac
     echo "uptime: ${up} s"
+    if rb_asleep; then echo "screen: $(rb_screen_state): $RB_SCREEN_OFF_MSG"; else echo "screen: $(rb_screen_state)"; fi
     echo "boot_id: $(cat "${BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}" 2>/dev/null)"
     if [ -d "$SHARED" ]; then
         if [ -e "$AUTORESUME" ]; then echo "auto-resume marker: PRESENT: $(cat "$AUTORESUME" 2>/dev/null)"; else echo "auto-resume marker: absent"; fi
@@ -886,7 +1051,7 @@ rb_boot_report() {
         nextui.elf* | PPSSPPSDL* | minui-power-control* | *"/launch.sh"*) ;;
         *) continue ;;
         esac
-        IFS= read -r st <"$p/stat" 2>/dev/null || continue
+        { IFS= read -r st <"$p/stat"; } 2>/dev/null || continue
         st="${st##*) }"
         # shellcheck disable=SC2086 # the fields of /proc/<pid>/stat after the command name
         set -- $st

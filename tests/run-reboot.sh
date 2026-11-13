@@ -43,6 +43,22 @@ while IFS= read -r p; do
     filter_generic="$filter_generic,!platform:$p"
 done < <(jq -r '.platforms[]' pak.json)
 
+# At the end, however it ends: the keep-awake loop that the tests (or run-device.sh) run on the device is stopped
+# (its lease is ended and it gets SIGTERM, which it handles cooperatively). Best effort, bounded; a plain shell
+# command, the kit is not needed. (Its lease would end it anyway, RB_KEEPAWAKE_LEASE after the last renewal.)
+# shellcheck disable=SC2317 # called from the EXIT trap
+stop_keepawake() {
+    local opts=()
+    read -r -a opts <<<"${DEVICE_SSH_OPTS:-}"
+    command -v timeout >/dev/null 2>&1 || return 0
+    # shellcheck disable=SC2016 # runs on the device
+    timeout -k 2 20 ssh -o BatchMode=yes -o ConnectTimeout=10 ${opts[@]+"${opts[@]}"} "$DEVICE_HOST" \
+        'rm -f /tmp/psp-keepawake.until; p=$(cat /tmp/psp-keepawake.d/pid 2>/dev/null); [ -z "$p" ] || kill -TERM "$p" 2>/dev/null; true' >/dev/null 2>&1 </dev/null
+}
+trap 'stop_keepawake' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 case "$stage" in /*) abs_stage="$stage" ;; *) abs_stage="$ROOT/$stage" ;; esac
 mkdir -p "$abs_stage"
 rm -rf "$abs_stage/reboot"
