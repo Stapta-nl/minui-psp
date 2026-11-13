@@ -379,21 +379,53 @@ launch_unchanged() {
     [ "$ri" = "$ni" ] && [ "$rf" = "$nf" ] && [ "$ns" -ge "$rs" ]
 }
 
+# e2e_clock: sets E2E_NOW to the wall clock in ms (bash's EPOCHREALTIME, else `date`; no fork with the former).
+# The quiet times and limits of the settles below are WALL-CLOCK seconds, not poll counts: a poll that takes
+# longer than usual (a slow /proc scan, a keep-awake tap) does not stretch the wait.
+e2e_clock() {
+    local t
+    if [ -n "${EPOCHREALTIME:-}" ]; then
+        t="${EPOCHREALTIME/[.,]/}"
+        E2E_NOW=$((t / 1000))
+    else
+        E2E_NOW=$(($(date +%s) * 1000))
+    fi
+}
+# e2e_poll_sleep <ms left>: the poll step of the settles (1 s), shorter when the quiet time ends sooner.
+e2e_poll_sleep() {
+    if [ "$1" -gt 0 ] && [ "$1" -lt 1000 ]; then
+        sleep "0.$(printf '%03d' "$1")" # the rest of the quiet time
+    else
+        sleep 1 # poll step
+    fi
+}
+# e2e_quiet_left <since ms> <quiet s>: sets E2E_LEFT to the ms of quiet time still to go (no since: not
+# quiet, a whole poll step) and E2E_QUIET to the whole seconds of quiet so far.
+e2e_quiet_left() {
+    if [ -z "$1" ]; then
+        E2E_LEFT=1000 E2E_QUIET=0
+    else
+        E2E_LEFT=$(($2 * 1000 - (E2E_NOW - $1))) E2E_QUIET=$(((E2E_NOW - $1) / 1000))
+    fi
+}
+
 # wait_ui_settled <quiet s> <limit s>: NextUI is up, and it and its launcher are quiet. Why this proves
 # "nothing launches by itself" (the absence checks of R1/R2/R6/R7: after a normal quit, a crash or a
 # forced reboot the device must come back to NextUI's menu and must NOT start the game: no auto-resume
 # marker is consumed and no PPSSPP appears): NextUI's main() calls autoResume() FIRST, before any
 # graphics or input init (nextui.c). With a marker it deletes it, queues the game in /tmp/next and
 # EXITS; without one it returns at once and NextUI goes on to its menu. So the decision is made within
-# moments of nextui.elf starting, and a nextui.elf that is the SAME process for <quiet> consecutive
-# polls has not exited to launch anything. Counted as quiet, per poll: the same nextui.elf pid, no
-# emulator process, no auto-resume marker ($AUTORESUME, if set: NextUI deletes it first thing, so it
-# still being there is a bug or a NextUI that has not run yet). If E2E_LAUNCH_REF is set (launch_sig of
-# the pak log before the event under test, log: E2E_LAUNCH_LOG, default $LOGS/PSP.txt) a rewritten log
-# (launch.sh ran) fails the wait AT ONCE: a positive "no launch" check next to the waiting. Fails
-# after <limit> s and says what it saw.
+# moments of nextui.elf starting, and a nextui.elf that is the SAME process for <quiet> seconds (wall
+# clock, counted from the first poll that saw it so) has not exited to launch anything. Quiet means, at
+# every poll: the same nextui.elf pid, no emulator process, no auto-resume marker ($AUTORESUME, if set:
+# NextUI deletes it first thing, so it still being there is a bug or a NextUI that has not run yet). If
+# E2E_LAUNCH_REF is set (launch_sig of the pak log before the event under test, log: E2E_LAUNCH_LOG,
+# default $LOGS/PSP.txt) a rewritten log (launch.sh ran) fails the wait AT ONCE: a positive "no launch"
+# check next to the waiting. Fails after <limit> s (wall clock) and says what it saw.
 wait_ui_settled() {
-    local quiet="$1" limit="$2" n=0 ok=0 pid last="" game="" marker="" log="${E2E_LAUNCH_LOG:-${LOGS:-}/PSP.txt}"
+    local quiet="$1" limit="$2" t0 since="" pid last="" game="" marker="" log="${E2E_LAUNCH_LOG:-${LOGS:-}/PSP.txt}"
+    e2e_clock
+    t0=$E2E_NOW
     while :; do
         "${E2E_POLL_HOOK:-:}" || true
         if [ -n "${E2E_LAUNCH_REF:-}" ] && ! launch_unchanged "$E2E_LAUNCH_REF" "$log"; then
@@ -405,69 +437,82 @@ wait_ui_settled() {
         marker=""
         pgrep PPSSPPSDL >/dev/null 2>&1 && game=1
         [ -n "${AUTORESUME:-}" ] && [ -e "$AUTORESUME" ] && marker=1
-        if [ -n "$pid" ] && [ "$pid" = "$last" ] && [ -z "$game" ] && [ -z "$marker" ]; then ok=$((ok + 1)); else ok=0; fi
+        e2e_clock
+        if [ -n "$pid" ] && [ -z "$game" ] && [ -z "$marker" ]; then
+            if [ "$pid" != "$last" ] || [ -z "$since" ]; then since=$E2E_NOW; fi
+        else
+            since=""
+        fi
         last="$pid"
-        [ "$ok" -ge "$quiet" ] && return 0
-        if [ "$n" -ge "$limit" ]; then
-            echo "NextUI did not settle within ${limit}s (nextui.elf pid: ${pid:-none}${game:+, a game is running}${marker:+, the auto-resume marker exists}; quiet polls: $ok of $quiet)" >&2
+        e2e_quiet_left "$since" "$quiet"
+        [ -n "$since" ] && [ "$E2E_LEFT" -le 0 ] && return 0
+        if [ $((E2E_NOW - t0)) -ge $((limit * 1000)) ]; then
+            echo "NextUI did not settle within ${limit}s (nextui.elf pid: ${pid:-none}${game:+, a game is running}${marker:+, the auto-resume marker exists}; quiet for $E2E_QUIET of ${quiet} s)" >&2
             return 1
         fi
-        sleep 1
-        n=$((n + 1))
+        e2e_poll_sleep "$E2E_LEFT"
     done
 }
 
 # True if the emulator runs with the test ROM as its argument. The command lines are read from
 # /proc and matched on argv[0] and the arguments, never on the whole text: the ssh call that
-# runs this contains the ROM's name too.
+# runs this contains the ROM's name too. Only bash builtins per process (no fork): this runs on every
+# poll of a settle, and a `$(tr ...)` per process made each poll take about a second on the device.
 rb_rom_running() {
-    local p first line args
+    local p first arg
     for p in /proc/[0-9]*/cmdline; do
-        [ -r "$p" ] || continue
-        args="$(tr '\0' '\n' <"$p" 2>/dev/null)"
-        first="${args%%$'\n'*}"
+        first=""
+        { IFS= read -r -d '' first || true; } 2>/dev/null <"$p" || continue
         case "${first##*/}" in PPSSPPSDL*) ;; *) continue ;; esac
-        while IFS= read -r line; do
-            [ "$line" = "$ROM" ] && return 0
-        done <<<"$args"
+        while IFS= read -r -d '' arg || [ -n "$arg" ]; do
+            [ "$arg" = "$ROM" ] && return 0
+        done 2>/dev/null <"$p"
     done
     return 1
 }
 
 # wait_game_settled <quiet s> <limit s>: the emulator runs the test ROM (its argv, from /proc: the
-# positive signal that the game was started) and has done so, as the SAME process, for <quiet>
-# consecutive polls. If minui-power-control's launch script has written /tmp/emulator_pid (it does so
-# once it has found the PPSSPP pid, and removes it at the end) that file must name this process before
-# a poll counts: an extra signal, never required, because not every power-control version writes it. A
-# game that dies while starting ends the wait at once. No log line or file says "PPSSPP takes hotkeys
-# now" (and the auto-load of a state leaves no file when there is no state), so the quiet time is a
-# fixed settle: see BOOT_SETTLE. Waits up to <limit> s for the game to appear.
+# positive signal that the game was started) and has done so, as the SAME process, for <quiet> seconds
+# (wall clock, counted from the first poll that saw it). If minui-power-control's launch script has
+# written /tmp/emulator_pid (it does so once it has found the PPSSPP pid, and removes it at the end) that
+# file must name this process before the quiet time starts: an extra signal, never required, because not
+# every power-control version writes it. A game that dies while starting ends the wait at once. No log
+# line of the pak or of this repository says "PPSSPP takes hotkeys now" (and the auto-load of a state
+# leaves no file when there is no state), so the quiet time is a fixed settle: see BOOT_SETTLE. Waits up
+# to <limit> s (wall clock) in all.
 wait_game_settled() {
-    local quiet="$1" limit="$2" n=0 ok=0 pid last="" seen="" epid=""
+    local quiet="$1" limit="$2" t0 since="" pid last="" seen="" epid=""
+    e2e_clock
+    t0=$E2E_NOW
     while :; do
         "${E2E_POLL_HOOK:-:}" || true
         pid=""
         rb_rom_running && pid="$(first_pid PPSSPPSDL)"
+        e2e_clock
         if [ -n "$pid" ]; then
             seen=1
             epid=""
             [ -f "${E2E_EMULATOR_PID_FILE:-/tmp/emulator_pid}" ] && IFS= read -r epid <"${E2E_EMULATOR_PID_FILE:-/tmp/emulator_pid}"
-            if [ "$pid" = "$last" ] && { [ -z "$epid" ] || [ "$epid" = "$pid" ]; }; then ok=$((ok + 1)); else ok=0; fi
+            if [ -n "$epid" ] && [ "$epid" != "$pid" ]; then
+                since=""
+            elif [ "$pid" != "$last" ] || [ -z "$since" ]; then
+                since=$E2E_NOW
+            fi
         else
-            ok=0
+            since=""
             if [ -n "$seen" ]; then
                 echo "the game exited or was restarted while it was starting (see PSP.txt)" >&2
                 return 1
             fi
         fi
         last="$pid"
-        [ "$ok" -ge "$quiet" ] && return 0
-        if [ "$n" -ge "$limit" ]; then
-            echo "the game was not running steadily within ${limit}s (pid: ${pid:-none}${epid:+, /tmp/emulator_pid: $epid}; steady polls: $ok of $quiet)" >&2
+        e2e_quiet_left "$since" "$quiet"
+        [ -n "$since" ] && [ "$E2E_LEFT" -le 0 ] && return 0
+        if [ $((E2E_NOW - t0)) -ge $((limit * 1000)) ]; then
+            echo "the game was not running steadily within ${limit}s (pid: ${pid:-none}${epid:+, /tmp/emulator_pid: $epid}; steady for $E2E_QUIET of ${quiet} s)" >&2
             return 1
         fi
-        sleep 1
-        n=$((n + 1))
+        e2e_poll_sleep "$E2E_LEFT"
     done
 }
 
@@ -624,7 +669,7 @@ e2e_phase() {
 }
 
 # restart_ui: kills NextUI and waits until the NEW process is up and settled (the same pid for
-# UI_SETTLE polls, default 2 s: the maintainer sees the Game Switcher load in about 1 s; the screenshot
+# UI_SETTLE seconds, default 2: the maintainer sees the Game Switcher load in about 1 s; the screenshot
 # after it has its own 1 s delay). No "NextUI has drawn" signal is verified on a device, so this is
 # the observed time plus margin. The old process being gone is detected by its pid.
 restart_ui() {

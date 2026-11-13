@@ -18,9 +18,15 @@
 #                             NextUI suspends the device after about 10 s without input, and a suspended
 #                             device does not answer ssh, so the taps must be dense
 #   RB_TRIGGER_LINGER (3)     seconds a trigger ssh call may stay open before it is cut (rb_trigger)
-#   REBOOT_DOWN_TIMEOUT (90)  BACKUP only: after the power-off request the device must be seen going
-#                             down (ssh port closed) within this; normally it takes a few seconds
-#   REBOOT_UP_TIMEOUT (300)   BACKUP only: ... and be back (port open, ssh answers with a NEW boot id)
+#   REBOOT_DOWN_TIMEOUT (30)  BACKUP only: after the power-off request the device must be seen going
+#                             down (ssh port closed) within this; observed: about 4 s
+#   REBOOT_UP_TIMEOUT (120)   BACKUP only: ... and be back (port open, ssh answers with a NEW boot id);
+#                             observed: about 35 s after going down
+#   RB_SAME_ID_GRACE (15)     a device that went "down" and then answers ssh with the SAME boot id for this
+#                             long did not reboot (it was asleep, or the network dropped): the wait ends
+#                             with that verdict instead of running into REBOOT_UP_TIMEOUT
+#   RB_SETUP_STEP_TIMEOUT (3) hard limit of every step of the network setup before the trigger (ssh -G,
+#                             the /dev/tcp check; the ping baseline has its own 3 s limit)
 #   RESUME_TIMEOUT (180)      BACKUP only: after boot NextUI must be up and relaunch the game within this
 #   RB_PORT_PROBE             a command (run with eval) that succeeds when the device's ssh port is open;
 #                             replaces the built-in probe (host unit tests, odd networks)
@@ -299,11 +305,13 @@ rb_kill_tree() {
 # for at most RB_TRIGGER_LINGER seconds (3), then the client is cut (a connection that dies with the
 # reboot is never waited for). No multiplexing (rb_ssh_setup), and short server-alive settings (2 s x 2)
 # so that a dead connection is noticed fast. Records when it returned (RB_T_TRIGGER_RET, ms) and how long
-# the call took (RB_TRIGGER_MS): the reboot clock of await_reboot starts there.
+# the call took (RB_TRIGGER_MS): the reboot clock of await_reboot starts there. The network setup of
+# await_reboot (rb_net_prepare) is done here, BEFORE the request is sent.
 rb_trigger() {
     local fn="$1" t0 out pid i=0 steps rc=0 how="returned" saved=()
     rb_ssh_ready || { echo "DEVICE_HOST is not set" >&2; return 2; }
     saved=("${RB_SSH[@]}")
+    rb_net_prepare # before the clock starts: await_reboot must not spend the reboot on its setup
     steps=$((${RB_TRIGGER_LINGER:-3} * 5))
     out="$(mktemp "${TMPDIR:-/tmp}/rb-trigger.XXXXXX")" || return 2
     t0="$(rb_now_ms)"
@@ -347,10 +355,12 @@ rb_went_down() {
     now="$(rb_boot_id)" || return 0
     [ "$now" != "$1" ]
 }
-# True when the device answers and its boot id is not $1.
+# True when the device answers and its boot id is not $1. RB_SEEN_ID: the id it answered ("" no answer).
 rb_is_back() {
     local now
+    RB_SEEN_ID=""
     now="$(rb_boot_id)" || return 1
+    RB_SEEN_ID="$now"
     [ -n "$now" ] && [ "$now" != "$1" ]
 }
 
@@ -366,11 +376,20 @@ rb_is_back() {
 # UP: ping answers (if it is used) AND the port accepts AND ssh answers with a NEW boot id; a wrong probe
 # (a tunnel that always accepts, a firewall that drops ping) cannot hold a run: while ping/port look
 # wrong, ssh is tried every 3rd poll and a new boot id alone is accepted (and logged as such).
-# Sets RB_NET_VIA, RB_NET_HOST, RB_NET_PORT and RB_NET_DESC (no address in the description).
+# Sets RB_NET_VIA, RB_NET_HOST, RB_NET_PORT and RB_NET_DESC (no address in the description), and
+# RB_NET_SETUP_NOTE: how long each step took. Every step has a hard limit (RB_SETUP_STEP_TIMEOUT, 3 s):
+# a setup that stalls must not delay the first poll after a reboot (it once took 135 s, see below).
 rb_net_setup() {
-    local cfg host="" port="" proxy="" opts=" ${DEVICE_SSH_OPTS:-} "
+    local cfg="" host="" port="" proxy="" opts=" ${DEVICE_SSH_OPTS:-} " lim="${RB_SETUP_STEP_TIMEOUT:-3}" f t0 t1 t2 tcp_out
     rb_ssh_ready || true
-    cfg="$("${RB_SSH[@]}" -G "$DEVICE_HOST" 2>/dev/null)" || cfg=""
+    t0="$(rb_now_ms)"
+    # through a file, like rb_boot_id: a child of ssh (a `Match exec` of ~/.ssh/config) that keeps stdout open
+    # must not hold a command substitution beyond the limit
+    if f="$(mktemp "${TMPDIR:-/tmp}/rb-sshG.XXXXXX")"; then
+        timeout -k 1 "$lim" "${RB_SSH[@]}" -G "$DEVICE_HOST" >"$f" 2>/dev/null </dev/null && cfg="$(cat "$f")"
+        rm -f "$f"
+    fi
+    t1="$(rb_now_ms)"
     host="$(printf '%s\n' "$cfg" | sed -n 's/^hostname //p' | head -n 1)"
     port="$(printf '%s\n' "$cfg" | sed -n 's/^port //p' | head -n 1)"
     proxy="$(printf '%s\n' "$cfg" | sed -n -e 's/^proxyjump //p' -e 's/^proxycommand //p' | grep -v '^none$' | head -n 1)"
@@ -382,9 +401,17 @@ rb_net_setup() {
     fi
     RB_NET_HOST="$host"
     RB_NET_PORT="${port:-22}"
+    # Does this bash have /dev/tcp? Asked WITHOUT a connection: a service name that does not exist fails in
+    # the lookup in a bash that has it ("Servname not supported", "Invalid argument"), while a bash built
+    # without it opens a file of that name ("No such file or directory"). The earlier check connected to
+    # 127.0.0.1:9; on a host where a SYN to a closed local port is dropped instead of refused (seen on
+    # WSL2), that connect hung for the kernel's whole SYN retry time, about 130 s, right after the trigger.
+    # A check that runs into the limit counts as "has /dev/tcp" (the probes have their own 2 s limit).
+    tcp_out="$(LC_ALL=C timeout -k 1 "$lim" "${RB_BASH:-bash}" -c 'exec 3<>/dev/tcp/127.0.0.1/rb-no-such-service' 2>&1 </dev/null)" || true
+    t2="$(rb_now_ms)"
     if [ -n "$proxy" ]; then
         RB_NET_VIA=ssh
-    elif "${RB_BASH:-bash}" -c 'exec 3<>/dev/tcp/127.0.0.1/9' 2>&1 | grep -qi 'no such file\|not supported'; then
+    elif printf '%s' "$tcp_out" | grep -qi 'no such file'; then
         if command -v nc >/dev/null 2>&1; then RB_NET_VIA=nc; else RB_NET_VIA=ping; fi
     else
         RB_NET_VIA=tcp
@@ -394,6 +421,21 @@ rb_net_setup() {
     ping) RB_NET_DESC="ping" ;;
     *) RB_NET_DESC="ping and the ssh port (port $RB_NET_PORT, $RB_NET_VIA)" ;;
     esac
+    RB_NET_SETUP_NOTE="ssh -G $((t1 - t0))ms, /dev/tcp check $((t2 - t1))ms"
+}
+
+# rb_net_prepare: the network setup and the ping baseline, done ONCE and BEFORE the trigger (rb_trigger
+# calls it, outside the reboot clock: the device is still up, so ping can answer), so that await_reboot
+# polls the moment the trigger call returned. Sets RB_PING_USABLE, RB_NET_READY=1 and adds the time of the
+# ping baseline to RB_NET_SETUP_NOTE (each step's time is in the log, so a stall can be attributed).
+rb_net_prepare() {
+    local t0
+    rb_net_setup
+    t0="$(rb_now_ms)"
+    RB_PING_USABLE=0
+    if rb_ping_probe; then RB_PING_USABLE=1; fi
+    RB_NET_SETUP_NOTE="$RB_NET_SETUP_NOTE, ping baseline $([ "$RB_PING_USABLE" = 1 ] && echo ok || echo 'not used') $(($(rb_now_ms) - t0))ms"
+    RB_NET_READY=1
 }
 
 # rb_ping_probe: 0 the device answers ping, 1 it does not, 2 not available here (no ping, jump host).
@@ -451,19 +493,36 @@ rb_down_check() {
 }
 # Up: see rb_net_setup. RB_T_PORT notes when the port was first seen open since it was last closed (a
 # port seen closed again clears it, so a false "down" leaves no misleading time); RB_UP_VIA records
-# which signal succeeded.
+# which signal succeeded. Sleep is not a reboot: a suspended device (or a network blip) looks "down" too,
+# and comes back with the SAME boot id. When ssh keeps answering with the old id for RB_SAME_ID_GRACE
+# seconds (15) the check ends the wait with RB_NOT_REBOOTED=1 (await_reboot fails with that verdict). The
+# grace covers a false "down" right before a real reboot (the device goes down about 4 s after the trigger).
 rb_up_check() {
     RB_UP_N=$((RB_UP_N + 1))
     rb_net_poll up "$RB_UP_N"
     if [ "$RB_PING" != fail ] && [ "$RB_TCP" = ok ]; then
         [ -n "$RB_T_PORT" ] || RB_T_PORT=$(($(rb_now_ms) - RB_T0))
         rb_is_back "$RB_OLD_ID" && { RB_UP_VIA="ping + port open, then ssh with a new boot_id"; return 0; }
-        return 1
+        rb_same_id_check
+        return
     fi
     RB_T_PORT=""
     [ $((RB_UP_N % 3)) -eq 0 ] || return 1
     rb_is_back "$RB_OLD_ID" && { RB_UP_VIA="ssh with a new boot_id ONLY (ping=$RB_PING, port=$RB_TCP: those probes look wrong for this setup; check RB_PORT_PROBE)"; return 0; }
-    return 1
+    rb_same_id_check
+}
+# rb_same_id_check: after an rb_is_back that failed: 0 (and RB_NOT_REBOOTED=1) once the device has answered
+# with the OLD boot id for RB_SAME_ID_GRACE seconds in a row, else 1. RB_T_SAME: since when (ms after the trigger).
+rb_same_id_check() {
+    if [ -z "$RB_SEEN_ID" ] || [ "$RB_SEEN_ID" != "$RB_OLD_ID" ]; then
+        RB_T_SAME=""
+        return 1
+    fi
+    [ -n "$RB_T_SAME" ] || RB_T_SAME=$(($(rb_now_ms) - RB_T0))
+    rb_trace "up poll $RB_UP_N: ssh answers with the SAME boot id (since $(rb_secs "$RB_T_SAME") s)"
+    [ $(($(rb_now_ms) - RB_T0 - RB_T_SAME)) -ge $((${RB_SAME_ID_GRACE:-15} * 1000)) ] || return 1
+    RB_NOT_REBOOTED=1
+    return 0
 }
 
 # rb_phase_note <what> <seconds> <backup timeout>: a line for the log, with a warning when a phase
@@ -474,47 +533,81 @@ rb_phase_note() {
     rb_log "reboot: $1 after ${2}s$note"
 }
 
+# rb_boot_snapshot <label>: rb_boot_report of the device (uptime, boot id, the auto-resume marker, the pak
+# log, the processes of NextUI, launch.sh and PPSSPP with their start time after the boot), traced in the
+# timings file and kept in RB_BOOT_REPORT (a failing test writes it to its evidence). Never fails.
+rb_boot_snapshot() {
+    local out line
+    out="$(dev_kit "${RB_PROBE_TIMEOUT:-10}" rb_boot_report 2>&1)" || out="${out:+$out
+}(no complete answer from the device)"
+    RB_BOOT_REPORT="${RB_BOOT_REPORT:-}=== $1 ($(rb_secs $(($(rb_now_ms) - RB_T0))) s after the trigger)
+$out
+"
+    rb_trace "boot report: $1"
+    while IFS= read -r line; do rb_trace "  $line"; done <<<"$out"
+    return 0
+}
+
 # await_reboot <old boot id>: after the reboot was triggered (rb_trigger), (1) the device must be seen going
-# down (ping or the ssh port; REBOOT_DOWN_TIMEOUT is the backup), (2) come back (ping and port, then ssh
-# answering with a NEW boot id; REBOOT_UP_TIMEOUT is the backup), (3) the kit is installed again and (4)
-# the SD card is mounted. All polled every second. EVERY time is counted from the moment the trigger call
-# RETURNED (rb_trigger records it; without rb_trigger: from the start of this function), and the log says how
-# long the trigger call took and how long it was until the first probe. Keep-awake is off while the device
-# power-cycles and starts again the moment it answers (before the kit install and the SD card wait).
+# down (ping or the ssh port; REBOOT_DOWN_TIMEOUT, 30 s, is the backup), (2) come back (ping and port, then
+# ssh answering with a NEW boot id; REBOOT_UP_TIMEOUT, 120 s, is the backup; the SAME boot id for
+# RB_SAME_ID_GRACE seconds ends the wait: the device was asleep or unreachable, it did not reboot), (3) the
+# kit is installed again and (4) the SD card is mounted. All polled every second. EVERY time is counted from
+# the moment the trigger call RETURNED (rb_trigger records it; without rb_trigger: from the start of this
+# function), and the log says how long the trigger call took, how long each step of the network setup took
+# (done by rb_trigger before the request; here only without it) and when the first poll was. Keep-awake is off
+# while the device power-cycles and starts again the moment it answers (before the kit install and the SD
+# card wait). A boot report (rb_boot_snapshot) is taken at the first contact after the boot and again once
+# the SD card is mounted.
 await_reboot() {
-    local old="$1" tick="${RB_TICK:-1}" t_entry t_setup t_first sec0 t_down t_up t_kit t_sd secs_el ms_el d
+    local old="$1" tick="${RB_TICK:-1}" t_entry t_first sec0 t_down t_up t_kit t_sd secs_el ms_el d where
+    local down_to="${REBOOT_DOWN_TIMEOUT:-30}" up_to="${REBOOT_UP_TIMEOUT:-120}"
     t_entry="$(rb_now_ms)"
     RB_TICK=0
-    RB_OLD_ID="$old" RB_DOWN_N=0 RB_UP_N=0 RB_T_PORT="" RB_UP_VIA="" RB_DOWN_VIA="" RB_PING_USABLE=0
+    RB_OLD_ID="$old" RB_DOWN_N=0 RB_UP_N=0 RB_T_PORT="" RB_UP_VIA="" RB_DOWN_VIA="" RB_T_SAME="" RB_SEEN_ID="" RB_NOT_REBOOTED=""
+    RB_BOOT_REPORT=""
     RB_T0="${RB_T_TRIGGER_RET:-$t_entry}"
     sec0=$SECONDS
-    rb_net_setup
-    t_setup="$(rb_now_ms)"
-    if rb_ping_probe; then RB_PING_USABLE=1; fi
+    where="before the trigger"
+    if [ "${RB_NET_READY:-}" != 1 ]; then
+        rb_net_prepare
+        where="HERE, after the trigger (no rb_trigger before this wait): $(($(rb_now_ms) - t_entry))ms"
+    fi
     t_first="$(rb_now_ms)"
-    rb_log "reboot: trigger call took $((${RB_TRIGGER_MS:--1}))ms; $((t_entry - RB_T0))ms from its return to this wait, setup $((t_setup - t_entry))ms, ping baseline $([ "$RB_PING_USABLE" = 1 ] && echo ok || echo 'not used') ($((t_first - t_setup))ms); first poll at $(rb_secs $((t_first - RB_T0))) s; watching $RB_NET_DESC"
-    RB_T_TRIGGER_RET=""
-    await "${REBOOT_DOWN_TIMEOUT:-90}" "the device to go down (reboot)" rb_down_check || { RB_TICK=$tick; rb_log "reboot: the device was not seen going down after $((($(rb_now_ms) - RB_T0) / 1000))s"; return 1; }
+    rb_log "reboot: trigger call took $((${RB_TRIGGER_MS:--1}))ms; $((t_entry - RB_T0))ms from its return to this wait; network setup $where ($RB_NET_SETUP_NOTE); first poll at $(rb_secs $((t_first - RB_T0))) s; watching $RB_NET_DESC"
+    RB_T_TRIGGER_RET="" RB_NET_READY=""
+    await "$down_to" "the device to go down (reboot)" rb_down_check || { RB_TICK=$tick; rb_log "reboot: the device was not seen going down after $((($(rb_now_ms) - RB_T0) / 1000))s"; return 1; }
     t_down=$((($(rb_now_ms) - RB_T0 + 500) / 1000))
     rb_log "reboot: down ($RB_DOWN_VIA)"
-    rb_phase_note "down" "$t_down" "${REBOOT_DOWN_TIMEOUT:-90}"
-    await "${REBOOT_UP_TIMEOUT:-300}" "the device to come back (ping and ssh port open, ssh answering with a new boot_id)" rb_up_check || { RB_TICK=$tick; rb_log "reboot: the device did not come back within $((($(rb_now_ms) - RB_T0) / 1000 - t_down))s of going down (last poll: ping=$RB_PING port=$RB_TCP; new boot_id: no)"; return 1; }
+    rb_phase_note "down" "$t_down" "$down_to"
+    await "$up_to" "the device to come back (ping and ssh port open, ssh answering with a new boot_id)" rb_up_check || {
+        RB_TICK=$tick
+        rb_log "reboot: the device did not come back within $((($(rb_now_ms) - RB_T0) / 1000 - t_down))s of going down (last poll: ping=$RB_PING port=$RB_TCP; new boot_id: no${RB_T_SAME:+; it answers with the SAME boot id since $(rb_secs "$RB_T_SAME") s: asleep or unreachable for a while, not rebooted})"
+        return 1
+    }
+    if [ -n "$RB_NOT_REBOOTED" ]; then
+        RB_TICK=$tick
+        rb_log "reboot: NOT rebooted: the device was unreachable (\"down\" at ${t_down}s: $RB_DOWN_VIA) and has answered with the SAME boot id since $(rb_secs "$RB_T_SAME") s after the trigger (${RB_SAME_ID_GRACE:-15}s in a row): it was asleep (idle suspend) or the network dropped; the reboot did not happen"
+        return 1
+    fi
     ms_el=$(($(rb_now_ms) - RB_T0))
     t_up=$(((ms_el + 500) / 1000 - t_down))
     # keep-awake from here on: the idle suspend of NextUI is about 10 s and a suspended device does not answer
     RB_TICK=$tick
     RB_LAST_TICK=""
     rb_log "reboot: back via: $RB_UP_VIA"
-    rb_phase_note "back (${RB_T_PORT:+port open $(((RB_T_PORT + 500) / 1000))s after the trigger, }ssh with a new boot_id) ${t_up}s after going down; total" "$(((ms_el + 500) / 1000))" "$((${REBOOT_DOWN_TIMEOUT:-90} + ${REBOOT_UP_TIMEOUT:-300}))"
+    rb_phase_note "back (${RB_T_PORT:+port open $(((RB_T_PORT + 500) / 1000))s after the trigger, }ssh with a new boot_id) ${t_up}s after going down; total" "$(((ms_el + 500) / 1000))" "$((down_to + up_to))"
     await 60 "the kit to be installed after the reboot" dev_install_kit || return 1
     t_kit=$((($(rb_now_ms) - RB_T0 + 500) / 1000))
     dev_kit "${RB_PROBE_TIMEOUT:-10}" rb_tick >/dev/null 2>&1 || true # the first tap at once
     RB_LAST_TICK=$(($(rb_now_ms) / 1000))
+    rb_boot_snapshot "first contact after the boot (kit installed)"
     # The SD card is mounted a little after ssh is up: the backup flag lives on it, and the
     # evidence the power-off wrapper recorded too.
     await 120 "the SD card to be mounted after the reboot" probe '[ -f "$BAK/active" ]' || return 1
     t_sd=$((($(rb_now_ms) - RB_T0 + 500) / 1000))
-    rb_log "reboot timing (from the trigger call's return): down after ${t_down}s, up (new boot_id) after ${t_up}s more, kit installed at ${t_kit}s, SD card mounted at ${t_sd}s (backups: down ${REBOOT_DOWN_TIMEOUT:-90}s, up ${REBOOT_UP_TIMEOUT:-300}s)"
+    rb_boot_snapshot "the SD card is mounted"
+    rb_log "reboot timing (from the trigger call's return): down after ${t_down}s, up (new boot_id) after ${t_up}s more, kit installed at ${t_kit}s, SD card mounted at ${t_sd}s (backups: down ${down_to}s, up ${up_to}s)"
     # a cross-check of the clocks: bash's SECONDS and the wall clock must agree (a difference would make every
     # elapsed time above untrustworthy, and is the thing to look at in the next report)
     secs_el=$((SECONDS - sec0))

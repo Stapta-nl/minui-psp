@@ -490,6 +490,47 @@ rb_keepawake_dev() {
     return 0
 }
 
+# --- evidence about a boot ---------------------------------------------------------------
+# rb_boot_report: what the device looks like now, relative to its boot, for a report (was a game launched
+# after the boot, and when): the uptime, the boot id, the auto-resume marker (only when the SD card is
+# mounted), the pak log (launch_sig, and how long ago it was written) and every process of NextUI,
+# launch.sh, minui-power-control and PPSSPP with its start time in seconds after the boot (field 22 of
+# /proc/<pid>/stat, in clock ticks). Read only, never fails.
+rb_boot_report() {
+    local up hz p first arg args st t log="$LOGS/PSP.txt" now mt
+    read -r up _ </proc/uptime 2>/dev/null || up="?"
+    hz="$(getconf CLK_TCK 2>/dev/null)"
+    case "$hz" in "" | *[!0-9]*) hz=100 ;; esac
+    echo "uptime: ${up} s"
+    echo "boot_id: $(cat "${BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}" 2>/dev/null)"
+    if [ -d "$SHARED" ]; then
+        if [ -e "$AUTORESUME" ]; then echo "auto-resume marker: PRESENT: $(cat "$AUTORESUME" 2>/dev/null)"; else echo "auto-resume marker: absent"; fi
+        now="$(date +%s 2>/dev/null)"
+        mt="$(date -r "$log" +%s 2>/dev/null)"
+        echo "pak log: $(launch_sig "$log")${mt:+ (written $((now - mt)) s ago)}"
+    else
+        echo "auto-resume marker, pak log: unknown (the SD card is not mounted yet)"
+    fi
+    for p in /proc/[0-9]*; do
+        first="" args=""
+        while IFS= read -r -d '' arg || [ -n "$arg" ]; do
+            [ -n "$first" ] || first="$arg"
+            args="$args$arg "
+        done 2>/dev/null <"$p/cmdline" || continue
+        case "${first##*/} $args" in
+        nextui.elf* | PPSSPPSDL* | minui-power-control* | *"/launch.sh"*) ;;
+        *) continue ;;
+        esac
+        IFS= read -r st <"$p/stat" 2>/dev/null || continue
+        st="${st##*) }"
+        # shellcheck disable=SC2086 # the fields of /proc/<pid>/stat after the command name
+        set -- $st
+        t="${20:-0}"
+        echo "process ${p#/proc/}: started $((t / hz)).$(((t % hz) * 10 / hz)) s after the boot: ${args% }"
+    done
+    return 0
+}
+
 # Best-effort screenshot kept as evidence (the Screenshot Monitor pak is optional here).
 rb_evidence_shot() { # rb_evidence_shot <label>
     [ -f "$MON/bin/screenshot" ] || return 0

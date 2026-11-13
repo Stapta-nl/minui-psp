@@ -236,7 +236,7 @@ make_device() {
 
 @test "await_reboot: the clock starts when the trigger call RETURNED (a fake clock): earlier work is never counted, no false SLOW" {
     export RB_CLOCK_FILE="$T/clock" FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=1
-    export REBOOT_DOWN_TIMEOUT=90 REBOOT_UP_TIMEOUT=300
+    unset REBOOT_DOWN_TIMEOUT REBOOT_UP_TIMEOUT # the defaults: 30 s and 120 s
     echo 1000000 >"$RB_CLOCK_FILE"
     # shellcheck disable=SC2317 # replaces sleep: every poll step is one fake second
     sleep() { echo $(($(cat "$RB_CLOCK_FILE") + 1000)) >"$RB_CLOCK_FILE"; }
@@ -249,8 +249,61 @@ make_device() {
     assert_success
     assert_output --partial "trigger call took 400ms; 2000ms from its return to this wait"
     assert_output --partial "reboot: down after 2s"
+    assert_output --partial "(backups: down 30s, up 120s)"
     refute_output --partial "after 138s"
     refute_output --partial "SLOW"
+}
+
+@test "the reboot backups default to 30 s down and 120 s up (observed: about 4 s and 35 s), overridable" {
+    grep -q 'REBOOT_DOWN_TIMEOUT:-30' "$HELPERS/reboot.bash"
+    grep -q 'REBOOT_UP_TIMEOUT:-120' "$HELPERS/reboot.bash"
+    run grep -c 'REBOOT_DOWN_TIMEOUT:-90\|REBOOT_UP_TIMEOUT:-300' "$HELPERS/reboot.bash" "$TESTS_DIR/bats/reboot.bats"
+    refute_output --partial ":1"
+}
+
+@test "rb_trigger does the network setup BEFORE the request: await_reboot polls at once and logs every setup step's time" {
+    export RB_CLOCK_FILE="$T/clock" FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20
+    echo 1000000 >"$RB_CLOCK_FILE"
+    # shellcheck disable=SC2317 # replaces sleep: every poll step is one fake second
+    sleep() { echo $(($(cat "$RB_CLOCK_FILE") + 1000)) >"$RB_CLOCK_FILE"; }
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    dev_install_kit
+    rb_trigger true
+    [ "$RB_NET_READY" = 1 ]
+    run await_reboot oldboot
+    assert_success
+    assert_output --partial "network setup before the trigger (ssh -G "
+    assert_output --partial "/dev/tcp check "
+    assert_output --partial "ping baseline not used"
+    assert_output --partial "first poll at 0.0 s"
+    # without rb_trigger the setup is done in the wait, and the log says so
+    unset RB_NET_READY
+    run await_reboot oldboot
+    assert_output --partial "network setup HERE, after the trigger"
+}
+
+@test "rb_net_setup: a /dev/tcp check or an ssh -G that hangs is cut by the step limit (a hang counts as 'has /dev/tcp')" {
+    unset RB_PORT_PROBE
+    printf '#!/bin/sh\nexec sleep 30\n' >"$T/bin/hangbash"
+    printf '#!/bin/sh\ncase " $* " in *" -G "*) exec sleep 30 ;; esac\nexit 1\n' >"$T/bin/ssh"
+    chmod +x "$T/bin/hangbash" "$T/bin/ssh"
+    local start=$SECONDS
+    RB_SETUP_STEP_TIMEOUT=1 RB_BASH="$T/bin/hangbash" rb_net_setup
+    [ $((SECONDS - start)) -le 5 ]
+    [ "$RB_NET_VIA" = tcp ]
+    [ "$RB_NET_HOST" = brick.example ] && [ "$RB_NET_PORT" = 2222 ] # read from the settings instead
+    [[ "$RB_NET_SETUP_NOTE" == "ssh -G "*"ms, /dev/tcp check "*ms ]]
+}
+
+@test "rb_net_setup: the /dev/tcp check makes no connection (no SYN that could hang): it uses a service name that does not exist" {
+    run grep -n 'exec 3<>/dev/tcp/127.0.0.1/' "$HELPERS/reboot.bash"
+    assert_output --partial "/dev/tcp/127.0.0.1/rb-no-such-service"
+    refute_output --partial "/dev/tcp/127.0.0.1/9'"
+    bash -c 'exec 3<>/dev/tcp/127.0.0.1/rb-no-such-service' 2>&1 | grep -qi 'no such file' && skip "this bash has no /dev/tcp"
+    unset RB_PORT_PROBE
+    rb_net_setup
+    [ "$RB_NET_VIA" = tcp ]
 }
 
 @test "await_reboot: also waits for the SD card (the backup flag) after the boot" {
@@ -284,7 +337,44 @@ make_device() {
     run await_reboot oldboot
     assert_failure
     assert_output --partial "the device to come back"
-    assert_output --partial "last poll: ping=n/a port=ok; new boot_id: no"
+    assert_output --partial "last poll: ping=n/a port=ok; new boot_id: no; it answers with the SAME boot id"
+}
+
+@test "await_reboot: down, then the SAME boot id for RB_SAME_ID_GRACE s: ends at once with 'asleep or unreachable, not rebooted' (no wait for the backup)" {
+    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=2 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=60 RB_SAME_ID_GRACE=1
+    local start=$SECONDS
+    run await_reboot oldboot
+    assert_failure
+    [ $((SECONDS - start)) -lt 20 ]
+    assert_output --partial "reboot: NOT rebooted: the device was unreachable"
+    assert_output --partial "asleep (idle suspend) or the network dropped"
+    run cat "$T/timings.txt"
+    assert_output --partial "ssh answers with the SAME boot id (since"
+}
+
+@test "await_reboot: a short false 'down' and the old id, then the real reboot within the grace: still a reboot" {
+    # port closed for one poll, then open with the OLD id for a few polls, then the new boot id
+    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=1 FAKE_SSH_NEWBOOT_AT=4 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20 RB_SAME_ID_GRACE=15
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    run await_reboot oldboot
+    assert_success
+    refute_output --partial "NOT rebooted"
+    assert_output --partial "reboot: back via: ping + port open, then ssh with a new boot_id"
+}
+
+@test "await_reboot: a boot report at the first contact and once the SD card is mounted (uptime, boot id, marker, processes)" {
+    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=2 FAKE_SSH_NEWBOOT_AT=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=20
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    await_reboot oldboot 2>/dev/null
+    [[ "$RB_BOOT_REPORT" == *"=== first contact after the boot (kit installed)"* ]]
+    [[ "$RB_BOOT_REPORT" == *"=== the SD card is mounted"* ]]
+    [[ "$RB_BOOT_REPORT" == *"boot_id: newboot"* ]]
+    [[ "$RB_BOOT_REPORT" == *"auto-resume marker: absent"* ]]
+    run cat "$T/timings.txt"
+    assert_output --partial "boot report: first contact after the boot"
+    assert_output --partial "  uptime: "
 }
 
 @test "await_reboot: the port never opens again: an error after the backup timeout" {
@@ -504,14 +594,34 @@ FAKE
     rb_rom_running() { [ -f "$FS/game.pid" ]; }
 }
 
-@test "wait_ui_settled: returns after N quiet polls, early (not after the old fixed wait)" {
+@test "wait_ui_settled: returns after N quiet seconds, early (not after the old fixed wait)" {
     fake_settle_tools
     echo 100 >"$FS/nextui.pid"
     hook() { echo x >>"$T/hook.log"; }
     E2E_POLL_HOOK=hook run wait_ui_settled 2 60
     assert_success
-    # early: 3 polls (2 quiet ones), not the 60 of the limit
-    [ "$(wc -l <"$T/hook.log")" -le 5 ]
+    # early: polls at 0, 1 and 2 s (the first one starts the quiet time: no extra poll), not the 60 of the limit
+    [ "$(wc -l <"$T/hook.log")" -le 4 ]
+}
+
+@test "the quiet time is wall-clock seconds from the first quiet poll: slow polls do not stretch it, and no extra poll" {
+    fake_settle_tools
+    echo 300 >"$FS/game.pid"
+    # every poll takes 1.5 s (a slow /proc scan, a keep-awake tap): 3 s of quiet must not take 3 polls x 2.5 s
+    hook() { sleep 1.5; }
+    local t0
+    t0="$(rb_now_ms)"
+    E2E_POLL_HOOK=hook run wait_game_settled 3 30
+    assert_success
+    [ $(($(rb_now_ms) - t0)) -lt 6500 ]
+    echo 100 >"$FS/nextui.pid"
+    rm -f "$FS/game.pid"
+    t0="$(rb_now_ms)"
+    run wait_ui_settled 2 30
+    assert_success
+    # polls at 0, 1, 2 s: about 2 s, not the 3 polls of the old counting
+    [ $(($(rb_now_ms) - t0)) -lt 2900 ]
+    [ $(($(rb_now_ms) - t0)) -ge 1900 ]
 }
 
 @test "wait_ui_settled: a NextUI that restarts (new pid) or exits to launch a game is not settled; the limit is the backup" {
@@ -533,7 +643,7 @@ FAKE
     assert_output --partial "pid: none"
 }
 
-@test "wait_game_settled: the same game process for N polls; a game that dies while starting ends the wait at once" {
+@test "wait_game_settled: the same game process for N seconds; a game that dies while starting ends the wait at once" {
     fake_settle_tools
     echo 300 >"$FS/game.pid"
     run wait_game_settled 2 30
@@ -740,7 +850,7 @@ game 3 6"
 
 @test "rb_net_setup: no /dev/tcp in bash selects nc (else ping), and the probes call them with short limits" {
     unset RB_PORT_PROBE
-    printf '#!/bin/sh\necho "bash: /dev/tcp/127.0.0.1/9: No such file or directory" >&2\nexit 1\n' >"$T/bin/nobash"
+    printf '#!/bin/sh\necho "bash: /dev/tcp/127.0.0.1/rb-no-such-service: No such file or directory" >&2\nexit 1\n' >"$T/bin/nobash"
     chmod +x "$T/bin/nobash"
     printf '#!/bin/sh\necho "$*" >"%s/nc.args"\n' "$T" >"$T/bin/nc"
     printf '#!/bin/sh\necho "$*" >"%s/ping.args"\n' "$T" >"$T/bin/ping"
@@ -776,6 +886,16 @@ game 3 6"
     run env -i PATH="$PATH" HOME="${HOME:-/tmp}" DEVICE_HOST="$DEVICE_HOST" DEVICE_SSH_OPTS="$DEVICE_SSH_OPTS" \
         FAKE_SSH_STATE="$FAKE_SSH_STATE" FAKE_SSH_LOG="$FAKE_SSH_LOG" bash "$TESTS_DIR/lib/bats-core/bin/bats" "$T/probe.bats"
     assert_success
+}
+
+@test "reboot.bats: a failed test (BATS_TEST_COMPLETED unset) leaves its evidence: the boot reports, one taken now, the pak log" {
+    run awk '/^teardown\(\) \{/{f=1} f{print} /^\}/{f=0}' "$TESTS_DIR/bats/reboot.bats"
+    assert_output --partial 'BATS_TEST_COMPLETED'
+    assert_output --partial 'fetch_failure_evidence'
+    run awk '/^fetch_failure_evidence\(\) \{/{f=1} f{print} /^\}/{f=0}' "$TESTS_DIR/bats/reboot.bats"
+    assert_output --partial 'RB_BOOT_REPORT'
+    assert_output --partial 'rb_boot_report'
+    assert_output --partial 'fetch_log'
 }
 
 @test "reboot.bats sets the ssh command up for every test (setup), not only in setup_file" {
@@ -1545,6 +1665,26 @@ fake_game_up() { # a NextUI that is up and no game: what e2e_stop_game wants to 
     assert_failure
     kill "$emu"
     wait "$emu" 2>/dev/null || true
+}
+
+@test "rb_boot_report: uptime, boot id, the marker, the pak log and launch.sh with its start time after the boot" {
+    printf '/Roms/game.iso' >"$AUTORESUME"
+    printf 'first line\n' >"$LOGS/PSP.txt"
+    (exec -a sh bash -c 'sleep 30; :' "$PAK/launch.sh" "$ROM" 3>&-) &
+    local p=$!
+    sleep 0.3
+    run rb_boot_report
+    kill "$p"
+    wait "$p" 2>/dev/null || true
+    assert_success
+    assert_output --regexp "uptime: [0-9.]+ s"
+    assert_output --partial "boot_id: oldboot"
+    assert_output --partial "auto-resume marker: PRESENT: /Roms/game.iso"
+    assert_output --partial "first line (written"
+    assert_output --regexp "process $p: started [0-9]+\.[0-9] s after the boot: sh "
+    printf '%s\n' "$output" | grep "^process $p: " | grep -qF "$PAK/launch.sh"
+    SHARED="$T/not-mounted" run rb_boot_report
+    assert_output --partial "unknown (the SD card is not mounted yet)"
 }
 
 @test "rb_asleep: the probe decides when given; rb_tick taps the pad when awake and does not when asleep" {

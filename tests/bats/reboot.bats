@@ -88,6 +88,27 @@ fetch_evidence() {
 fetch_log() {
     dev_kit 60 'cat "$LOGS/PSP.txt"' >"$OUT/$1-PSP.log" 2>&1 || true
 }
+# fetch_failure_evidence <label>: after a failed test, what the next report needs to tell what happened:
+# the pak log (<label>-PSP.log) and <label>-failure.txt with the boot reports await_reboot took during the
+# test (first contact after the boot, SD card mounted: the uptime, the boot id, whether the auto-resume
+# marker existed, the pak log, the start of launch.sh / NextUI / PPSSPP after the boot) and one taken now.
+# Best effort, short limits: the device may be down.
+fetch_failure_evidence() {
+    local f="$OUT/$1-failure.txt"
+    {
+        echo "test: ${BATS_TEST_DESCRIPTION:-?}"
+        if [ -n "${RB_BOOT_REPORT:-}" ]; then
+            echo "--- boot reports taken by await_reboot in this test"
+            printf '%s' "$RB_BOOT_REPORT"
+        else
+            echo "--- no reboot was awaited in this test (no boot reports)"
+        fi
+        echo "=== now (after the failure)"
+        dev_kit 20 rb_boot_report 2>&1 || echo "(no complete answer from the device)"
+    } >"$f" 2>&1
+    fetch_log "$1"
+}
+
 # The non-trace lines of the pak log (launch.sh runs with xtrace on some builds).
 pak_log() { dev_kit 60 'grep -v "^+" "$LOGS/PSP.txt"'; }
 
@@ -130,7 +151,11 @@ setup() {
 }
 
 # One line per test in the TAP output: the total and where the time went (every wait and every ssh call of 2 s or more).
+# A test that failed (bats sets BATS_TEST_COMPLETED only for one that passed) leaves its evidence (R7 and every other case).
 teardown() {
+    if [ -z "${BATS_TEST_COMPLETED:-}" ] && [ -z "${BATS_TEST_SKIPPED:-}" ] && [ -n "${OUT:-}" ]; then
+        fetch_failure_evidence "${BATS_TEST_DESCRIPTION%% *}"
+    fi
     rb_test_end
 }
 
@@ -186,7 +211,7 @@ teardown_file() {
     [ -n "${RB_STARTED:-}" ] || return 0
     rb_ssh_setup || return 0
     # A case that was cut short in the middle of a reboot: wait for the device first.
-    RB_TICK=0 await "${REBOOT_UP_TIMEOUT:-300}" "the device to be reachable for the restore" dev_run "${RB_PROBE_TIMEOUT:-10}" true || {
+    RB_TICK=0 await "${REBOOT_UP_TIMEOUT:-120}" "the device to be reachable for the restore" dev_run "${RB_PROBE_TIMEOUT:-10}" true || {
         echo "# the device is not reachable: its backup stays on the SD card and is restored by the next run" >&3
         return 0
     }
@@ -304,6 +329,8 @@ teardown_file() {
     old="$(rb_boot_id)"
     [ -n "$old" ] || fail "could not read the device's boot id"
     ref="$(rb_launch_ref)" # the pak log of this game: a launch after the boot would rewrite it
+    # On a failure, teardown writes R7-failure.txt (boot reports: was the marker there at the first contact,
+    # when did launch.sh start after the boot) and R7-PSP.log: a real auto-launch and sleep/wake differ there.
     rb_trigger rb_hard_reboot
     await_reboot "$old"
     await "${RESUME_TIMEOUT:-180}" "NextUI to be up after the boot" probe rb_nextui_up
