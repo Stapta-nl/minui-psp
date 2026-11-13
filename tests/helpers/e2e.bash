@@ -380,21 +380,23 @@ launch_unchanged() {
 }
 
 # e2e_clock: sets E2E_NOW to the wall clock in ms (bash's EPOCHREALTIME, else `date`; no fork with the former).
+# E2E_COARSE=1 with the `date` fallback: its 1 s resolution could cut a quiet time short by up to 1 s, so
+# e2e_quiet_left then asks for one second more.
 # The quiet times and limits of the settles below are WALL-CLOCK seconds, not poll counts: a poll that takes
 # longer than usual (a slow /proc scan, a keep-awake tap) does not stretch the wait.
 e2e_clock() {
     local t
     if [ -n "${EPOCHREALTIME:-}" ]; then
         t="${EPOCHREALTIME/[.,]/}"
-        E2E_NOW=$((t / 1000))
+        E2E_NOW=$((t / 1000)) E2E_COARSE=""
     else
-        E2E_NOW=$(($(date +%s) * 1000))
+        E2E_NOW=$(($(date +%s) * 1000)) E2E_COARSE=1
     fi
 }
 # e2e_poll_sleep <ms left>: the poll step of the settles (1 s), shorter when the quiet time ends sooner.
 e2e_poll_sleep() {
     if [ "$1" -gt 0 ] && [ "$1" -lt 1000 ]; then
-        sleep "0.$(printf '%03d' "$1")" # the rest of the quiet time
+        sleep "0.$(printf '%03d' "$1")" 2>/dev/null || sleep 1 # the rest of the quiet time (whole seconds: a sleep without fractions)
     else
         sleep 1 # poll step
     fi
@@ -405,7 +407,7 @@ e2e_quiet_left() {
     if [ -z "$1" ]; then
         E2E_LEFT=1000 E2E_QUIET=0
     else
-        E2E_LEFT=$(($2 * 1000 - (E2E_NOW - $1))) E2E_QUIET=$(((E2E_NOW - $1) / 1000))
+        E2E_LEFT=$((($2 + ${E2E_COARSE:-0}) * 1000 - (E2E_NOW - $1))) E2E_QUIET=$(((E2E_NOW - $1) / 1000))
     fi
 }
 

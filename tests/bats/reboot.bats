@@ -92,7 +92,7 @@ fetch_log() {
 # the pak log (<label>-PSP.log) and <label>-failure.txt with the boot reports await_reboot took during the
 # test (first contact after the boot, SD card mounted: the uptime, the boot id, whether the auto-resume
 # marker existed, the pak log, the start of launch.sh / NextUI / PPSSPP after the boot) and one taken now.
-# Best effort, short limits: the device may be down.
+# Best effort, short limits: the device may be down (the kit is installed again first).
 fetch_failure_evidence() {
     local f="$OUT/$1-failure.txt"
     {
@@ -104,6 +104,7 @@ fetch_failure_evidence() {
             echo "--- no reboot was awaited in this test (no boot reports)"
         fi
         echo "=== now (after the failure)"
+        dev_install_kit 15 >/dev/null 2>&1 || true # a reboot cleared /tmp: without the kit every call below exits 97
         dev_kit 20 rb_boot_report 2>&1 || echo "(no complete answer from the device)"
     } >"$f" 2>&1
     fetch_log "$1"

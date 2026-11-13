@@ -109,13 +109,14 @@ dev_kit() {
 # dev_ok <timeout s> <script>: dev_kit with no output, for use in a wait.
 dev_ok() { dev_kit "$1" "$2" >/dev/null 2>&1; }
 
-# Streams the device-side functions to the device (needed after every boot).
+# dev_install_kit [limit s]: streams the device-side functions to the device (needed after every boot);
+# the ssh call is limited to <limit> s (60).
 dev_install_kit() {
-    local here="${BASH_SOURCE[0]%/*}" errf rc
+    local here="${BASH_SOURCE[0]%/*}" errf rc limit="${1:-60}"
     rb_ssh_ready || { echo "DEVICE_HOST is not set" >&2; return 2; }
     errf="$(mktemp "${TMPDIR:-/tmp}/rb-ssh-err.XXXXXX")" || return 2
     cat "$here/e2e.bash" "$here/devconfig.bash" "$here/reboot-device.bash" |
-        timeout -k 3 60 "${RB_SSH[@]}" "$DEVICE_HOST" "cat >$(rb_q "$RB_KIT_PATH.part") && mv $(rb_q "$RB_KIT_PATH.part") $(rb_q "$RB_KIT_PATH")" 2>"$errf"
+        timeout -k 3 "$limit" "${RB_SSH[@]}" "$DEVICE_HOST" "cat >$(rb_q "$RB_KIT_PATH.part") && mv $(rb_q "$RB_KIT_PATH.part") $(rb_q "$RB_KIT_PATH")" 2>"$errf"
     rc=${PIPESTATUS[1]}
     rb_scrub <"$errf" >&2
     rm -f "$errf"
@@ -355,11 +356,12 @@ rb_went_down() {
     now="$(rb_boot_id)" || return 0
     [ "$now" != "$1" ]
 }
-# True when the device answers and its boot id is not $1. RB_SEEN_ID: the id it answered ("" no answer).
+# True when the device answers and its boot id is not $1. RB_SEEN_ID: the id it answered ("" no answer);
+# RB_SSH_FAILED=1 once ssh did not answer at all (the device was really unreachable, see rb_same_id_check).
 rb_is_back() {
     local now
     RB_SEEN_ID=""
-    now="$(rb_boot_id)" || return 1
+    now="$(rb_boot_id)" || { RB_SSH_FAILED=1; return 1; }
     RB_SEEN_ID="$now"
     [ -n "$now" ] && [ "$now" != "$1" ]
 }
@@ -495,8 +497,10 @@ rb_down_check() {
 # port seen closed again clears it, so a false "down" leaves no misleading time); RB_UP_VIA records
 # which signal succeeded. Sleep is not a reboot: a suspended device (or a network blip) looks "down" too,
 # and comes back with the SAME boot id. When ssh keeps answering with the old id for RB_SAME_ID_GRACE
-# seconds (15) the check ends the wait with RB_NOT_REBOOTED=1 (await_reboot fails with that verdict). The
-# grace covers a false "down" right before a real reboot (the device goes down about 4 s after the trigger).
+# seconds (15) the check ends the wait with RB_NOT_REBOOTED=1 (await_reboot fails with that verdict), but
+# ONLY after ssh itself failed at least once in this phase (RB_SSH_FAILED): a "down" from one lost ping or
+# a missed port probe is no proof of unreachability, and the power-off path (the shim waits up to 15 s for
+# launch.sh, the save on exit, sync) keeps sshd answering with the old id for a while before the reboot.
 rb_up_check() {
     RB_UP_N=$((RB_UP_N + 1))
     rb_net_poll up "$RB_UP_N"
@@ -511,15 +515,20 @@ rb_up_check() {
     rb_is_back "$RB_OLD_ID" && { RB_UP_VIA="ssh with a new boot_id ONLY (ping=$RB_PING, port=$RB_TCP: those probes look wrong for this setup; check RB_PORT_PROBE)"; return 0; }
     rb_same_id_check
 }
-# rb_same_id_check: after an rb_is_back that failed: 0 (and RB_NOT_REBOOTED=1) once the device has answered
-# with the OLD boot id for RB_SAME_ID_GRACE seconds in a row, else 1. RB_T_SAME: since when (ms after the trigger).
+# rb_same_id_check: after an rb_is_back that failed: 0 (and RB_NOT_REBOOTED=1) once the device, after an ssh
+# failure in this phase, has answered with the OLD boot id for RB_SAME_ID_GRACE seconds in a row, else 1.
+# RB_T_SAME: since when (ms after the trigger); not started before an ssh failure.
 rb_same_id_check() {
     if [ -z "$RB_SEEN_ID" ] || [ "$RB_SEEN_ID" != "$RB_OLD_ID" ]; then
         RB_T_SAME=""
         return 1
     fi
+    if [ "${RB_SSH_FAILED:-}" != 1 ]; then
+        rb_trace "up poll $RB_UP_N: ssh answers with the SAME boot id (ssh never failed since the \"down\": not counted as asleep, still waiting for the reboot)"
+        return 1
+    fi
     [ -n "$RB_T_SAME" ] || RB_T_SAME=$(($(rb_now_ms) - RB_T0))
-    rb_trace "up poll $RB_UP_N: ssh answers with the SAME boot id (since $(rb_secs "$RB_T_SAME") s)"
+    rb_trace "up poll $RB_UP_N: ssh answers with the SAME boot id (since $(rb_secs "$RB_T_SAME") s, after an ssh failure)"
     [ $(($(rb_now_ms) - RB_T0 - RB_T_SAME)) -ge $((${RB_SAME_ID_GRACE:-15} * 1000)) ] || return 1
     RB_NOT_REBOOTED=1
     return 0
@@ -564,7 +573,7 @@ await_reboot() {
     local down_to="${REBOOT_DOWN_TIMEOUT:-30}" up_to="${REBOOT_UP_TIMEOUT:-120}"
     t_entry="$(rb_now_ms)"
     RB_TICK=0
-    RB_OLD_ID="$old" RB_DOWN_N=0 RB_UP_N=0 RB_T_PORT="" RB_UP_VIA="" RB_DOWN_VIA="" RB_T_SAME="" RB_SEEN_ID="" RB_NOT_REBOOTED=""
+    RB_OLD_ID="$old" RB_DOWN_N=0 RB_UP_N=0 RB_T_PORT="" RB_UP_VIA="" RB_DOWN_VIA="" RB_T_SAME="" RB_SEEN_ID="" RB_SSH_FAILED="" RB_NOT_REBOOTED=""
     RB_BOOT_REPORT=""
     RB_T0="${RB_T_TRIGGER_RET:-$t_entry}"
     sec0=$SECONDS
@@ -582,7 +591,7 @@ await_reboot() {
     rb_phase_note "down" "$t_down" "$down_to"
     await "$up_to" "the device to come back (ping and ssh port open, ssh answering with a new boot_id)" rb_up_check || {
         RB_TICK=$tick
-        rb_log "reboot: the device did not come back within $((($(rb_now_ms) - RB_T0) / 1000 - t_down))s of going down (last poll: ping=$RB_PING port=$RB_TCP; new boot_id: no${RB_T_SAME:+; it answers with the SAME boot id since $(rb_secs "$RB_T_SAME") s: asleep or unreachable for a while, not rebooted})"
+        rb_log "reboot: the device did not come back within $((($(rb_now_ms) - RB_T0) / 1000 - t_down))s of going down (last poll: ping=$RB_PING port=$RB_TCP; new boot_id: no$([ -n "$RB_SEEN_ID" ] && [ "$RB_SEEN_ID" = "$RB_OLD_ID" ] && echo "; it answers with the SAME boot id${RB_T_SAME:+ since $(rb_secs "$RB_T_SAME") s}: not rebooted${RB_SSH_FAILED:+ (it was unreachable for a while: asleep?)}"))"
         return 1
     }
     if [ -n "$RB_NOT_REBOOTED" ]; then

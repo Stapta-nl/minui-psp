@@ -340,8 +340,9 @@ make_device() {
     assert_output --partial "last poll: ping=n/a port=ok; new boot_id: no; it answers with the SAME boot id"
 }
 
-@test "await_reboot: down, then the SAME boot id for RB_SAME_ID_GRACE s: ends at once with 'asleep or unreachable, not rebooted' (no wait for the backup)" {
-    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=2 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=60 RB_SAME_ID_GRACE=1
+@test "await_reboot: unreachable (ssh failed too), then the SAME boot id for RB_SAME_ID_GRACE s: ends at once with 'asleep or unreachable, not rebooted' (no wait for the backup)" {
+    # the port is closed for the down poll and three up polls; the 3rd up poll asks ssh, which fails (asleep)
+    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=4 FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=60 RB_SAME_ID_GRACE=1
     local start=$SECONDS
     run await_reboot oldboot
     assert_failure
@@ -350,6 +351,21 @@ make_device() {
     assert_output --partial "asleep (idle suspend) or the network dropped"
     run cat "$T/timings.txt"
     assert_output --partial "ssh answers with the SAME boot id (since"
+}
+
+@test "await_reboot: a false 'down' (ssh never failed) and the old id for longer than the grace (a slow power-off), then the new id: a reboot" {
+    # one missed port probe; then ssh answers the OLD id for about 12 polls (> the 1 s grace), then the new boot id
+    export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=1 FAKE_SSH_NEWBOOT_AT=12 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=30 RB_SAME_ID_GRACE=1
+    mkdir -p "$BAK"
+    : >"$BAK/active"
+    local start=$SECONDS
+    run await_reboot oldboot
+    assert_success
+    [ $((SECONDS - start)) -ge 2 ] # the old id was answered for longer than the grace
+    refute_output --partial "NOT rebooted"
+    assert_output --partial "reboot: back via: ping + port open, then ssh with a new boot_id"
+    run cat "$T/timings.txt"
+    assert_output --partial "ssh never failed since the"
 }
 
 @test "await_reboot: a short false 'down' and the old id, then the real reboot within the grace: still a reboot" {
@@ -894,8 +910,24 @@ game 3 6"
     assert_output --partial 'fetch_failure_evidence'
     run awk '/^fetch_failure_evidence\(\) \{/{f=1} f{print} /^\}/{f=0}' "$TESTS_DIR/bats/reboot.bats"
     assert_output --partial 'RB_BOOT_REPORT'
+    assert_output --partial 'dev_install_kit 15' # a reboot cleared /tmp: the kit first, best effort
     assert_output --partial 'rb_boot_report'
     assert_output --partial 'fetch_log'
+}
+
+@test "settle clock fallbacks: a sleep without fractions sleeps 1 s; the 1 s clock of date asks for one second more quiet" {
+    # shellcheck disable=SC2317 # a sleep that rejects fractions
+    sleep() { case "$1" in *.*) return 1 ;; esac; echo "slept $1" >>"$T/sleep.log"; }
+    e2e_poll_sleep 300
+    run cat "$T/sleep.log"
+    assert_output "slept 1"
+    export E2E_NOW=10000 E2E_COARSE=""
+    e2e_quiet_left 8000 2
+    [ "$E2E_LEFT" = 0 ]
+    E2E_COARSE=1
+    e2e_quiet_left 8000 2
+    [ "$E2E_LEFT" = 1000 ]
+    (unset EPOCHREALTIME; e2e_clock; [ "$E2E_COARSE" = 1 ])
 }
 
 @test "reboot.bats sets the ssh command up for every test (setup), not only in setup_file" {
