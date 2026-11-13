@@ -162,6 +162,13 @@ rb_preflight() {
 # "active" is set first, so an abort at any point is restored by rb_restore (this run) or by the
 # next run, of either test file.
 rb_backup() {
+    local rc=0
+    rb_lock backup "${RB_BACKUP_LOCK_WAIT:-10}" || return 1
+    rb_backup_steps || rc=$?
+    rb_unlock
+    return "$rc"
+}
+rb_backup_steps() {
     psp_backup || return 1
     rm -f "$BAK"/evidence-* "$BAK/wrapper.log" "$BAK/trigger.log"
     # What a cut-short run had bound is gone again: resolve the hotkeys from the restored file.
@@ -197,6 +204,17 @@ rb_stop_game() {
 # card and NextUI may not be up yet, so with RB_EXPECT_BACKUP=1 (the caller knows a backup was made)
 # it waits (RB_SD_WAIT, 120 s) for the backup and fails loudly instead of returning silently.
 rb_restore() {
+    local rc=0
+    # never next to a backup that still runs (its ssh connection dropped; see rb_stop_backup)
+    rb_lock restore "${RB_LOCK_WAIT:-300}" || {
+        echo "NOT restored: the backup stays in $BAK and is restored by the next run" >&2
+        return 1
+    }
+    rb_restore_steps || rc=$?
+    rb_unlock
+    return "$rc"
+}
+rb_restore_steps() {
     local had_hotkeys=0
     if [ ! -f "$BAK/active" ]; then
         [ -n "${RB_EXPECT_BACKUP:-}" ] || return 0
@@ -495,16 +513,23 @@ rb_keepawake_dev() {
 # the device, until the script ends. For the calls that can take long WITHOUT polling anything (the backup
 # copies every save state, the restore, stopping a game): NextUI suspends the device after its idle time
 # (minuisettings.txt: screentimeout, then suspendTimeout) and a suspended device drops the ssh connection.
-# The loop ends with the script, or by itself within a second when the shell that started it is gone (an
-# ssh call that was cut). Returns the script's status.
+# The loop ends with the script (cooperatively: never in the middle of a tap), or by itself within a second
+# when the shell that started it is gone (an ssh call that was cut, rb_stop_backup). Returns the script's status.
 rb_awake() {
     local parent=$$ tp="" rc=0 every="${KEEPAWAKE_INTERVAL:-3}"
     rb_keepawake_dev
     case "$every" in "" | *[!0-9]* | 0) ;; *)
         if [ "${RB_TICK:-1}" = 1 ]; then
+            # Stopped COOPERATIVELY: SIGTERM only sets a flag (bash runs the trap after the command in
+            # progress), so a tap always ends with its release; a power key held down would be NextUI's
+            # long press (power off). The 1 s pause is interruptible (a background sleep and wait).
             (
-                while kill -0 "$parent" 2>/dev/null; do
-                    sleep 1
+                stop=0
+                trap 'stop=1' TERM
+                while [ "$stop" = 0 ] && kill -0 "$parent" 2>/dev/null; do
+                    sleep 1 &
+                    wait $! 2>/dev/null
+                    [ "$stop" = 0 ] || break
                     rb_keepawake_dev
                 done
             ) >/dev/null 2>&1 </dev/null &
@@ -514,17 +539,88 @@ rb_awake() {
     esac
     eval "$1" || rc=$?
     if [ -n "$tp" ]; then
-        kill "$tp" 2>/dev/null
+        kill -TERM "$tp" 2>/dev/null
         wait "$tp" 2>/dev/null
     fi
     return "$rc"
 }
 
-# rb_no_backup_running [tag]: true when no rb_backup started by the host ("rb_awake rb_backup #<tag>", see
-# rb_backup_call) runs any more. The process of a backup whose ssh connection dropped (the device suspended)
-# can go on after the device woke up; a second backup must not run next to it. ("[r]" so that the pattern
-# does not match this check's own command line.)
-rb_no_backup_running() { ! pgrep -f "[r]b_awake rb_backup #${1:-}" >/dev/null 2>&1; }
+# --- one backup or restore at a time ------------------------------------------------------------
+# rb_backup and rb_restore hold a lock: the directory $RB_TMP/psp-test.lock with the pid of the shell that
+# holds it (and what it does) in "pid". The process of a backup whose ssh connection dropped (the device
+# suspended) goes on once the device is awake again; a restore (teardown_file) or a second backup next to it
+# could interleave their copies (e.g. leave controls.ini with the test hotkeys and no active backup). A lock
+# whose holder is gone (a killed shell, a reboot clears /tmp anyway) is stale and taken over.
+rb_lock_dir() { echo "${RB_TMP:-/tmp}/psp-test.lock"; }
+# rb_lock_holder: the pid (and what) of a LIVE holder of the lock, else nothing.
+rb_lock_holder() {
+    local d p="" w=""
+    d="$(rb_lock_dir)"
+    [ -r "$d/pid" ] && read -r p w <"$d/pid" 2>/dev/null
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "$p $w"
+    return 0
+}
+# rb_lock <what> <wait s>: takes the lock, waiting up to <wait s> for a live holder to finish.
+rb_lock() {
+    local what="$1" limit="${2:-0}" d p="" w="" me="${BASHPID:-$$}" t0=$SECONDS
+    d="$(rb_lock_dir)"
+    while :; do
+        if mkdir "$d" 2>/dev/null; then
+            echo "$me $what" >"$d/pid"
+            return 0
+        fi
+        p="" w=""
+        [ -r "$d/pid" ] && read -r p w <"$d/pid" 2>/dev/null
+        if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then # stale: the holder is gone
+            rm -rf "$d"
+            continue
+        fi
+        if [ -z "$p" ] && [ $((SECONDS - t0)) -ge 3 ]; then # the holder died between mkdir and writing its pid
+            rm -rf "$d"
+            continue
+        fi
+        if [ $((SECONDS - t0)) -ge "$limit" ]; then
+            echo "a ${w:-backup or restore} of the test files is still running on the device (pid ${p:-?}): the $what does not run next to it" >&2
+            return 1
+        fi
+        sleep 1
+    done
+}
+rb_unlock() {
+    local d p=""
+    d="$(rb_lock_dir)"
+    [ -r "$d/pid" ] && read -r p _ <"$d/pid" 2>/dev/null
+    [ "$p" = "${BASHPID:-$$}" ] && rm -rf "$d"
+    return 0
+}
+# rb_stop_backup [wait s]: stops a backup that still runs (the lock's holder; its ssh connection dropped):
+# SIGTERM to its shell only (a cp it runs finishes on its own; its keep-awake loop ends cooperatively, never
+# in the middle of a key press), then waits up to <wait s> (30) until the shell and its children are gone.
+# Safe because the next rb_backup restores a cut-short backup first. 0 when nothing runs (any more).
+rb_stop_backup() {
+    local limit="${1:-30}" h p w kids k t0=$SECONDS alive
+    h="$(rb_lock_holder)"
+    [ -n "$h" ] || return 0
+    p="${h%% *}" w="${h#* }"
+    case "$w" in backup) ;; *)
+        echo "a $w (not a backup) holds the lock (pid $p): not stopped" >&2
+        return 1
+        ;;
+    esac
+    kids="$(pgrep -P "$p" 2>/dev/null | tr '\n' ' ')"
+    echo "stopping the backup that still runs (pid $p)"
+    kill -TERM "$p" 2>/dev/null
+    while :; do
+        alive=""
+        for k in $p $kids; do kill -0 "$k" 2>/dev/null && alive="$alive $k"; done
+        [ -n "$alive" ] || return 0
+        if [ $((SECONDS - t0)) -ge "$limit" ]; then
+            echo "the backup (pid $p) did not end within ${limit}s (still running:$alive)" >&2
+            return 1
+        fi
+        sleep 1
+    done
+}
 
 # rb_idle_settings: NextUI's idle times from minuisettings.txt, as "screentimeout=60 suspendTimeout=30"
 # (only those two keys; the file also holds credentials). Empty when there is no such file or key.

@@ -178,7 +178,11 @@ setup_file() {
 
     local rc=0
     dev_run 30 true || rc=$?
-    [ "$rc" = 0 ] || fail "the device is unreachable: $(rb_unreachable_note "$rc")"
+    if [ "$rc" != 0 ]; then
+        local note
+        note="$(rb_unreachable_note "$rc")"
+        fail "the device is unreachable (ssh status $rc)${note:+: $note}"
+    fi
     dev_install_kit || fail "could not install the test kit on the device"
     # Wake / keep-awake tap FIRST: the device may have been idle at the NextUI menu since the end of the
     # on-device run (no input there), and NextUI suspends it after its idle time (screentimeout +

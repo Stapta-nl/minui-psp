@@ -742,16 +742,32 @@ new_state_files_sig() {
         echo "${f##*/}"
     done
 }
+# new_states_complete: every new thumbnail (since the marker, no undo copies) has its .ppst, also newer than
+# the marker, and no state is being written (PPSSPP writes <name>.ppst.tmp and renames it): the thumbnail
+# alone can be there before the state.
+new_states_complete() {
+    local j p
+    while IFS= read -r j; do
+        [ -n "$j" ] || continue
+        p="${j%.jpg}.ppst"
+        [ -f "$p" ] && [ "$p" -nt "$BAK/marker" ] || return 1
+    done < <(new_state_thumbs)
+    for p in "$STATE_DIR"/*.ppst.tmp; do
+        [ -e "$p" ] && return 1
+    done
+    return 0
+}
 # wait_state_saved <count before the save hotkey> [limit s]: the positive signal that a save state hotkey
-# worked: a NEW state thumbnail (one more than <count> since the marker; a save into another slot) and the
-# state files written since the marker unchanged over E2E_SAVE_STABLE (0.5 s). Fails after <limit> s
-# (SAVE_WAIT, 10): the caller goes on, and "two save states were written" says what is missing.
+# worked: a NEW state thumbnail (one more than <count> since the marker; a save into another slot), the
+# .ppst of every new thumbnail written (no .ppst.tmp left), and the state files written since the marker
+# unchanged over E2E_SAVE_STABLE (0.5 s). Fails after <limit> s (SAVE_WAIT, 10): the caller goes on, and
+# "two save states were written" says what is missing.
 wait_state_saved() {
     local before="$1" limit="${2:-${SAVE_WAIT:-10}}" t0 a b
     e2e_clock
     t0=$E2E_NOW
     while :; do
-        if [ "$(new_state_count)" -gt "$before" ]; then
+        if [ "$(new_state_count)" -gt "$before" ] && new_states_complete; then
             a="$(new_state_files_sig)"
             sleep "${E2E_SAVE_STABLE:-0.5}" 2>/dev/null || sleep 1
             b="$(new_state_files_sig)"

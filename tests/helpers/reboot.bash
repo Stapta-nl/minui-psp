@@ -292,14 +292,14 @@ rb_unreachable_note() {
 # connection DROPS (255: the device suspended, or the network), the output says whether the device still
 # answers ping (rb_unreachable_note), and the backup is retried ONCE: after the device answers again (within
 # RB_BACKUP_RETRY_WAIT s, 30, while keep-awake taps are sent), the kit is installed again and a first backup
-# that still runs on the device is waited for (its process can outlive the connection). The retry is safe:
-# rb_backup (psp_backup) first restores the backup of a run that was cut short (the "active" flag is set
-# before anything is copied, every stashed file and state copy is complete and verified, or not there),
-# then makes a fresh one with a new run id. Any other failure is not retried. Returns the backup's status.
+# that still runs on the device (its process outlives the connection) is STOPPED (rb_stop_backup). The retry
+# is safe: rb_backup (psp_backup) first restores the backup of a run that was cut short (the "active" flag is
+# set before anything is copied, every stashed file and state copy is complete and verified, or not there),
+# then makes a fresh one with a new run id; and a backup and a restore never run at the same time (the lock
+# of rb_backup / rb_restore). Any other failure is not retried. Returns the backup's status.
 rb_backup_call() {
-    local limit="$1" out="$2" rc=0 note tag="psp$$x$RANDOM"
-    # the tag (a shell comment, so only in the command line) lets the device find THIS backup's process
-    dev_kit "$limit" "rb_awake rb_backup #$tag" >"$out" 2>&1 || rc=$?
+    local limit="$1" out="$2" rc=0 note
+    dev_kit "$limit" "rb_awake rb_backup" >"$out" 2>&1 || rc=$?
     [ "$rc" = 255 ] || return "$rc"
     note="$(rb_unreachable_note 255)"
     echo "the ssh connection dropped during the backup: $note" >>"$out"
@@ -308,13 +308,22 @@ rb_backup_call() {
         return 255
     fi
     dev_install_kit 30 >>"$out" 2>&1 || { echo "could not install the kit again: the backup was not retried" >>"$out"; return 255; }
-    if ! dev_kit 150 "wait_for 120 rb_no_backup_running $tag" >>"$out" 2>&1; then
-        echo "the first backup still runs on the device (or the device stopped answering): the backup was not retried" >>"$out"
+    rc=0
+    dev_kit 90 "rb_stop_backup 60" >>"$out" 2>&1 || rc=$?
+    case "$rc" in
+    0) ;;
+    255 | 124 | 97 | 98)
+        echo "the device stopped answering while the first backup was being stopped (status $rc): the backup was not retried; $(rb_unreachable_note "$rc")" >>"$out"
+        return 255
+        ;;
+    *)
+        echo "the first backup still runs on the device and could not be stopped (status $rc): the backup was not retried" >>"$out"
         return 1
-    fi
+        ;;
+    esac
     echo "the device answers again: retrying the backup once (what the first attempt had copied is restored first)" >>"$out"
     rc=0
-    dev_kit "$limit" "rb_awake rb_backup #$tag" >>"$out" 2>&1 || rc=$?
+    dev_kit "$limit" "rb_awake rb_backup" >>"$out" 2>&1 || rc=$?
     [ "$rc" != 255 ] || echo "the ssh connection dropped again: $(rb_unreachable_note 255)" >>"$out"
     return "$rc"
 }

@@ -1902,21 +1902,64 @@ count_tests() { # count_tests <filter...>: how many tests bats selects (in a cle
 two"
 }
 
-@test "rb_no_backup_running: sees THIS run's backup still running on the device (its ssh connection gone), not itself" {
-    local tag="t$$x$RANDOM" pid
-    run rb_no_backup_running "$tag"
+@test "rb_awake: a stop during a tap still sends the release (cooperative stop: never a key left held down)" {
+    rb_tick() { echo down >>"$T/keys"; sleep 1; echo up >>"$T/keys"; }
+    # tap 1 (at once, in the caller) 0-1 s; the loop's tap 2 starts at about 2 s; the script ends at about 2.4 s, mid-tap
+    KEEPAWAKE_INTERVAL=1 run rb_awake 'sleep 1.4'
     assert_success
-    bash -c "sleep 3; : rb_awake rb_backup #$tag" &
-    pid=$!
-    sleep 0.3
-    run rb_no_backup_running "$tag"
+    [ "$(grep -c down "$T/keys")" -ge 2 ]
+    [ "$(grep -c down "$T/keys")" = "$(grep -c up "$T/keys")" ]
+    [ "$(tail -n 1 "$T/keys")" = up ]
+}
+
+@test "lock: a backup or restore never runs next to a live one; a stale lock (holder gone) is taken over" {
+    rb_lock backup 0 # (not with run: the holder is this shell)
+    run rb_lock_holder
+    assert_output --partial " backup"
+    rb_unlock
+    assert_file_not_exist "$(rb_lock_dir)"
+    # a live holder (another process): a second one waits, then refuses
+    rm -rf "$(rb_lock_dir)"
+    bash -c 'sleep 3' &
+    local pid=$!
+    mkdir "$(rb_lock_dir)" && echo "$pid backup" >"$(rb_lock_dir)/pid"
+    run rb_lock restore 1
     assert_failure
-    run rb_no_backup_running "other$tag" # another run's backup is not this one
-    assert_success
+    assert_output --partial "still running on the device (pid $pid)"
+    # rb_restore refuses too (bounded) and says the backup stays
+    seed_files
+    mkdir -p "$BAK" && echo id >"$BAK/active"
+    RB_LOCK_WAIT=1 run rb_restore
+    assert_failure
+    assert_output --partial "NOT restored"
+    assert_file_exist "$BAK/active"
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null || true
-    run rb_no_backup_running "$tag"
+    # the holder is gone: stale, taken over
+    run rb_lock backup 0
     assert_success
+}
+
+@test "rb_stop_backup: stops the shell of a backup that still runs (its children finish), and nothing else" {
+    run rb_stop_backup 2
+    assert_success # nothing runs
+    bash -c 'sleep 30 & wait' &
+    local pid=$!
+    sleep 0.2
+    mkdir "$(rb_lock_dir)" && echo "$pid backup" >"$(rb_lock_dir)/pid"
+    run rb_stop_backup 1
+    # the shell is gone; its sleep child is not killed (it would finish by itself), so the wait times out here
+    if kill -0 "$pid" 2>/dev/null; then fail "the backup's shell still runs"; fi
+    pkill -P "$pid" 2>/dev/null || true
+    # a restore that holds the lock is never stopped
+    bash -c 'sleep 3' &
+    pid=$!
+    rm -rf "$(rb_lock_dir)"
+    mkdir "$(rb_lock_dir)" && echo "$pid restore" >"$(rb_lock_dir)/pid"
+    run rb_stop_backup 1
+    assert_failure
+    assert_output --partial "not a backup"
+    kill "$pid" 2>/dev/null || true
 }
 
 @test "rb_idle_settings: only screentimeout and suspendTimeout from minuisettings.txt (never the credentials)" {
@@ -1957,6 +2000,10 @@ two"
     seed_files
     dev_install_kit
     export RB_PING_PROBE="return 1" RB_BACKUP_RETRY_WAIT=10
+    # the first backup's process outlives its dropped connection (here: a process holding the lock)
+    bash -c 'sleep 30' &
+    local first=$!
+    mkdir -p "$RB_TMP" && mkdir "$(rb_lock_dir)" && echo "$first backup" >"$(rb_lock_dir)/pid"
     # ssh call 2 (the backup) and 3 (the first 'answers again?' probe) fail
     echo 1 >"$FAKE_SSH_STATE"
     export FAKE_SSH_DOWN_FROM=2 FAKE_SSH_DOWN_TO=3
@@ -1968,6 +2015,10 @@ two"
     assert_output --partial "retrying the backup once"
     assert_file_exist "$BAK/active"
     [ "$(grep -c 'rb_awake rb_backup' "$FAKE_SSH_LOG")" = 2 ]
+    grep -q 'rb_stop_backup' "$FAKE_SSH_LOG" # a first backup that still runs is stopped before the retry
+    if kill -0 "$first" 2>/dev/null; then fail "the first backup still runs"; fi
+    grep -q "stopping the backup that still runs (pid $first)" "$T/backup.out"
+    assert_file_not_exist "$(rb_lock_dir)"
     # and the backup is good: a restore puts everything back
     mess_up
     rb_restore
@@ -2042,7 +2093,7 @@ two"
     grep -q '"rb_awake rb_settle"' "$f"
     grep -q 'rb_awake rb_restore' "$f"
     grep -q "rb_awake 'rb_settle; rb_ini_set" "$f"
-    grep -q 'dev_kit "$limit" "rb_awake rb_backup #$tag"' "$HELPERS/reboot.bash"
+    grep -q 'dev_kit "$limit" "rb_awake rb_backup"' "$HELPERS/reboot.bash"
 }
 
 @test "run-device.sh: a keep-awake tap right after the on-device tests, before the reboot tests (not when they are skipped)" {
@@ -2116,9 +2167,17 @@ two"
     assert_success
     run cat "$STATE_DIR/G_1.00_0.ppst"
     assert_output "complete"
+    # a thumbnail without its state (PPSSPP still writes <name>.ppst.tmp): not saved yet
+    printf 'j' >"$STATE_DIR/G_1.00_1.jpg"
+    printf 'tmp' >"$STATE_DIR/G_1.00_1.ppst.tmp"
+    run wait_state_saved 2 1
+    assert_failure
+    ( sleep 0.4; mv "$STATE_DIR/G_1.00_1.ppst.tmp" "$STATE_DIR/G_1.00_1.ppst" ) &
+    run wait_state_saved 2 10
+    assert_success
     # no new state (the slot hotkey did not work: the same slot again): fails after the limit, says so
     local t0=$SECONDS
-    run wait_state_saved 2 1
+    run wait_state_saved 3 1
     assert_failure
     assert_output --partial "no new save state was written"
     [ $((SECONDS - t0)) -le 4 ]
