@@ -39,8 +39,9 @@
 # reboot (the same address), and nothing else touching the device while it runs. The Screenshot
 # Monitor pak is optional (evidence screenshots).
 #
-# The device is kept awake while the tests wait: every KEEPAWAKE_INTERVAL seconds a harmless
-# button tap is injected (KEEPAWAKE_KEY, default l1); a device whose backlight node bl_power says
+# The device is kept awake from the start (a tap right after the kit is installed in setup_file) and
+# while the tests wait or run a long call (backup, restore, stopping a game: rb_awake on the device):
+# every KEEPAWAKE_INTERVAL seconds a harmless button tap is injected (KEEPAWAKE_KEY, default l1); a device whose backlight node bl_power says
 # powered down (never on a guess) is woken with a short power key tap instead. A device in DEEP sleep does not answer ssh, so it cannot be woken
 # from here: prevention is what the tests rely on.
 #
@@ -116,7 +117,7 @@ pak_log() { dev_kit 60 'grep -v "^+" "$LOGS/PSP.txt"'; }
 # start_game <SaveStateOnExit value>: a fresh game start, as NextUI does it, with PPSSPP's
 # settings set for the case (auto-load newest state always on).
 start_game() {
-    rb_timed "start_game: stop, ini, mark, launch" dev_kit 240 "rb_settle; rb_ini_set SaveStateOnExit $1; rb_ini_set AutoLoadSaveState 2; rb_mark; rb_launch_game"
+    rb_timed "start_game: stop, ini, mark, launch" dev_kit 240 "rb_awake 'rb_settle; rb_ini_set SaveStateOnExit $1; rb_ini_set AutoLoadSaveState 2; rb_mark; rb_launch_game'"
     await 90 "PPSSPP to start the test game" probe rb_rom_running
     settle_boot
 }
@@ -175,8 +176,19 @@ setup_file() {
     mkdir -p "$STEPS"
     export SD PLATFORM PAK_NAME BOOT_WAIT UI_WAIT NOGAME_WAIT OUT STEPS
 
-    dev_run 30 true || fail "the device is unreachable"
+    local rc=0
+    dev_run 30 true || rc=$?
+    [ "$rc" = 0 ] || fail "the device is unreachable: $(rb_unreachable_note "$rc")"
     dev_install_kit || fail "could not install the test kit on the device"
+    # Wake / keep-awake tap FIRST: the device may have been idle at the NextUI menu since the end of the
+    # on-device run (no input there), and NextUI suspends it after its idle time (screentimeout +
+    # suspendTimeout), which drops ssh. Every long call below runs under rb_awake (taps on the device).
+    dev_kit 15 rb_tick >/dev/null 2>&1 || true
+    # shellcheck disable=SC2034 # read by rb_keepawake_maybe (the waits of setup_file)
+    RB_LAST_TICK=$(($(rb_now_ms) / 1000))
+    RB_IDLE_INFO="$(dev_kit 30 rb_idle_settings 2>/dev/null)" || RB_IDLE_INFO=""
+    export RB_IDLE_INFO
+    [ -z "$RB_IDLE_INFO" ] || info "NextUI idle settings: $RB_IDLE_INFO (the tests tap a button every ${KEEPAWAKE_INTERVAL:-3} s while they wait)"
 
     local found
     found="$(dev_kit 60 rb_discover)" || fail "could not look at the device"
@@ -187,7 +199,7 @@ setup_file() {
     info "$(dev_kit 60 rb_config_info 2>&1)"
 
     local problems
-    if ! problems="$(dev_kit 60 rb_preflight)"; then
+    if ! problems="$(dev_kit 60 "rb_awake rb_preflight")"; then
         fail "preflight failed: $problems"
     fi
 
@@ -197,15 +209,18 @@ setup_file() {
     export RB_STARTED
     # The backup copies every save state (about 9 MB each): the time limit follows the size.
     local kb
-    kb="$(dev_kit 60 rb_state_kb 2>/dev/null)"
+    kb="$(dev_kit 60 "rb_awake rb_state_kb" 2>/dev/null)"
     case "$kb" in "" | *[!0-9]*) kb=0 ;; esac
-    dev_kit "${RB_BACKUP_TIMEOUT:-$((300 + kb / 1000))}" rb_backup >"$OUT/hotkeys.txt" 2>&1 || fail "could not back up the device's files (and bind the hotkeys): $(cat "$OUT/hotkeys.txt")"
+    # (kept awake on the device while it copies; a dropped connection is explained and retried once: rb_backup_call)
+    rb_backup_call "${RB_BACKUP_TIMEOUT:-$((300 + kb / 1000))}" "$OUT/hotkeys.txt" || fail "could not back up the device's files (and bind the hotkeys): $(cat "$OUT/hotkeys.txt")"
     [ -s "$OUT/hotkeys.txt" ] && info "$(cat "$OUT/hotkeys.txt")"
     # The id of the backup THIS run made: only that one is restored normally at the end.
     PSP_RUN_ID="$(dev_kit 60 'cat "$BAK/active"' 2>/dev/null)"
     [ -n "$PSP_RUN_ID" ] || fail "could not read the id of this run's backup"
     export PSP_RUN_ID
-    dev_kit 300 rb_settle || fail "could not bring the device to a clean start"
+    rc=0
+    dev_kit 300 "rb_awake rb_settle" || rc=$?
+    [ "$rc" = 0 ] || fail "could not bring the device to a clean start (status $rc)$(n="$(rb_unreachable_note "$rc")"; [ -z "$n" ] || printf ': %s' "$n")"
 }
 
 teardown_file() {
@@ -213,14 +228,14 @@ teardown_file() {
     rb_ssh_setup || return 0
     # A case that was cut short in the middle of a reboot: wait for the device first.
     RB_TICK=0 await "${REBOOT_UP_TIMEOUT:-120}" "the device to be reachable for the restore" dev_run "${RB_PROBE_TIMEOUT:-10}" true || {
-        echo "# the device is not reachable: its backup stays on the SD card and is restored by the next run" >&3
+        echo "# the device is not reachable ($(rb_unreachable_note 255)): its backup stays on the SD card and is restored by the next run" >&3
         return 0
     }
     dev_install_kit
     # A backup is expected (and waited for) only when this run made one.
     local expect=""
     [ -n "${PSP_RUN_ID:-}" ] && expect="RB_EXPECT_BACKUP=1; export RB_EXPECT_BACKUP;"
-    if restored="$(dev_kit 400 "$expect rb_restore")"; then
+    if restored="$(dev_kit 400 "$expect rb_awake rb_restore")"; then
         [ -n "$restored" ] && echo "# $restored" >&3
         echo "# restored; results in $OUT" >&3
     else

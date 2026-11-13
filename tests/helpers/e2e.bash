@@ -163,9 +163,14 @@ backup_states() {
     fi
     rm -rf "$BAK/states"
     mkdir -p "$BAK/states" || return 1
+    # Each copy is made under a hidden .part name and renamed once it compares equal: a backup that
+    # is cut short (the ssh call dropped, the device suspended) never leaves a truncated copy that a
+    # later restore (psp_backup restores a leftover backup first) would put over the real state.
     for f in "$STATE_DIR"/*; do
         [ -f "$f" ] || continue
-        if ! { cp -p "$f" "$BAK/states/" && cmp -s "$f" "$BAK/states/${f##*/}"; }; then
+        if ! { cp -p "$f" "$BAK/states/.${f##*/}.part" && cmp -s "$f" "$BAK/states/.${f##*/}.part" &&
+            mv -f "$BAK/states/.${f##*/}.part" "$BAK/states/${f##*/}"; }; then
+            rm -f "$BAK/states/.${f##*/}.part"
             echo "could not back up $f (SD card full?)" >&2
             return 1
         fi
@@ -317,15 +322,23 @@ psp_finish() {
 }
 
 # --- helpers ---------------------------------------------------------------------------
-wait_for() { # wait_for <seconds> <command...>
-    local n="$1"
+# wait_for <seconds> <command...>: polls the command until it succeeds (0) or <seconds> of WALL-CLOCK
+# time have passed (1). The poll step is E2E_WAIT_STEP (0.2 s): the signals waited for this way (a
+# process that appears or is gone, a file) are cheap to read, and a 1 s step added up to a second per
+# wait. E2E_POLL_HOOK (the keep-awake of the reboot kit) runs on every poll, at most as often as it
+# allows itself.
+wait_for() {
+    local limit="$1" t0
     shift
-    while [ "$n" -gt 0 ]; do
+    e2e_clock
+    t0=$E2E_NOW
+    while :; do
         "$@" >/dev/null 2>&1 && return 0
-        sleep 1
-        n=$((n - 1))
+        e2e_clock
+        [ $((E2E_NOW - t0)) -lt $((limit * 1000)) ] || return 1
+        "${E2E_POLL_HOOK:-:}" >/dev/null 2>&1 || true
+        sleep "${E2E_WAIT_STEP:-0.2}" 2>/dev/null || sleep 1 # poll step (a sleep without fractions: 1 s)
     done
-    return 1
 }
 running() { pgrep "$1" >/dev/null 2>&1; }
 not_running() { ! pgrep "$1" >/dev/null 2>&1; }
@@ -620,11 +633,13 @@ colour() { "$PNGCOLOR" "$1" 2>/dev/null; } # prints "R G B"
 # shot <label>: takes a screenshot with the Screenshot Monitor pak. The image is kept as
 # $OUT/<label>.png and the name the pak gave it in $OUT/<label>.shotname.
 shot() {
-    local before newest
+    local before newest t0
     # The pak names files by the second, and the screen needs a moment to show what the last key
     # did: no signal exists for "drawn" (a frame-stable check would need two screenshots), so the
     # fixed second stays.
     sleep 1
+    e2e_clock
+    t0=$E2E_NOW
     before="$(ls "$SHOTDIR" 2>/dev/null)"
     SDCARD_PATH="$SD" PATH="$MON/bin/$PLATFORM:$MON/bin:$PATH" sh "$MON/bin/screenshot" >"$OUT/$1.shot.log" 2>&1
     # shellcheck disable=SC2012 # names come from the screenshot pak (date based), ls -t is fine
@@ -637,6 +652,7 @@ shot() {
     else
         info "$1: no screenshot was written (see $OUT/$1.shot.log)"
     fi
+    e2e_phase_since "shot $1 (after the fixed 1 s)" "$t0"
 }
 
 have_shot() {
@@ -669,22 +685,86 @@ e2e_phase() {
     { [ -w /dev/fd/3 ] && echo "# wait: $1 ${2}s" >&3; } 2>/dev/null || true
     [ -z "${OUT:-}" ] || echo "$(date '+%H:%M:%S') wait: $1 ${2}s" >>"$OUT/timings.txt" 2>/dev/null || true
 }
+# e2e_secs <ms>: "3.2"
+e2e_secs() { printf '%s.%s' $(($1 / 1000)) $((($1 % 1000) / 100)); }
+# e2e_phase_since <label> <start ms> [note]: e2e_phase for a step that began at <start ms> (e2e_clock).
+e2e_phase_since() {
+    e2e_clock
+    e2e_phase "$1${3:+ ($3)}" "$(e2e_secs $((E2E_NOW - $2)))"
+}
+# e2e_timed <label> <command...>: runs the command and records how long it took (and its status if not 0).
+e2e_timed() {
+    local label="$1" t0 rc=0
+    shift
+    e2e_clock
+    t0=$E2E_NOW
+    "$@" || rc=$?
+    if [ "$rc" = 0 ]; then e2e_phase_since "$label" "$t0"; else e2e_phase_since "$label" "$t0" "rc $rc"; fi
+    return "$rc"
+}
+
+# nextui_replaced <old pid>: a nextui.elf runs and it is not <old pid>.
+nextui_replaced() {
+    local p
+    p="$(first_pid nextui.elf)"
+    [ -n "$p" ] && [ "$p" != "$1" ]
+}
 
 # restart_ui: kills NextUI and waits until the NEW process is up and settled (the same pid for
 # UI_SETTLE seconds, default 2: the maintainer sees the Game Switcher load in about 1 s; the screenshot
 # after it has its own 1 s delay). No "NextUI has drawn" signal is verified on a device, so this is
 # the observed time plus margin. The old process being gone is detected by its pid.
 restart_ui() {
-    local old t0=$SECONDS
+    local old t0
+    e2e_clock
+    t0=$E2E_NOW
     old="$(first_pid nextui.elf)"
     kill_ui
-    wait_for 40 sh -c "p=\$(pgrep nextui.elf | head -n 1); [ -n \"\$p\" ] && [ \"\$p\" != '$old' ]" || {
+    wait_for 40 nextui_replaced "$old" || {
         echo "NextUI did not come back within 40 s of being restarted" >&2
         return 1
     }
-    e2e_phase "NextUI restarted (new pid)" $((SECONDS - t0))
+    e2e_phase_since "NextUI restarted (new pid)" "$t0"
     ui_settle
-    e2e_phase "restart_ui total" $((SECONDS - t0))
+    e2e_phase_since "restart_ui total" "$t0"
+}
+
+# --- the save state hotkey's result: the files PPSSPP writes ----------------------------------
+# new_state_count: how many save state thumbnails were written since the test's marker ($BAK/marker).
+new_state_count() { new_state_thumbs | wc -l | tr -d ' '; }
+# new_state_files_sig: name, size and time of every state file (.ppst and .jpg, no undo copies) written
+# since the marker: it stops changing once PPSSPP has finished writing.
+new_state_files_sig() {
+    local f
+    find "$STATE_DIR" -type f -newer "$BAK/marker" ! -name '*undo*' 2>/dev/null | sort | while IFS= read -r f; do
+        # shellcheck disable=SC2012 # one known file; BusyBox stat may lack -c
+        ls -ln "$f" 2>/dev/null | awk '{ print $5, $6, $7, $8 }'
+        echo "${f##*/}"
+    done
+}
+# wait_state_saved <count before the save hotkey> [limit s]: the positive signal that a save state hotkey
+# worked: a NEW state thumbnail (one more than <count> since the marker; a save into another slot) and the
+# state files written since the marker unchanged over E2E_SAVE_STABLE (0.5 s). Fails after <limit> s
+# (SAVE_WAIT, 10): the caller goes on, and "two save states were written" says what is missing.
+wait_state_saved() {
+    local before="$1" limit="${2:-${SAVE_WAIT:-10}}" t0 a b
+    e2e_clock
+    t0=$E2E_NOW
+    while :; do
+        if [ "$(new_state_count)" -gt "$before" ]; then
+            a="$(new_state_files_sig)"
+            sleep "${E2E_SAVE_STABLE:-0.5}" 2>/dev/null || sleep 1
+            b="$(new_state_files_sig)"
+            [ "$a" = "$b" ] && return 0
+        else
+            sleep "${E2E_WAIT_STEP:-0.2}" 2>/dev/null || sleep 1 # poll step
+        fi
+        e2e_clock
+        if [ $((E2E_NOW - t0)) -ge $((limit * 1000)) ]; then
+            echo "no new save state was written (and finished) within ${limit}s of the save hotkey (new states: $(new_state_count), before: $before)" >&2
+            return 1
+        fi
+    done
 }
 open_switcher() { # restarts NextUI directly into the Game Switcher
     printf unused >"$PERSIST"

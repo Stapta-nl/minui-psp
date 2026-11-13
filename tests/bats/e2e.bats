@@ -24,8 +24,10 @@
 #   SDCARD_PATH (/mnt/SDCARD)  PLATFORM  ROM_DIR  ROM  OUT_DIR (this file uses OUT_DIR/e2e)
 #   PSP_KEYS   space separated steps run inside PPSSPP after boot, to make save states.
 #              Steps: up down left right a b x y l1 r1 select start | chords joined with +
-#              (select+r1) | sleep<sec> | shot
-#              Default: save, next slot, save, using the hotkeys of the DEVICE: the Save State,
+#              (select+r1) | sleep<sec> | shot | saved (waits until a NEW save state has been written
+#              since the last key and its files stopped changing; SAVE_WAIT, 10 s, is the backup)
+#              Default: save, next slot, save (each save followed by "saved"; a fixed 1 s after Next
+#              Slot, for the evidence screenshot), using the hotkeys of the DEVICE: the Save State,
 #              Next Slot and Exit App bindings are read from the pak's controls.ini (see
 #              tests/helpers/devconfig.bash). PPSSPP has no default for them: a hotkey that is
 #              not bound there is reported by the preflight (bind it, or set the variables).
@@ -209,11 +211,11 @@ teardown_file() {
     for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && rm -f "$f"; done
     seed_recent
     mkdir -p "$STATE_DIR"
-    touch_marker "$BAK/marker" # (FAT mtimes have 2 s resolution: returns once the clock is past the mark)
+    e2e_timed "marker (file system clock past it)" touch_marker "$BAK/marker" # (FAT mtimes have 2 s resolution: returns once the clock is past the mark)
     printf "'%s/launch.sh' '%s'\n" "$PAK" "$ROM" >/tmp/next
     kill_ui # the launcher loop then runs /tmp/next
-    wait_for 60 running PPSSPPSDL || fail "PPSSPP did not start within 60 s"
-    game_settle || fail "the game did not settle (see above)"
+    e2e_timed "PPSSPP started (process up)" wait_for 60 running PPSSPPSDL || fail "PPSSPP did not start within 60 s"
+    e2e_timed "game_settle (the same PPSSPP for BOOT_SETTLE s)" game_settle || fail "the game did not settle (see above)"
 
     shot e2-game
     have_shot e2-game
@@ -223,15 +225,19 @@ teardown_file() {
 }
 
 @test "E2 PPSSPP exits and NextUI is back" {
-    local i=0 k exit_ok=1
+    local i=0 k exit_ok=1 states=0
     for k in $PSP_KEYS; do
         i=$((i + 1))
         case "$k" in
         # explicit pacing from PSP_KEYS: waits for something on the screen (a save overlay) or lets
         # PPSSPP finish a write; there is no signal for it, and the user chose the duration
-        sleep*) sleep "${k#sleep}" ;;
+        sleep*) e2e_timed "step $i: $k (fixed)" sleep "${k#sleep}" ;;
+        # the save hotkey's positive signal: a new state written since the last key (and finished);
+        # not there within SAVE_WAIT s: go on, "two save states were written" says what is missing
+        saved) e2e_timed "step $i: a new save state written" wait_state_saved "$states" || true ;;
         shot) shot "e2-step$i" ;;
         *)
+            states="$(new_state_count)"
             press "$k"
             sleep "$KEY_GAP" # spacing between injected key presses: no signal exists for "the emulator took the key"
             ;;
@@ -240,12 +246,13 @@ teardown_file() {
 
     if [ -n "$EXIT_KEYS" ]; then
         press "$EXIT_KEYS"
-        wait_for 20 not_running PPSSPPSDL || exit_ok=0
+        # (PPSSPP saves a state on exit when SaveStateOnExit is on: that write is part of this wait)
+        e2e_timed "PPSSPP exited after the Exit hotkey (process gone)" wait_for 20 not_running PPSSPPSDL || exit_ok=0
     fi
     running PPSSPPSDL && killall PPSSPPSDL_"$PLATFORM" 2>/dev/null
-    wait_for 30 not_running PPSSPPSDL || fail "PPSSPP was still running 30 s after it was killed"
-    wait_for 90 running nextui.elf || fail "NextUI did not come back within 90 s"
-    ui_settle || fail "NextUI did not settle after the game"
+    e2e_timed "PPSSPP gone" wait_for 30 not_running PPSSPPSDL || fail "PPSSPP was still running 30 s after it was killed"
+    e2e_timed "NextUI back (process up)" wait_for 90 running nextui.elf || fail "NextUI did not come back within 90 s"
+    e2e_timed "ui_settle (the same NextUI for UI_SETTLE s)" ui_settle || fail "NextUI did not settle after the game"
     ls -l --full-time "$STATE_DIR" >"$OUT/e2-states.txt" 2>/dev/null || ls -l "$STATE_DIR" >"$OUT/e2-states.txt" 2>&1
     cp "$LOGS/PSP.txt" "$OUT/e2-PSP.log" 2>/dev/null
     [ "$exit_ok" = 1 ] || fail "PPSSPP did not exit on the Exit hotkey ($EXIT_KEYS) and had to be killed. Hotkeys used:

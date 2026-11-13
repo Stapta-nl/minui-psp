@@ -1880,3 +1880,253 @@ count_tests() { # count_tests <filter...>: how many tests bats selects (in a cle
     assert_grep "$TESTS_DIR/run-device.sh" 'filter_platform="device,!reboot,platform:'
     assert_grep "$TESTS_DIR/run-reboot.sh" 'filter_platform="reboot,platform:'
 }
+
+# --- keeping the device awake during long calls, and an ssh drop during the backup -------------
+@test "rb_awake: a tap at once and every KEEPAWAKE_INTERVAL s while the script runs; its status; the loop ends with it; off with 0" {
+    rb_tick() { echo t >>"$T/ticks"; }
+    slow() { sleep 2.6; return 3; }
+    KEEPAWAKE_INTERVAL=1 run rb_awake slow
+    assert_failure 3
+    local n
+    n="$(wc -l <"$T/ticks")"
+    [ "$n" -ge 3 ] # at once, then about every second
+    sleep 1.5
+    [ "$(wc -l <"$T/ticks")" = "$n" ] # the background loop is gone
+    : >"$T/ticks"
+    KEEPAWAKE_INTERVAL=0 run rb_awake 'sleep 1.2'
+    assert_success
+    [ ! -s "$T/ticks" ]
+    # a command line works too (eval), e.g. the start of a game
+    KEEPAWAKE_INTERVAL=1 run rb_awake 'echo one; echo two'
+    assert_output "one
+two"
+}
+
+@test "rb_no_backup_running: sees THIS run's backup still running on the device (its ssh connection gone), not itself" {
+    local tag="t$$x$RANDOM" pid
+    run rb_no_backup_running "$tag"
+    assert_success
+    bash -c "sleep 3; : rb_awake rb_backup #$tag" &
+    pid=$!
+    sleep 0.3
+    run rb_no_backup_running "$tag"
+    assert_failure
+    run rb_no_backup_running "other$tag" # another run's backup is not this one
+    assert_success
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null || true
+    run rb_no_backup_running "$tag"
+    assert_success
+}
+
+@test "rb_idle_settings: only screentimeout and suspendTimeout from minuisettings.txt (never the credentials)" {
+    printf 'font=1\r\nscreentimeout=60\r\nraPassword=secret\r\nsuspendTimeout=30\r\nraToken=tok\r\n' >"$SHARED/minuisettings.txt"
+    run rb_idle_settings
+    assert_output "screentimeout=60 suspendTimeout=30"
+    rm -f "$SHARED/minuisettings.txt"
+    run rb_idle_settings
+    assert_output ""
+}
+
+@test "rb_unreachable_note: ssh dropped and no ping: probably ASLEEP, the idle times, press the power button; ping answers: not asleep" {
+    export RB_IDLE_INFO="screentimeout=60 suspendTimeout=30"
+    RB_PING_PROBE="return 1" run rb_unreachable_note 255
+    assert_output --partial "does not answer ping"
+    assert_output --partial "probably ASLEEP"
+    assert_output --partial "screentimeout=60 s"
+    assert_output --partial "suspendTimeout=30 s later, about 90 s"
+    assert_output --partial "Press the power button"
+    RB_PING_PROBE="return 0" run rb_unreachable_note 255
+    assert_output --partial "answers ping"
+    assert_output --partial "not asleep"
+    RB_PING_PROBE="return 2" RB_IDLE_INFO="" run rb_unreachable_note 124
+    assert_output --partial "ping cannot be used"
+    assert_output --partial "screentimeout, suspendTimeout"
+    run rb_unreachable_note 1
+    assert_output ""
+}
+
+@test "dev_definite: an unreachable device's message says it is probably asleep when ping fails too" {
+    export FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=999 RB_DEFINITE_TRIES=2 RB_PING_PROBE="return 1"
+    run dev_definite 5 true
+    assert_failure 2
+    assert_output --partial "probably ASLEEP"
+}
+
+@test "rb_backup_call: the connection drops during the backup: explained, the device answers again, retried ONCE and done" {
+    seed_files
+    dev_install_kit
+    export RB_PING_PROBE="return 1" RB_BACKUP_RETRY_WAIT=10
+    # ssh call 2 (the backup) and 3 (the first 'answers again?' probe) fail
+    echo 1 >"$FAKE_SSH_STATE"
+    export FAKE_SSH_DOWN_FROM=2 FAKE_SSH_DOWN_TO=3
+    run rb_backup_call 60 "$T/backup.out"
+    assert_success
+    run cat "$T/backup.out"
+    assert_output --partial "dropped during the backup"
+    assert_output --partial "probably ASLEEP"
+    assert_output --partial "retrying the backup once"
+    assert_file_exist "$BAK/active"
+    [ "$(grep -c 'rb_awake rb_backup' "$FAKE_SSH_LOG")" = 2 ]
+    # and the backup is good: a restore puts everything back
+    mess_up
+    rb_restore
+    run cat "$RECENT"
+    assert_output "/Roms/other.iso"
+}
+
+@test "rb_backup_call: a device that stays unreachable is not retried (bounded wait) and the reason is given" {
+    seed_files
+    dev_install_kit
+    export RB_PING_PROBE="return 1" RB_BACKUP_RETRY_WAIT=1 FAKE_SSH_DOWN_FROM=2 FAKE_SSH_DOWN_TO=999
+    echo 1 >"$FAKE_SSH_STATE"
+    local start=$SECONDS
+    run rb_backup_call 60 "$T/backup.out"
+    assert_failure 255
+    [ $((SECONDS - start)) -le 8 ]
+    run cat "$T/backup.out"
+    assert_output --partial "probably ASLEEP"
+    assert_output --partial "Press the power button"
+    assert_output --partial "not retried"
+    [ "$(grep -c 'rb_awake rb_backup' "$FAKE_SSH_LOG")" = 1 ]
+}
+
+@test "rb_backup_call: other failures (the backup itself failed) are not retried" {
+    dev_install_kit
+    printf '[ControlMapping]\nSelect = 10-196\n' >"$CONTROLS" # no Save State, no Exit App
+    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
+    export SET_HOTKEYS=0
+    run rb_backup_call 60 "$T/backup.out"
+    assert_failure 1
+    [ "$(grep -c 'rb_awake rb_backup' "$FAKE_SSH_LOG")" = 1 ]
+    run cat "$T/backup.out"
+    refute_output --partial "retrying"
+}
+
+@test "a backup cut short while it copies the save states leaves no truncated copy; the retry restores nothing wrong" {
+    seed_files
+    printf 'AAAAAAAAAA' >"$STATE_DIR/A_1.00_0.ppst"
+    printf 'BBBBBBBBBB' >"$STATE_DIR/B_1.00_1.ppst"
+    # the first backup dies (as with a dropped connection) in the middle of copying B
+    (
+        cp() {
+            case "$*" in *B_1.00_1.ppst*) printf 'BB' >"${*: -1}"; kill -9 "$BASHPID" ;; esac
+            command cp "$@"
+        }
+        rb_backup
+    ) || true
+    assert_file_exist "$BAK/active"
+    assert_file_not_exist "$BAK/states/B_1.00_1.ppst" # only a hidden .part, never a truncated copy under the real name
+    # the retry restores the cut-short backup first, then makes a fresh one
+    run rb_backup
+    assert_success
+    assert_output --partial "aborted run"
+    run cat "$STATE_DIR/B_1.00_1.ppst"
+    assert_output "BBBBBBBBBB"
+    run cat "$STATE_DIR/A_1.00_0.ppst"
+    assert_output "AAAAAAAAAA"
+    run find "$STATE_DIR" -name '*.replaced.*'
+    assert_output ""
+    run cat "$BAK/states/B_1.00_1.ppst"
+    assert_output "BBBBBBBBBB"
+}
+
+@test "reboot.bats: a wake tap right after the kit install in setup_file; the backup, preflight, settle, restore and game start run under rb_awake" {
+    local f="$TESTS_DIR/bats/reboot.bats" kit tick
+    kit="$(grep -n 'dev_install_kit || fail' "$f" | head -n 1 | cut -d: -f1)"
+    tick="$(grep -n 'dev_kit 15 rb_tick' "$f" | head -n 1 | cut -d: -f1)"
+    [ -n "$tick" ] && [ "$tick" -gt "$kit" ]
+    [ "$(grep -n 'rb_discover' "$f" | head -n 1 | cut -d: -f1)" -gt "$tick" ]
+    grep -q 'rb_backup_call' "$f"
+    grep -q '"rb_awake rb_preflight"' "$f"
+    grep -q '"rb_awake rb_settle"' "$f"
+    grep -q 'rb_awake rb_restore' "$f"
+    grep -q "rb_awake 'rb_settle; rb_ini_set" "$f"
+    grep -q 'dev_kit "$limit" "rb_awake rb_backup #$tag"' "$HELPERS/reboot.bash"
+}
+
+@test "run-device.sh: a keep-awake tap right after the on-device tests, before the reboot tests (not when they are skipped)" {
+    local f="$TESTS_DIR/run-device.sh" tap tests reboot
+    tests="$(grep -n '^run_step /dev/null run_tests' "$f" | cut -d: -f1)"
+    tap="$(grep -n '^        wake_device' "$f" | cut -d: -f1)"
+    reboot="$(grep -n 'run_step /dev/null run_reboot' "$f" | cut -d: -f1)"
+    [ "$tests" -lt "$tap" ] && [ "$tap" -lt "$reboot" ]
+    grep -q "rb_init && rb_tick" "$f"
+}
+
+# --- e2e: waits on signals with a short poll step, and their timing lines --------------------
+@test "wait_for: wall-clock limit, a short poll step (returns within a fraction of a second of the signal), calls E2E_POLL_HOOK" {
+    hook() { echo x >>"$T/hook.log"; }
+    ( sleep 0.5; : >"$T/flag" ) &
+    local t0 t1
+    t0="$(rb_now_ms)"
+    E2E_POLL_HOOK=hook run wait_for 10 test -f "$T/flag"
+    assert_success
+    t1="$(rb_now_ms)"
+    [ $((t1 - t0)) -lt 900 ] # the old 1 s step needed a whole second
+    [ "$(wc -l <"$T/hook.log")" -ge 1 ]
+    t0="$(rb_now_ms)"
+    run wait_for 1 false
+    assert_failure
+    t1="$(rb_now_ms)"
+    [ $((t1 - t0)) -ge 1000 ] && [ $((t1 - t0)) -lt 2500 ]
+}
+
+@test "nextui_replaced / restart_ui: the new NextUI pid is the signal; the timing lines are in ms" {
+    fake_settle_tools
+    echo 100 >"$FS/nextui.pid"
+    run nextui_replaced 100
+    assert_failure
+    run nextui_replaced 99
+    assert_success
+    export OUT="$T/out" UI_SETTLE=0
+    mkdir -p "$OUT"
+    kill_ui() { echo 101 >"$FS/nextui.pid"; }
+    run restart_ui
+    assert_success
+    grep -Eq 'wait: NextUI restarted \(new pid\) [0-9]+\.[0-9]s' "$OUT/timings.txt"
+    grep -Eq 'wait: restart_ui total [0-9]+\.[0-9]s' "$OUT/timings.txt"
+}
+
+@test "e2e_timed: records the label, the seconds and a non-zero status" {
+    export OUT="$T/out"
+    mkdir -p "$OUT"
+    e2e_timed "a nap" sleep 0.3
+    run e2e_timed "a failure" false
+    assert_failure
+    grep -Eq 'wait: a nap 0\.[2-9]s' "$OUT/timings.txt"
+    grep -q 'wait: a failure (rc 1) ' "$OUT/timings.txt"
+}
+
+@test "wait_state_saved: a NEW state since the key (not one that was there), once its files stop changing; bounded" {
+    mkdir -p "$BAK"
+    touch_marker "$BAK/marker"
+    printf 'old' >"$STATE_DIR/G_1.00_4.ppst"
+    printf 'j' >"$STATE_DIR/G_1.00_4.jpg"
+    [ "$(new_state_count)" = 1 ]
+    # a second save into another slot, still being written for a moment
+    (
+        sleep 0.4
+        printf 'j' >"$STATE_DIR/G_1.00_0.jpg"
+        printf 'part' >"$STATE_DIR/G_1.00_0.ppst"
+        sleep 0.3
+        printf 'complete' >"$STATE_DIR/G_1.00_0.ppst"
+    ) &
+    run wait_state_saved 1 10
+    assert_success
+    run cat "$STATE_DIR/G_1.00_0.ppst"
+    assert_output "complete"
+    # no new state (the slot hotkey did not work: the same slot again): fails after the limit, says so
+    local t0=$SECONDS
+    run wait_state_saved 2 1
+    assert_failure
+    assert_output --partial "no new save state was written"
+    [ $((SECONDS - t0)) -le 4 ]
+}
+
+@test "e2e.bats: the default keys wait for the save (saved) instead of a fixed sleep3; the E2 waits are timed" {
+    grep -q 'PSP_KEYS="$SAVE_KEYS saved shot $NEXT_SLOT_KEYS sleep1 shot $SAVE_KEYS saved shot"' "$HELPERS/devconfig.bash"
+    grep -q 'saved) e2e_timed .* wait_state_saved "$states"' "$TESTS_DIR/bats/e2e.bats"
+    grep -q 'e2e_timed "PPSSPP exited after the Exit hotkey (process gone)" wait_for 20 not_running PPSSPPSDL' "$TESTS_DIR/bats/e2e.bats"
+    grep -q 'e2e_timed "PPSSPP started (process up)" wait_for 60 running PPSSPPSDL' "$TESTS_DIR/bats/e2e.bats"
+}

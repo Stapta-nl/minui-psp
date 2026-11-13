@@ -14,9 +14,13 @@
 #   SSH_CONNECT_TIMEOUT (5)   per ssh call; polling during a reboot needs it short
 #   POLL_INTERVAL (1)         seconds between polls of every wait
 #   RB_PROBE_TIMEOUT (10)     limit of one ssh probe inside a wait (a hung ssh must not eat the wait)
-#   KEEPAWAKE_INTERVAL (3)    seconds between keep-awake steps during every wait and settle (0 = off).
-#                             NextUI suspends the device after about 10 s without input, and a suspended
-#                             device does not answer ssh, so the taps must be dense
+#   KEEPAWAKE_INTERVAL (3)    seconds between keep-awake steps during every wait and settle, and during the
+#                             long calls that run under rb_awake on the device (0 = off). NextUI turns the
+#                             screen off and then suspends the device after the idle times of its settings
+#                             (minuisettings.txt: screentimeout, then suspendTimeout; can be as short as about
+#                             10 s), and a suspended device does not answer ssh, so the taps must be dense
+#   RB_BACKUP_RETRY_WAIT (30) after the ssh connection of the backup dropped: how long the device may take
+#                             to answer again before the backup is retried once (setup_file)
 #   RB_TRIGGER_LINGER (3)     seconds a trigger ssh call may stay open before it is cut (rb_trigger)
 #   REBOOT_DOWN_TIMEOUT (30)  BACKUP only: after the power-off request the device must be seen going
 #                             down (ssh port closed) within this; observed: about 4 s
@@ -255,6 +259,66 @@ rb_device_retry() {
     done
 }
 
+# --- an unreachable device: asleep? ----------------------------------------------------------
+# rb_idle_note: NextUI's idle times as the device reported them in setup_file (RB_IDLE_INFO, from
+# minuisettings.txt), for the messages below.
+rb_idle_note() {
+    local st="" su=""
+    st="$(printf '%s' "${RB_IDLE_INFO:-}" | sed -n 's/.*screentimeout=\([0-9]*\).*/\1/p')"
+    su="$(printf '%s' "${RB_IDLE_INFO:-}" | sed -n 's/.*suspendTimeout=\([0-9]*\).*/\1/p')"
+    if [ -n "$st" ] && [ -n "$su" ]; then
+        printf "NextUI's idle suspend: on this device the screen goes off after screentimeout=%s s without input and the device suspends suspendTimeout=%s s later, about %s s in all (minuisettings.txt)" "$st" "$su" $((st + su))
+    else
+        printf "NextUI's idle suspend: the screen goes off and the device suspends after the idle times of its settings (screentimeout, suspendTimeout in minuisettings.txt)"
+    fi
+}
+# rb_unreachable_note <ssh status>: one sentence for a failure message after a call to the device failed:
+# for an ssh failure (255) or a cut call (124), whether the device still answers ping, and what that
+# means. Asleep is the likely cause when ping fails too: say so, and that the power button wakes it.
+rb_unreachable_note() {
+    local rc="${1:-255}" p=0
+    case "$rc" in 255 | 124) ;; *) return 0 ;; esac
+    [ -n "${RB_NET_HOST:-}" ] || rb_net_setup >/dev/null 2>&1 || true
+    rb_ping_probe || p=$?
+    case "$p" in
+    0) printf 'the ssh call failed (status %s) but the device answers ping: the network or sshd had a problem, the device is not asleep' "$rc" ;;
+    1) printf 'the ssh call failed (status %s) and the device does not answer ping either: it is probably ASLEEP (%s). Press the power button to wake it; the tests keep it awake with button taps only while they can reach it' "$rc" "$(rb_idle_note)" ;;
+    *) printf 'the ssh call failed (status %s) and ping cannot be used from here: if the screen of the device is off it is probably asleep (%s); press the power button to wake it' "$rc" "$(rb_idle_note)" ;;
+    esac
+}
+
+# rb_backup_call <limit s> <output file>: the backup of setup_file (rb_backup on the device, under rb_awake so
+# that the device is kept awake while it copies the save states), its output in the file. When the ssh
+# connection DROPS (255: the device suspended, or the network), the output says whether the device still
+# answers ping (rb_unreachable_note), and the backup is retried ONCE: after the device answers again (within
+# RB_BACKUP_RETRY_WAIT s, 30, while keep-awake taps are sent), the kit is installed again and a first backup
+# that still runs on the device is waited for (its process can outlive the connection). The retry is safe:
+# rb_backup (psp_backup) first restores the backup of a run that was cut short (the "active" flag is set
+# before anything is copied, every stashed file and state copy is complete and verified, or not there),
+# then makes a fresh one with a new run id. Any other failure is not retried. Returns the backup's status.
+rb_backup_call() {
+    local limit="$1" out="$2" rc=0 note tag="psp$$x$RANDOM"
+    # the tag (a shell comment, so only in the command line) lets the device find THIS backup's process
+    dev_kit "$limit" "rb_awake rb_backup #$tag" >"$out" 2>&1 || rc=$?
+    [ "$rc" = 255 ] || return "$rc"
+    note="$(rb_unreachable_note 255)"
+    echo "the ssh connection dropped during the backup: $note" >>"$out"
+    if ! await "${RB_BACKUP_RETRY_WAIT:-30}" "the device to answer again after the backup's ssh connection dropped" dev_run "${RB_PROBE_TIMEOUT:-10}" true 2>/dev/null; then
+        echo "the device did not answer again within ${RB_BACKUP_RETRY_WAIT:-30}s: the backup was not retried" >>"$out"
+        return 255
+    fi
+    dev_install_kit 30 >>"$out" 2>&1 || { echo "could not install the kit again: the backup was not retried" >>"$out"; return 255; }
+    if ! dev_kit 150 "wait_for 120 rb_no_backup_running $tag" >>"$out" 2>&1; then
+        echo "the first backup still runs on the device (or the device stopped answering): the backup was not retried" >>"$out"
+        return 1
+    fi
+    echo "the device answers again: retrying the backup once (what the first attempt had copied is restored first)" >>"$out"
+    rc=0
+    dev_kit "$limit" "rb_awake rb_backup #$tag" >>"$out" 2>&1 || rc=$?
+    [ "$rc" != 255 ] || echo "the ssh connection dropped again: $(rb_unreachable_note 255)" >>"$out"
+    return "$rc"
+}
+
 # The settles run ON the device (a local one second loop: no ssh call per poll; the keep-awake taps
 # are sent from there too) with the functions of e2e.bash, which read BOOT_SETTLE / BOOT_WAIT,
 # UI_SETTLE / UI_WAIT and NOGAME_SETTLE / NOGAME_WAIT (forwarded with the other settings). The device
@@ -279,7 +343,7 @@ rb_launch_ref() { rb_device_retry dev_kit 30 'launch_sig "$LOGS/PSP.txt"'; }
 # that did not load (97/98) is "unknown": it is retried (RB_DEFINITE_TRIES, 20, every POLL_INTERVAL)
 # and after that returns 2. For decisions that must not be taken on a guess.
 dev_definite() {
-    local rc i=0
+    local rc i=0 note
     while :; do
         dev_kit "$1" "$2" >/dev/null 2>&1
         rc=$?
@@ -289,7 +353,11 @@ dev_definite() {
         *) return 1 ;;
         esac
         i=$((i + 1))
-        [ "$i" -lt "${RB_DEFINITE_TRIES:-20}" ] || { echo "no definite answer from the device (ssh status $rc) after $i tries: $2" >&2; return 2; }
+        if [ "$i" -ge "${RB_DEFINITE_TRIES:-20}" ]; then
+            note="$(rb_unreachable_note "$rc")"
+            echo "no definite answer from the device (ssh status $rc) after $i tries: $2${note:+; $note}" >&2
+            return 2
+        fi
         sleep "${POLL_INTERVAL:-1}"
     done
 }
@@ -601,7 +669,7 @@ await_reboot() {
     fi
     ms_el=$(($(rb_now_ms) - RB_T0))
     t_up=$(((ms_el + 500) / 1000 - t_down))
-    # keep-awake from here on: the idle suspend of NextUI is about 10 s and a suspended device does not answer
+    # keep-awake from here on: NextUI's idle suspend (as short as about 10 s) and a suspended device does not answer
     RB_TICK=$tick
     RB_LAST_TICK=""
     rb_log "reboot: back via: $RB_UP_VIA"

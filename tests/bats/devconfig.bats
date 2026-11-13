@@ -138,8 +138,8 @@ ctl() { printf '%s\n' "$SHIPPED" >"$CTL"; printf '%s\n' "$@" >>"$CTL"; }
     [[ "$HOTKEY_PROBLEMS" == *"SAVE_KEYS is empty"* ]]
 }
 
-@test "cfg_keys_valid: buttons, chords, sleepN and shot pass; anything else is named" {
-    run cfg_keys_valid "select+r1 sleep3 shot sleep0.5 left"
+@test "cfg_keys_valid: buttons, chords, sleepN, saved and shot pass; anything else is named" {
+    run cfg_keys_valid "select+r1 sleep3 shot sleep0.5 left saved"
     assert_success
     run cfg_keys_valid "select+r1 sleepx"
     assert_failure
@@ -477,7 +477,7 @@ FAKE
     out="$(CONTROLS="$CTL" bash -c ". '$TESTS_DIR/helpers/e2e.bash'; . '$TESTS_DIR/helpers/devconfig.bash'; unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS PSP_KEYS
         e2e_setup_hotkeys; e2e_reinit_hotkeys
         bash -c 'printf \"%s|%s|%s|%s\" \"\$EXIT_KEYS\" \"\$SAVE_KEYS\" \"\$PSP_KEYS\" \"\${HOTKEY_INFO:+info}\"'")"
-    [ "$out" = "select+start|select+r1|select+r1 sleep3 shot select+right sleep1 shot select+r1 sleep3 shot|info" ]
+    [ "$out" = "select+start|select+r1|select+r1 saved shot select+right sleep1 shot select+r1 saved shot|info" ]
 }
 
 @test "e2e: with the Exit hotkey exported, the E2 exit test takes the hotkey path, not the kill path" {

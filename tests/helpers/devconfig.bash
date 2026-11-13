@@ -170,14 +170,14 @@ cfg_controls_bind() {
     return "$rc"
 }
 
-# cfg_keys_valid <steps>: every step is a button/chord that btn_set knows, sleepN or shot.
+# cfg_keys_valid <steps>: every step is a button/chord that btn_set knows, sleepN, saved or shot.
 # Prints the first bad step.
 cfg_keys_valid() {
     local step k
     set -f
     for step in $1; do
         case "$step" in
-        shot) continue ;;
+        shot | saved) continue ;;
         sleep*)
             case "${step#sleep}" in "" | *[!0-9.]*) echo "$step"; set +f; return 1 ;; esac
             continue
@@ -409,7 +409,9 @@ e2e_reinit_hotkeys() {
 e2e_default_keys() {
     local bad
     if [ "$PSP_DEFAULT" = 1 ]; then
-        PSP_KEYS="$SAVE_KEYS sleep3 shot $NEXT_SLOT_KEYS sleep1 shot $SAVE_KEYS sleep3 shot"
+        # "saved" waits for the state file the hotkey wrote (a positive signal; it was a fixed sleep3);
+        # sleep1 after Next Slot stays: the slot change only shows on the screen (for the evidence shot)
+        PSP_KEYS="$SAVE_KEYS saved shot $NEXT_SLOT_KEYS sleep1 shot $SAVE_KEYS saved shot"
     elif [ -n "$PSP_KEYS" ] && ! bad="$(cfg_keys_valid "$PSP_KEYS")"; then
         HOTKEY_PROBLEMS="$HOTKEY_PROBLEMS${HOTKEY_PROBLEMS:+
 }PSP_KEYS has a step the test cannot press: '$bad'"

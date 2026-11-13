@@ -23,7 +23,7 @@
 #
 # Host side only: PAK_MISMATCH=fail (default warn).
 # Forwarded to the device when set: SDCARD_PATH ROM_DIR ROM PSP_KEYS SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS BOOT_WAIT
-# UI_WAIT BOOT_SETTLE UI_SETTLE KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT.
+# UI_WAIT BOOT_SETTLE UI_SETTLE SAVE_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT.
 #
 # Before the tests it compares the installed pak with this checkout (or SRC_PAK) and warns if
 # they differ (tests/pakcheck.sh); PAK_MISMATCH=fail makes that fatal. The result is in the summary.
@@ -220,7 +220,7 @@ sd="${SDCARD_PATH:-/mnt/SDCARD}"
 pak_name="${PAK_NAME:-$(jq -r '.name // empty' pak.json 2>/dev/null)}"
 pak_name="${pak_name:-PSP}"
 assignments="PLATFORM=$(q "$platform") PAK_NAME=$(q "$pak_name") SRC_PAK=$(q "$sd/Emus/$platform/$pak_name.pak") RESULT_DIR=$(q "$remote_tmp/result") DEVICE_COLLECT=1"
-for v in SDCARD_PATH ROM_DIR ROM PSP_KEYS SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS BOOT_WAIT UI_WAIT BOOT_SETTLE UI_SETTLE KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT; do
+for v in SDCARD_PATH ROM_DIR ROM PSP_KEYS SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS BOOT_WAIT UI_WAIT BOOT_SETTLE UI_SETTLE SAVE_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT; do
     if [ -n "${!v+x}" ]; then
         assignments="$assignments $v=$(q "${!v}")"
     fi
@@ -261,6 +261,28 @@ run_tests() {
 }
 run_step /dev/null run_tests
 rc=$?
+
+# The reboot tests follow: a keep-awake tap NOW (best effort, bounded), with the kit of the test bundle that
+# is still on the device. The last on-device tests send no input, so the device has been idle at the NextUI
+# menu for a while, and NextUI suspends it after its idle time (minuisettings.txt: screentimeout, then
+# suspendTimeout), which would drop the reboot tests' first ssh calls. reboot.bats taps again (and keeps the
+# device awake) from its first call on; this covers the time in between (fetching the results, the start).
+# shellcheck disable=SC2317 # called below
+wake_device() {
+    local cmd
+    cmd="cd '$remote_tmp' && PLATFORM=$(q "$platform") PAK_NAME=$(q "$pak_name") SD=$(q "$sd") bash -c '. tests/helpers/e2e.bash && . tests/helpers/devconfig.bash && . tests/helpers/reboot-device.bash && rb_init && rb_tick' >/dev/null 2>&1"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -k 2 20 "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "$cmd" >/dev/null 2>&1 </dev/null
+    else
+        rssh "$cmd" >/dev/null 2>&1 </dev/null
+    fi
+}
+case "${SKIP_REBOOT_TESTS:-}" in "" | 0)
+    if [ "$rc" -le 1 ]; then
+        wake_device || echo "== $platform: (the keep-awake tap before the reboot tests did not go through; they tap again themselves)"
+    fi
+    ;;
+esac
 
 # shellcheck disable=SC2317 # called through run_step
 fetch_results() {

@@ -490,6 +490,48 @@ rb_keepawake_dev() {
     return 0
 }
 
+# rb_awake <script>: runs the script (eval'd: a function name or a short command line) with the device kept
+# awake: one keep-awake step at once and then one every KEEPAWAKE_INTERVAL seconds from a background loop on
+# the device, until the script ends. For the calls that can take long WITHOUT polling anything (the backup
+# copies every save state, the restore, stopping a game): NextUI suspends the device after its idle time
+# (minuisettings.txt: screentimeout, then suspendTimeout) and a suspended device drops the ssh connection.
+# The loop ends with the script, or by itself within a second when the shell that started it is gone (an
+# ssh call that was cut). Returns the script's status.
+rb_awake() {
+    local parent=$$ tp="" rc=0 every="${KEEPAWAKE_INTERVAL:-3}"
+    rb_keepawake_dev
+    case "$every" in "" | *[!0-9]* | 0) ;; *)
+        if [ "${RB_TICK:-1}" = 1 ]; then
+            (
+                while kill -0 "$parent" 2>/dev/null; do
+                    sleep 1
+                    rb_keepawake_dev
+                done
+            ) >/dev/null 2>&1 </dev/null &
+            tp=$!
+        fi
+        ;;
+    esac
+    eval "$1" || rc=$?
+    if [ -n "$tp" ]; then
+        kill "$tp" 2>/dev/null
+        wait "$tp" 2>/dev/null
+    fi
+    return "$rc"
+}
+
+# rb_no_backup_running [tag]: true when no rb_backup started by the host ("rb_awake rb_backup #<tag>", see
+# rb_backup_call) runs any more. The process of a backup whose ssh connection dropped (the device suspended)
+# can go on after the device woke up; a second backup must not run next to it. ("[r]" so that the pattern
+# does not match this check's own command line.)
+rb_no_backup_running() { ! pgrep -f "[r]b_awake rb_backup #${1:-}" >/dev/null 2>&1; }
+
+# rb_idle_settings: NextUI's idle times from minuisettings.txt, as "screentimeout=60 suspendTimeout=30"
+# (only those two keys; the file also holds credentials). Empty when there is no such file or key.
+rb_idle_settings() {
+    grep -E '^(screentimeout|suspendTimeout)=[0-9]+' "$SHARED/minuisettings.txt" 2>/dev/null | tr -d '\r' | tr '\n' ' ' | sed 's/ $//'
+}
+
 # --- evidence about a boot ---------------------------------------------------------------
 # rb_boot_report: what the device looks like now, relative to its boot, for a report (was a game launched
 # after the boot, and when): the uptime, the boot id, the auto-resume marker (only when the SD card is
