@@ -37,6 +37,8 @@ rb_init() {
     SHOTDIR="$SD/Screenshots"
     OUT="${RB_OUT:-${RB_TMP:-/tmp}/psp-reboot-out}"
     RB_TMP="${RB_TMP:-/tmp}"
+    # the kit's files, for a detached job that loads them again (rb_detach)
+    RB_KIT_SOURCES="${RB_KIT_SOURCES:-${RB_KIT_PATH:-}}"
     NEXT="$RB_TMP/next"
     WRAPPER="$RB_TMP/psp-test-poweroff"
     UI_WAIT="${UI_WAIT:-6}"
@@ -205,7 +207,7 @@ rb_stop_game() {
 # it waits (RB_SD_WAIT, 120 s) for the backup and fails loudly instead of returning silently.
 rb_restore() {
     local rc=0
-    # never next to a backup that still runs (its ssh connection dropped; see rb_stop_backup)
+    # never next to a backup that still runs (a detached job the host gave up on: see rb_job_start)
     rb_lock restore "${RB_LOCK_WAIT:-300}" || {
         echo "NOT restored: the backup stays in $BAK and is restored by the next run" >&2
         return 1
@@ -448,51 +450,117 @@ rb_hard_reboot() {
 }
 
 # --- keeping the device awake ------------------------------------------------------------
-# True if the screen looks off (backlight at 0 or powered down). SLEEP_PROBE (a command, true
-# when asleep) overrides this for devices where the sysfs guess is wrong.
+# What NextUI does when the idle time is up (NextUI's workspace/all/common/api.c, PWR_update/PWR_sleep): after
+# screentimeout s without input it enters "hybrid sleep" (PWR_enterSleep: backlight to 0 through the /dev/disp
+# ioctl on the tg5040, NOT through /sys/class/backlight, then `killall -STOP keymon.elf batmon.elf audiomon.elf`)
+# and waits in PWR_waitForWake for the release of the POWER key (BTN_WAKE; any other button is ignored, so a
+# keep-awake tap of L1 does NOT end it); after suspendTimeout s more it suspends the device (deep sleep: ssh
+# drops). On waking it sends SIGCONT to those daemons again (PWR_exitSleep). So a keymon.elf in the stopped
+# state ("T" in /proc/<pid>/stat) is NextUI's screen-off state: nothing else in NextUI stops it.
+#
+# rb_keymon_state: the state letter of keymon.elf (R, S, T, ...), empty when it does not run. RB_KEYMON_STAT
+# (host unit tests): a stat file to read instead.
+rb_keymon_state() {
+    local p st=""
+    if [ -n "${RB_KEYMON_STAT:-}" ]; then
+        IFS= read -r st <"$RB_KEYMON_STAT" 2>/dev/null || st=""
+    else
+        p="$(pgrep keymon.elf 2>/dev/null | head -n 1)"
+        [ -n "$p" ] && IFS= read -r st <"/proc/$p/stat" 2>/dev/null
+    fi
+    [ -n "$st" ] || return 0
+    st="${st##*) }"
+    printf '%s' "${st%% *}"
+}
+# rb_screen_state: one line for the logs: what the screen-off state looks like on this device (keymon's state,
+# every backlight's bl_power and brightness, fb0's blank). Read only.
+rb_screen_state() {
+    local f v out
+    out="keymon=$(rb_keymon_state)"
+    for f in "${RB_BACKLIGHT_DIR:-/sys/class/backlight}"/*; do
+        [ -d "$f" ] || continue
+        v=""; read -r v <"$f/bl_power" 2>/dev/null
+        out="$out ${f##*/}:bl_power=$v"
+        v=""; read -r v <"$f/brightness" 2>/dev/null
+        out="$out,brightness=$v"
+    done
+    v=""; read -r v <"${RB_FB_DIR:-/sys/class/graphics/fb0}/blank" 2>/dev/null
+    printf '%s fb0_blank=%s' "$out" "$v"
+}
+# True if the screen is off. Only clear signals count, never a guess (a power tap on an AWAKE device would put
+# it to sleep: NextUI's manual sleep): SLEEP_PROBE (a command, true when asleep) when given; else keymon.elf
+# stopped (NextUI's hybrid sleep, see above), or a backlight node that says "powered down" (bl_power != 0, the
+# FB_BLANK values). A brightness of 0 proves nothing (it can be the user's setting, and NextUI does not use the
+# sysfs node on the tg5040).
 rb_asleep() {
-    local f v found=0
+    local f v
     if [ -n "${SLEEP_PROBE:-}" ]; then
         sh -c "$SLEEP_PROBE" >/dev/null 2>&1
         return
     fi
-    # One clear signal only: a backlight node that says "powered down" (bl_power != 0, the
-    # FB_BLANK values). A brightness of 0 proves nothing (it can be the user's setting), and
-    # without a bl_power node the answer is "awake": the power key is never tapped on a guess.
+    [ "$(rb_keymon_state)" = T ] && return 0
     for f in "${RB_BACKLIGHT_DIR:-/sys/class/backlight}"/*/bl_power; do
         [ -r "$f" ] || continue
-        found=1
         read -r v <"$f"
         [ "$v" = 0 ] || return 0
     done
-    [ "$found" = 1 ] && return 1
     return 1
 }
 
 # Taps KEY_POWER (code 116, a short tap, well under the 2 s long press that powers off) on the
-# power key's input device: POWER_DEV_NAME (regex) is matched against the device names.
+# power key's input device: POWER_DEV_NAME (regex) is matched against the device names. One power tap at a
+# time on the device (several keep-awake loops may see the screen off at once): a second one within a few
+# seconds is skipped, so a woken device is never put back to sleep by the next tap.
 rb_wake() {
-    local dev
+    local dev lk="${RB_TMP:-/tmp}/psp-wake.lock" t=""
     dev="$(awk -v re="${POWER_DEV_NAME:-axp|pek|power|gpio-keys}" '
         /^N: Name=/ { name = $0; sub(/^N: Name="/, "", name); sub(/"$/, "", name); use = (name ~ re && name !~ /TRIMUI Player/) }
         use && /^H: Handlers=/ { for (i = 1; i <= NF; i++) if ($i ~ /^event/) { print "/dev/input/" $i; exit } }
     ' /proc/bus/input/devices 2>/dev/null)"
     [ -c "$dev" ] || { echo "no power key device found (POWER_DEV_NAME)" >&2; return 1; }
+    if ! mkdir "$lk" 2>/dev/null; then
+        read -r t <"$lk/t" 2>/dev/null
+        case "$t" in "" | *[!0-9]*) t=0 ;; esac
+        [ $(($(date +%s) - t)) -ge 5 ] || return 0 # another loop's tap, just now
+        rm -rf "$lk"
+        mkdir "$lk" 2>/dev/null || return 0
+    fi
+    date +%s >"$lk/t"
     PAD="$dev" pad 1 116 1
     PAD="$dev" syn
     sleep 0.2 # a short key tap (input injection): no signal exists
     PAD="$dev" pad 1 116 0
     PAD="$dev" syn
+    sleep 1 # NextUI wakes on the release and sends keymon SIGCONT: then the next check sees it awake
+    rm -rf "$lk"
 }
 
-# One keep-awake step: wake the device if it sleeps, otherwise a harmless tap on the pad (any
-# input restarts the idle timer of NextUI's auto sleep).
-rb_tick() {
-    if rb_asleep; then
-        rb_wake
-    else
-        press "${KEEPAWAKE_KEY:-l1}"
+# rb_keepawake_log <line>: appended to the device's keep-awake log (RB_TMP/psp-keepawake.log; kept short).
+rb_keepawake_log() {
+    local f="${RB_TMP:-/tmp}/psp-keepawake.log"
+    if [ -f "$f" ] && [ "$(wc -c <"$f" 2>/dev/null || echo 0)" -gt 300000 ]; then
+        tail -n 500 "$f" >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
     fi
+    echo "$(date '+%H:%M:%S' 2>/dev/null) $*" >>"$f" 2>/dev/null
+    return 0
+}
+
+# One keep-awake step: wake the device if its screen is off (rb_asleep), otherwise a harmless tap on the pad
+# (any input restarts the idle timer of NextUI's auto sleep). Prints, and logs, the screen state and what
+# was done (the host's waits put it in reboot-timings.txt).
+rb_tick() {
+    local st line rc=0
+    st="$(rb_screen_state)"
+    if rb_asleep; then
+        rb_wake || rc=$?
+        line="tick: $st -> SCREEN OFF: power tap (rc $rc)"
+    else
+        press "${KEEPAWAKE_KEY:-l1}" || rc=$?
+        line="tick: $st -> ${KEEPAWAKE_KEY:-l1} tap"
+    fi
+    rb_keepawake_log "$line"
+    echo "$line"
+    return "$rc"
 }
 
 # rb_keepawake_dev: rb_tick at most every KEEPAWAKE_INTERVAL seconds (0 = never, RB_TICK=0 = never);
@@ -514,9 +582,10 @@ rb_keepawake_dev() {
 # copies every save state, the restore, stopping a game): NextUI suspends the device after its idle time
 # (minuisettings.txt: screentimeout, then suspendTimeout) and a suspended device drops the ssh connection.
 # The loop ends with the script (cooperatively: never in the middle of a tap), or by itself within a second
-# when the shell that started it is gone (an ssh call that was cut, rb_stop_backup). Returns the script's status.
+# when the shell that runs the script is gone (a cut ssh call; under rb_job_start: the detached job's shell,
+# not the ssh session that started it). Returns the script's status.
 rb_awake() {
-    local parent=$$ tp="" rc=0 every="${KEEPAWAKE_INTERVAL:-3}"
+    local parent="${BASHPID:-$$}" tp="" rc=0 every="${KEEPAWAKE_INTERVAL:-3}"
     rb_keepawake_dev
     case "$every" in "" | *[!0-9]* | 0) ;; *)
         if [ "${RB_TICK:-1}" = 1 ]; then
@@ -545,10 +614,197 @@ rb_awake() {
     return "$rc"
 }
 
+# --- running detached from the ssh session -------------------------------------------------------
+# rb_detach <log> <function> [args...]: runs a kit function in the background, DETACHED from the ssh session
+# that started it (a dropped connection must not end it): stdin from /dev/null, stdout and stderr appended to
+# <log>, SIGHUP and SIGPIPE ignored, and, when the device has `setsid` and the kit's files are known
+# (RB_KIT_SOURCES, set by rb_init from RB_KIT_PATH), in a session of its own (a new bash that loads the kit
+# again). Returns at once.
+rb_detach() {
+    local log="$1"
+    shift
+    (
+        trap '' HUP PIPE
+        if [ -n "${RB_KIT_SOURCES:-}" ] && command -v setsid >/dev/null 2>&1; then
+            # shellcheck disable=SC2086 # the kit's files, split on spaces on purpose
+            RB_KIT_SOURCES="$RB_KIT_SOURCES" exec setsid bash -c 'for f in $RB_KIT_SOURCES; do . "$f" || exit 97; done; rb_init || exit 98; "$@"' rb-detached "$@"
+        fi
+        "$@"
+    ) </dev/null >>"$log" 2>&1 3>&- &
+}
+
+# Long calls run as JOBS: started detached on the device (rb_job_start), under rb_awake so that the device is
+# kept awake by the job itself, and polled by the host with short ssh calls (rb_job in reboot.bash). A Wi-Fi
+# drop of 15-30 s then only costs a few failed polls; the job goes on. A job lives in RB_TMP/psp-test-jobs/<id>:
+# script, log (its stdout and stderr), pid (its shell) and, once it ended, status (its exit status, written
+# atomically). A job that the host gave up on keeps running and, for a backup or restore, keeps the lock
+# (psp-test.lock): the next backup or restore waits for it or refuses to run next to it.
+rb_job_dir() { echo "${RB_TMP:-/tmp}/psp-test-jobs/$1"; }
+
+# rb_job_start <id> <script>: starts the job, idempotent per id (the directory is claimed with mkdir: a start
+# whose answer was lost can be sent again). Returns once the job runs (its pid file) or has ended.
+rb_job_start() {
+    local id="$1" d t0=$SECONDS
+    case "$id" in "" | *[!A-Za-z0-9._-]*) echo "bad job id: $id" >&2; return 2 ;; esac
+    d="$(rb_job_dir "$id")"
+    mkdir -p "${d%/*}" || return 1
+    if mkdir "$d" 2>/dev/null; then
+        printf '%s' "$2" >"$d/script" || return 1
+        : >"$d/log"
+        rb_detach "$d/log" rb_job_run "$id"
+    fi
+    # (well within the host's 10 s limit of this call)
+    while [ ! -s "$d/pid" ] && [ ! -f "$d/status" ]; do
+        if [ $((SECONDS - t0)) -ge 5 ]; then
+            echo "the job $id did not start: $(tail -n 5 "$d/log" 2>/dev/null)" >&2
+            return 1
+        fi
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+    return 0
+}
+# rb_job_run <id>: the job itself (in the detached shell): rb_awake <script>, then the status file.
+rb_job_run() {
+    local d rc=0
+    d="$(rb_job_dir "$1")"
+    trap '' HUP PIPE
+    echo "${BASHPID:-$$}" >"$d/pid"
+    rb_awake "$(cat "$d/script")" || rc=$?
+    echo "$rc" >"$d/status.part" && mv "$d/status.part" "$d/status"
+}
+# rb_job_poll <id>: 0 when the job ended (prints its status on the first line, then its log), 3 while it
+# runs, 4 when it is gone without a status (killed, or a reboot cleared /tmp: then the directory is gone too).
+rb_job_poll() {
+    local d p=""
+    d="$(rb_job_dir "$1")"
+    [ -d "$d" ] || { echo "no job $1 on the device (a reboot clears /tmp)"; return 4; }
+    if [ ! -f "$d/status" ]; then
+        read -r p <"$d/pid" 2>/dev/null
+        [ -n "$p" ] && kill -0 "$p" 2>/dev/null && return 3
+        [ -f "$d/status" ] || { echo "the job ended without a status (killed?); its log:"; cat "$d/log" 2>/dev/null; return 4; }
+    fi
+    cat "$d/status"
+    cat "$d/log" 2>/dev/null
+    return 0
+}
+# rb_job_log <id>: the log so far.  rb_job_clean <id>: removes an ENDED job's directory.
+rb_job_log() { cat "$(rb_job_dir "$1")/log" 2>/dev/null; }
+rb_job_clean() {
+    local d
+    d="$(rb_job_dir "$1")"
+    [ -f "$d/status" ] && rm -rf "$d"
+    return 0
+}
+
+# --- a keep-awake loop for a whole run ----------------------------------------------------------
+# rb_keepawake_start [max s]: makes sure ONE detached keep-awake loop runs on the device (run-device.sh starts
+# it before the on-device tests, reboot.bats keeps it and starts it again after every boot), for at most <max s>
+# (RB_KEEPAWAKE_MAX, 10800) from now: a loop that is already running is kept and its end moved. Every second the
+# loop checks the screen (rb_asleep: a screen that went off anyway is woken at once, before NextUI's
+# suspendTimeout), and every RB_KEEPAWAKE_EVERY seconds it taps KEEPAWAKE_KEY (default: a third of NextUI's
+# screentimeout, 3..20 s; 10 s when unknown; KEEPAWAKE_INTERVAL=0 turns the loop off). It ends cooperatively
+# (rb_keepawake_stop, or SIGTERM: never in the middle of a tap) or at its deadline. Log: RB_TMP/psp-keepawake.log.
+rb_keepawake_pidfile() { echo "${RB_TMP:-/tmp}/psp-keepawake.pid"; }
+rb_keepawake_pid() {
+    local p=""
+    read -r p <"$(rb_keepawake_pidfile)" 2>/dev/null
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "$p"
+    return 0
+}
+rb_keepawake_every() {
+    local st
+    case "${RB_KEEPAWAKE_EVERY:-}" in "" | *[!0-9]*) ;; *) echo "$RB_KEEPAWAKE_EVERY"; return ;; esac
+    st="$(grep -E '^screentimeout=[0-9]+' "$SHARED/minuisettings.txt" 2>/dev/null | head -n 1 | tr -d '\r')"
+    st="${st#screentimeout=}"
+    case "$st" in "" | *[!0-9]* | 0) echo 10; return ;; esac
+    st=$((st / 3))
+    [ "$st" -ge 3 ] || st=3
+    [ "$st" -le 20 ] || st=20
+    echo "$st"
+}
+rb_keepawake_start() {
+    local max="${1:-${RB_KEEPAWAKE_MAX:-10800}}" p
+    [ "${KEEPAWAKE_INTERVAL:-3}" != 0 ] || { echo "keep-awake loop: off (KEEPAWAKE_INTERVAL=0)"; return 0; }
+    echo $(($(date +%s) + max)) >"${RB_TMP:-/tmp}/psp-keepawake.until"
+    p="$(rb_keepawake_pid)"
+    if [ -n "$p" ]; then
+        echo "keep-awake loop: already running (pid $p), kept for ${max}s more"
+        return 0
+    fi
+    rb_detach /dev/null rb_keepawake_loop
+    echo "keep-awake loop: started (a tap every $(rb_keepawake_every) s, the screen checked every second)"
+}
+rb_keepawake_loop() {
+    local stop=0 until every last=-99999 pf
+    pf="$(rb_keepawake_pidfile)"
+    echo "${BASHPID:-$$}" >"$pf"
+    trap 'stop=1' TERM
+    trap '' HUP PIPE
+    every="$(rb_keepawake_every)"
+    rb_keepawake_log "keep-awake loop ${BASHPID:-$$}: started, a ${KEEPAWAKE_KEY:-l1} tap every ${every} s, the screen checked every second"
+    while [ "$stop" = 0 ]; do
+        read -r until <"${RB_TMP:-/tmp}/psp-keepawake.until" 2>/dev/null
+        case "$until" in "" | *[!0-9]*) until=0 ;; esac
+        [ "$(date +%s)" -lt "$until" ] || { rb_keepawake_log "keep-awake loop ${BASHPID:-$$}: deadline reached"; break; }
+        if rb_asleep || [ $((SECONDS - last)) -ge "$every" ]; then
+            rb_tick >/dev/null 2>&1
+            last=$SECONDS
+        fi
+        [ "$stop" = 0 ] || break
+        sleep 1 &
+        wait $! 2>/dev/null
+    done
+    [ "$stop" = 0 ] || rb_keepawake_log "keep-awake loop ${BASHPID:-$$}: stopped"
+    [ "$(cat "$pf" 2>/dev/null)" != "${BASHPID:-$$}" ] || rm -f "$pf"
+}
+# rb_keepawake_stop [wait s]: stops the loop cooperatively and waits (5 s) for it to end. 0 when none runs.
+rb_keepawake_stop() {
+    local p n=0
+    p="$(rb_keepawake_pid)"
+    [ -n "$p" ] || return 0
+    kill -TERM "$p" 2>/dev/null
+    while kill -0 "$p" 2>/dev/null; do
+        n=$((n + 1))
+        [ "$n" -le $((${1:-5} * 5)) ] || { echo "the keep-awake loop (pid $p) did not stop" >&2; return 1; }
+        sleep 0.2 2>/dev/null || sleep 1
+    done
+    rm -f "$(rb_keepawake_pidfile)" "${RB_TMP:-/tmp}/psp-keepawake.until"
+}
+
+# --- the suspend counter -------------------------------------------------------------------------
+# rb_suspend_count: "<count> <source>": how often the kernel suspended since the boot: /sys/power/suspend_stats/
+# success (newer kernels), the "success:" line of /sys/kernel/debug/suspend_stats (debugfs), else the
+# "PM: suspend entry" lines of dmesg (the ring buffer can wrap: the count can then go DOWN). Fails (prints
+# nothing) when none exists. RB_SUSPEND_STATS / RB_SUSPEND_DEBUGFS (host unit tests): other paths.
+rb_suspend_count() {
+    local f v=""
+    f="${RB_SUSPEND_STATS:-/sys/power/suspend_stats/success}"
+    if [ -r "$f" ] && read -r v <"$f" 2>/dev/null; then
+        case "$v" in "" | *[!0-9]*) ;; *) echo "$v sysfs"; return 0 ;; esac
+    fi
+    f="${RB_SUSPEND_DEBUGFS:-/sys/kernel/debug/suspend_stats}"
+    if [ -r "$f" ]; then
+        v="$(sed -n 's/^success:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$f" 2>/dev/null | head -n 1)"
+        [ -z "$v" ] || { echo "$v debugfs"; return 0; }
+    fi
+    if command -v dmesg >/dev/null 2>&1 && v="$(dmesg 2>/dev/null)" && [ -n "$v" ]; then
+        echo "$(printf '%s\n' "$v" | grep -c 'PM: suspend entry') dmesg"
+        return 0
+    fi
+    return 1
+}
+# rb_power_info: "<boot id> <suspend count or -> <source or none>", one line, for the host's ledger.
+rb_power_info() {
+    local id c
+    id="$(cat "${BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}" 2>/dev/null)"
+    c="$(rb_suspend_count)" || c="- none"
+    echo "${id:-?} $c"
+}
+
 # --- one backup or restore at a time ------------------------------------------------------------
 # rb_backup and rb_restore hold a lock: the directory $RB_TMP/psp-test.lock with the pid of the shell that
-# holds it (and what it does) in "pid". The process of a backup whose ssh connection dropped (the device
-# suspended) goes on once the device is awake again; a restore (teardown_file) or a second backup next to it
+# holds it (and what it does) in "pid". A backup runs as a detached job (rb_job_start): when the host gave up
+# on it (its time limit, an unreachable device) it goes on; a restore (teardown_file) or a second backup next to it
 # could interleave their copies (e.g. leave controls.ini with the test hotkeys and no active backup). A lock
 # whose holder is gone (a killed shell, a reboot clears /tmp anyway) is stale and taken over.
 rb_lock_dir() { echo "${RB_TMP:-/tmp}/psp-test.lock"; }
@@ -593,35 +849,6 @@ rb_unlock() {
     [ "$p" = "${BASHPID:-$$}" ] && rm -rf "$d"
     return 0
 }
-# rb_stop_backup [wait s]: stops a backup that still runs (the lock's holder; its ssh connection dropped):
-# SIGTERM to its shell only (a cp it runs finishes on its own; its keep-awake loop ends cooperatively, never
-# in the middle of a key press), then waits up to <wait s> (30) until the shell and its children are gone.
-# Safe because the next rb_backup restores a cut-short backup first. 0 when nothing runs (any more).
-rb_stop_backup() {
-    local limit="${1:-30}" h p w kids k t0=$SECONDS alive
-    h="$(rb_lock_holder)"
-    [ -n "$h" ] || return 0
-    p="${h%% *}" w="${h#* }"
-    case "$w" in backup) ;; *)
-        echo "a $w (not a backup) holds the lock (pid $p): not stopped" >&2
-        return 1
-        ;;
-    esac
-    kids="$(pgrep -P "$p" 2>/dev/null | tr '\n' ' ')"
-    echo "stopping the backup that still runs (pid $p)"
-    kill -TERM "$p" 2>/dev/null
-    while :; do
-        alive=""
-        for k in $p $kids; do kill -0 "$k" 2>/dev/null && alive="$alive $k"; done
-        [ -n "$alive" ] || return 0
-        if [ $((SECONDS - t0)) -ge "$limit" ]; then
-            echo "the backup (pid $p) did not end within ${limit}s (still running:$alive)" >&2
-            return 1
-        fi
-        sleep 1
-    done
-}
-
 # rb_idle_settings: NextUI's idle times from minuisettings.txt, as "screentimeout=60 suspendTimeout=30"
 # (only those two keys; the file also holds credentials). Empty when there is no such file or key.
 rb_idle_settings() {

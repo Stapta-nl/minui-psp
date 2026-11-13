@@ -19,8 +19,12 @@
 #                             screen off and then suspends the device after the idle times of its settings
 #                             (minuisettings.txt: screentimeout, then suspendTimeout; can be as short as about
 #                             10 s), and a suspended device does not answer ssh, so the taps must be dense
-#   RB_BACKUP_RETRY_WAIT (30) after the ssh connection of the backup dropped: how long the device may take
-#                             to answer again before the backup is retried once (setup_file)
+#   RB_ALIVE_INT (5), RB_ALIVE_MAX (3)  ssh's ServerAliveInterval / ServerAliveCountMax: a connection that
+#                             carries no packet for 15 s is dead. A call allowed to run longer than 30 s
+#                             gets RB_LONG_ALIVE_MAX (8): 40 s without a packet (a Wi-Fi drop) do not kill it
+#   RB_JOB_POLL_TIMEOUT (10)  limit of one ssh poll of a job that runs detached on the device (rb_job)
+#   RB_SUSPEND_LEDGER         where the device's boot id and suspend counter are recorded during a run
+#                             (default: $OUT/suspend-ledger.txt; none: no ledger, nothing is recorded)
 #   RB_TRIGGER_LINGER (3)     seconds a trigger ssh call may stay open before it is cut (rb_trigger)
 #   REBOOT_DOWN_TIMEOUT (30)  BACKUP only: after the power-off request the device must be seen going
 #                             down (ssh port closed) within this; observed: about 4 s
@@ -41,7 +45,7 @@
 # are only the time-outs after which a wait gives up.
 
 RB_KIT_PATH="${RB_KIT_PATH:-/tmp/psp-reboot-kit.sh}"
-RB_ENV_VARS="SD PLATFORM PAK_NAME ROM_DIR ROM SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS PSP_RUN_ID UI_WAIT BOOT_WAIT NOGAME_WAIT BOOT_SETTLE UI_SETTLE NOGAME_SETTLE CHORD_HOLD KEEPAWAKE_KEY KEEPAWAKE_INTERVAL POWER_DEV_NAME SLEEP_PROBE RB_TMP RB_OUT RB_REBOOT_CMD RB_HARD_REBOOT_CMD BOOT_ID_FILE"
+RB_ENV_VARS="SD PLATFORM PAK_NAME ROM_DIR ROM SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS PSP_RUN_ID UI_WAIT BOOT_WAIT NOGAME_WAIT BOOT_SETTLE UI_SETTLE NOGAME_SETTLE CHORD_HOLD KEEPAWAKE_KEY KEEPAWAKE_INTERVAL POWER_DEV_NAME SLEEP_PROBE RB_TMP RB_OUT RB_REBOOT_CMD RB_HARD_REBOOT_CMD BOOT_ID_FILE RB_KIT_PATH RB_KEEPAWAKE_EVERY RB_KEEPAWAKE_MAX RB_KEYMON_STAT RB_SUSPEND_STATS RB_SUSPEND_DEBUGFS"
 
 # Quotes a value for the remote shell.
 rb_q() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
@@ -74,13 +78,25 @@ rb_scrub() {
     fi
 }
 
+# rb_ssh_cmd <limit s>: the ssh command for a call of that limit, in RB_SSH_CALL: a call allowed to run longer
+# than 30 s tolerates RB_LONG_ALIVE_MAX (8) server-alive intervals without an answer (40 s: a Wi-Fi drop), a
+# short one the default (15 s; its time limit bounds it anyway). ssh takes the FIRST value of an option, so the
+# override goes in front.
+rb_ssh_cmd() {
+    RB_SSH_CALL=("${RB_SSH[@]}")
+    if [ "${1%%.*}" -gt 30 ] 2>/dev/null; then
+        RB_SSH_CALL=("${RB_SSH[0]}" -o "ServerAliveCountMax=${RB_LONG_ALIVE_MAX:-8}" "${RB_SSH[@]:1}")
+    fi
+}
+
 # dev_run <timeout s> <script>: runs a script (bash) on the device and returns its status:
 # 124 on a timeout, 255 when ssh cannot connect. stdout is the script's, stderr is scrubbed.
 dev_run() {
     local limit="$1" script="$2" errf rc
     rb_ssh_ready || { echo "DEVICE_HOST is not set" >&2; return 2; }
+    rb_ssh_cmd "$limit"
     errf="$(mktemp "${TMPDIR:-/tmp}/rb-ssh-err.XXXXXX")" || return 2
-    timeout -k 3 "$limit" "${RB_SSH[@]}" "$DEVICE_HOST" "bash -c $(rb_q "$script")" </dev/null 2>"$errf"
+    timeout -k 3 "$limit" "${RB_SSH_CALL[@]}" "$DEVICE_HOST" "bash -c $(rb_q "$script")" </dev/null 2>"$errf"
     rc=$?
     rb_scrub <"$errf" >&2
     rm -f "$errf"
@@ -118,9 +134,10 @@ dev_ok() { dev_kit "$1" "$2" >/dev/null 2>&1; }
 dev_install_kit() {
     local here="${BASH_SOURCE[0]%/*}" errf rc limit="${1:-60}"
     rb_ssh_ready || { echo "DEVICE_HOST is not set" >&2; return 2; }
+    rb_ssh_cmd "$limit"
     errf="$(mktemp "${TMPDIR:-/tmp}/rb-ssh-err.XXXXXX")" || return 2
     cat "$here/e2e.bash" "$here/devconfig.bash" "$here/reboot-device.bash" |
-        timeout -k 3 "$limit" "${RB_SSH[@]}" "$DEVICE_HOST" "cat >$(rb_q "$RB_KIT_PATH.part") && mv $(rb_q "$RB_KIT_PATH.part") $(rb_q "$RB_KIT_PATH")" 2>"$errf"
+        timeout -k 3 "$limit" "${RB_SSH_CALL[@]}" "$DEVICE_HOST" "cat >$(rb_q "$RB_KIT_PATH.part") && mv $(rb_q "$RB_KIT_PATH.part") $(rb_q "$RB_KIT_PATH")" 2>"$errf"
     rc=${PIPESTATUS[1]}
     rb_scrub <"$errf" >&2
     rm -f "$errf"
@@ -206,7 +223,8 @@ rb_test_end() {
 # that sleeps, otherwise taps a harmless button (see rb_tick). NextUI suspends the device after about
 # 10 s without input, and a suspended device does not answer ssh (and cannot be woken from here), so the
 # taps are dense. The step runs in the BACKGROUND (never delays a poll, one at a time) and never fails
-# the test: a device that is rebooting simply does not answer.
+# the test: a device that is rebooting simply does not answer. What the device answered (the screen state:
+# keymon, backlight, fb0 blank, and the key it tapped) is traced in the timings file.
 rb_keepawake_maybe() {
     local every="${KEEPAWAKE_INTERVAL:-3}" now
     [ "${RB_TICK:-1}" = 1 ] && [ "$every" -gt 0 ] || return 0
@@ -214,7 +232,10 @@ rb_keepawake_maybe() {
     [ $((now - ${RB_LAST_TICK:--99999})) -ge "$every" ] || return 0
     if [ -n "${RB_TICK_PID:-}" ] && kill -0 "$RB_TICK_PID" 2>/dev/null; then return 0; fi
     RB_LAST_TICK=$now
-    ( dev_kit "${RB_PROBE_TIMEOUT:-10}" rb_tick || true ) >/dev/null 2>&1 3>&- </dev/null &
+    (
+        out="$(dev_kit "${RB_PROBE_TIMEOUT:-10}" rb_tick 2>/dev/null)" || out="${out:+$out }(no answer: status $?)"
+        rb_trace "keep-awake $out"
+    ) >/dev/null 2>&1 3>&- </dev/null &
     RB_TICK_PID=$!
 }
 
@@ -272,60 +293,184 @@ rb_idle_note() {
         printf "NextUI's idle suspend: the screen goes off and the device suspends after the idle times of its settings (screentimeout, suspendTimeout in minuisettings.txt)"
     fi
 }
-# rb_unreachable_note <ssh status>: one sentence for a failure message after a call to the device failed:
-# for an ssh failure (255) or a cut call (124), whether the device still answers ping, and what that
-# means. Asleep is the likely cause when ping fails too: say so, and that the power button wakes it.
-rb_unreachable_note() {
-    local rc="${1:-255}" p=0
-    case "$rc" in 255 | 124) ;; *) return 0 ;; esac
+# rb_ping_note: whether the device answers ping, as a few words for a message ("ping lost too", "ping still
+# answers", or nothing where ping cannot be used). Ping is NOT evidence of sleep: on a flaky Wi-Fi it fails on
+# and off while ssh works (seen in a maintainer's ping log); it is only reported.
+rb_ping_note() {
+    local p=0
     [ -n "${RB_NET_HOST:-}" ] || rb_net_setup >/dev/null 2>&1 || true
     rb_ping_probe || p=$?
     case "$p" in
-    0) printf 'the ssh call failed (status %s) but the device answers ping: the network or sshd had a problem, the device is not asleep' "$rc" ;;
-    1) printf 'the ssh call failed (status %s) and the device does not answer ping either: it is probably ASLEEP (%s). Press the power button to wake it; the tests keep it awake with button taps only while they can reach it' "$rc" "$(rb_idle_note)" ;;
-    *) printf 'the ssh call failed (status %s) and ping cannot be used from here: if the screen of the device is off it is probably asleep (%s); press the power button to wake it' "$rc" "$(rb_idle_note)" ;;
+    0) printf 'ping still answers' ;;
+    1) printf 'ping lost too' ;;
     esac
 }
+# rb_unreachable_note <ssh status>: one sentence for a failure message after a call to the device failed with
+# an ssh failure (255) or a cut call (124): unreachable, which can be a Wi-Fi drop or sleep. The suspend
+# counter tells them apart once the device answers again (rb_suspend_verdict); nothing is guessed from ping.
+rb_unreachable_note() {
+    local rc="${1:-255}" p
+    case "$rc" in 255 | 124) ;; *) return 0 ;; esac
+    p="$(rb_ping_note)"
+    printf 'the device does not answer (ssh status %s): unreachable (Wi-Fi drop or sleep; a suspend counter will tell once it answers)%s' "$rc" "${p:+; $p}"
+}
 
-# rb_backup_call <limit s> <output file>: the backup of setup_file (rb_backup on the device, under rb_awake so
-# that the device is kept awake while it copies the save states), its output in the file. When the ssh
-# connection DROPS (255: the device suspended, or the network), the output says whether the device still
-# answers ping (rb_unreachable_note), and the backup is retried ONCE: after the device answers again (within
-# RB_BACKUP_RETRY_WAIT s, 30, while keep-awake taps are sent), the kit is installed again and a first backup
-# that still runs on the device (its process outlives the connection) is STOPPED (rb_stop_backup). The retry
-# is safe: rb_backup (psp_backup) first restores the backup of a run that was cut short (the "active" flag is
-# set before anything is copied, every stashed file and state copy is complete and verified, or not there),
-# then makes a fresh one with a new run id; and a backup and a restore never run at the same time (the lock
-# of rb_backup / rb_restore). Any other failure is not retried. Returns the backup's status.
-rb_backup_call() {
-    local limit="$1" out="$2" rc=0 note
-    dev_kit "$limit" "rb_awake rb_backup" >"$out" 2>&1 || rc=$?
-    [ "$rc" = 255 ] || return "$rc"
-    note="$(rb_unreachable_note 255)"
-    echo "the ssh connection dropped during the backup: $note" >>"$out"
-    if ! await "${RB_BACKUP_RETRY_WAIT:-30}" "the device to answer again after the backup's ssh connection dropped" dev_run "${RB_PROBE_TIMEOUT:-10}" true 2>/dev/null; then
-        echo "the device did not answer again within ${RB_BACKUP_RETRY_WAIT:-30}s: the backup was not retried" >>"$out"
-        return 255
+# --- the suspend counter: was the device asleep, or was it the network? -----------------------
+# The ledger (RB_SUSPEND_LEDGER, default $OUT/suspend-ledger.txt; a file, so every bats test sees it): one line
+# per reading, "<time> <boot id> <count or -> <source> <label>", from rb_power_info on the device. The counter
+# counts since the boot, so it is compared only within one boot id.
+rb_ledger_file() { printf '%s' "${RB_SUSPEND_LEDGER-${OUT:+$OUT/suspend-ledger.txt}}"; }
+# rb_power_read: one short call (RB_PROBE_TIMEOUT) to the device; sets RB_PW_BOOT, RB_PW_COUNT ("-" without a
+# counter) and RB_PW_SRC. 1 when the device does not answer.
+rb_power_read() {
+    local f out=""
+    f="$(mktemp "${TMPDIR:-/tmp}/rb-power.XXXXXX")" || return 1
+    dev_kit "${RB_PROBE_TIMEOUT:-10}" rb_power_info >"$f" 2>/dev/null </dev/null && out="$(head -n 1 "$f")"
+    rm -f "$f"
+    [ -n "$out" ] || return 1
+    read -r RB_PW_BOOT RB_PW_COUNT RB_PW_SRC <<<"$out"
+    [ -n "$RB_PW_SRC" ] || return 1
+}
+# rb_suspend_record <label>: a reading in the ledger (best effort; nothing without a ledger).
+rb_suspend_record() {
+    local led
+    led="$(rb_ledger_file)"
+    [ -n "$led" ] || return 0
+    rb_power_read || return 0
+    echo "$(date +%H:%M:%S) $RB_PW_BOOT $RB_PW_COUNT $RB_PW_SRC ${1:-reading}" >>"$led" 2>/dev/null
+    return 0
+}
+# rb_suspend_verdict [ping note]: after the device was unreachable and answers again: did it SUSPEND since the
+# last reading of the ledger (then it was asleep, and the keep-awake did not prevent it) or not (then the
+# network dropped)? One sentence; the new reading is recorded. The ping note (rb_ping_note, taken while it was
+# unreachable) is only added to a "did not suspend".
+rb_suspend_verdict() {
+    local ping="${1:-}" led last="" lt="" lb="" lc="" d
+    if ! rb_power_read; then
+        echo "the device is still unreachable (Wi-Fi drop or sleep; a suspend counter will tell once it answers)"
+        return 0
     fi
-    dev_install_kit 30 >>"$out" 2>&1 || { echo "could not install the kit again: the backup was not retried" >>"$out"; return 255; }
+    led="$(rb_ledger_file)"
+    [ -z "$led" ] || last="$(grep -v '^ *$' "$led" 2>/dev/null | tail -n 1)"
+    [ -z "$led" ] || echo "$(date +%H:%M:%S) $RB_PW_BOOT $RB_PW_COUNT $RB_PW_SRC after it was unreachable" >>"$led" 2>/dev/null
+    read -r lt lb lc _ <<<"$last"
+    if [ "$RB_PW_SRC" = none ]; then
+        echo "the device answers again; it has no suspend counter (no /sys/power/suspend_stats, no debugfs suspend_stats, no dmesg), so sleep cannot be told from a network drop${ping:+ ($ping)}"
+    elif [ -z "$last" ]; then
+        echo "the device answers again; its suspend counter is ${RB_PW_COUNT} ($RB_PW_SRC) but there is no earlier reading to compare with"
+    elif [ "$lb" != "$RB_PW_BOOT" ]; then
+        echo "the device REBOOTED meanwhile (a new boot id since the reading at $lt): its suspend counter (${RB_PW_COUNT}, $RB_PW_SRC) counts from that boot"
+    elif [ "$lc" = - ]; then
+        echo "the device answers again; the earlier reading had no suspend counter: cannot compare"
+    else
+        d=$((RB_PW_COUNT - lc))
+        if [ "$d" -gt 0 ]; then
+            echo "the device SUSPENDED $d time(s) since $lt (suspend counter, $RB_PW_SRC: $lc -> $RB_PW_COUNT): it was ASLEEP, and the keep-awake did not prevent it ($(rb_idle_note))"
+        elif [ "$d" = 0 ]; then
+            echo "the device did not suspend (suspend counter, $RB_PW_SRC: $RB_PW_COUNT, unchanged since $lt): the network dropped (Wi-Fi)${ping:+, $ping}"
+        else
+            echo "the suspend counter went DOWN ($lc -> $RB_PW_COUNT, $RB_PW_SRC: the dmesg ring buffer wrapped?): cannot tell whether the device suspended"
+        fi
+    fi
+}
+# rb_suspend_total: one sentence for the end of the run: how often the device suspended during it, from the
+# ledger (for the first boot: the last reading minus the first; for every later boot: its last reading, the
+# counter starts at 0 with the boot). Tells whether the keep-awake works.
+rb_suspend_total() {
+    local led
+    led="$(rb_ledger_file)"
+    if [ -z "$led" ] || [ ! -s "$led" ]; then
+        echo "suspend counter: no readings (no ledger)"
+        return 0
+    fi
+    awk '
+        $3 == "-" { nocount = 1; next }
+        { if (!($2 in first)) { first[$2] = $3; order[++n] = $2; src = $4 } last[$2] = $3 }
+        END {
+            if (n == 0) { print "suspend counter: this device has none (no /sys/power/suspend_stats, debugfs or dmesg): cannot tell whether it slept"; exit }
+            total = 0; bad = 0
+            for (i = 1; i <= n; i++) { d = last[order[i]] - (i == 1 ? first[order[i]] : 0); if (d < 0) bad = 1; else total += d }
+            if (bad) print "suspend counter (" src "): went down during the run (the dmesg ring buffer wrapped?): unknown"
+            else if (total > 0) printf "suspend counter (%s): the device SUSPENDED %d time(s) during the run (%d boot(s)): the keep-awake did not prevent it\n", src, total, n
+            else printf "suspend counter (%s): the device did not suspend during the run (%d boot(s)): the keep-awake worked\n", src, n
+        }' "$led"
+}
+
+# --- long calls: detached jobs, polled ------------------------------------------------------------
+# rb_job <limit s> <name> <script>: runs the script on the device as a DETACHED job (rb_job_start: under
+# rb_awake, so the job keeps the device awake itself; its own pid, log and status file in RB_TMP/psp-test-jobs)
+# and polls it with short ssh calls (RB_JOB_POLL_TIMEOUT, 10 s, every POLL_INTERVAL) until it ended or <limit s>
+# passed. A poll that fails (ssh 255, a cut call, the kit missing) is just retried: a dropped connection (a
+# Wi-Fi drop of 15-30 s) costs a few polls and the job goes on; when the device answers again the drop is
+# explained from its suspend counter (rb_suspend_verdict). Prints the job's log (stdout and stderr) and returns
+# its status; 124 when it still runs at the limit (it goes on, and a backup or restore keeps its lock: the next
+# backup or restore waits for it or refuses), 255 when the device did not answer at the end, 1 when the job
+# died without a status.
+rb_job() {
+    local limit="$1" name="$2" script="$3" id t0 f rc n_fail=0 t_fail="" ping="" st now
+    id="${name//[!A-Za-z0-9]/-}-$(date +%s)-$$-${RANDOM:-0}"
+    f="$(mktemp "${TMPDIR:-/tmp}/rb-job.XXXXXX")" || return 2
+    t0="$(rb_now_ms)"
     rc=0
-    dev_kit 90 "rb_stop_backup 60" >>"$out" 2>&1 || rc=$?
-    case "$rc" in
-    0) ;;
-    255 | 124 | 97 | 98)
-        echo "the device stopped answering while the first backup was being stopped (status $rc): the backup was not retried; $(rb_unreachable_note "$rc")" >>"$out"
-        return 255
-        ;;
-    *)
-        echo "the first backup still runs on the device and could not be stopped (status $rc): the backup was not retried" >>"$out"
-        return 1
-        ;;
-    esac
-    echo "the device answers again: retrying the backup once (what the first attempt had copied is restored first)" >>"$out"
-    rc=0
-    dev_kit "$limit" "rb_awake rb_backup" >>"$out" 2>&1 || rc=$?
-    [ "$rc" != 255 ] || echo "the ssh connection dropped again: $(rb_unreachable_note 255)" >>"$out"
-    return "$rc"
+    # the start is idempotent (the job's directory is claimed with mkdir): a start whose answer was lost is retried
+    rb_device_retry dev_kit "${RB_JOB_POLL_TIMEOUT:-10}" "rb_job_start $(rb_q "$id") $(rb_q "$script")" >"$f" 2>&1 || rc=$?
+    if [ "$rc" != 0 ]; then
+        cat "$f"
+        rm -f "$f"
+        echo "could not start the $name on the device (status $rc)$(n="$(rb_unreachable_note "$rc")"; [ -z "$n" ] || printf ': %s' "$n")"
+        return "$rc"
+    fi
+    while :; do
+        rc=0
+        dev_kit "${RB_JOB_POLL_TIMEOUT:-10}" "rb_job_poll $(rb_q "$id")" >"$f" 2>/dev/null || rc=$?
+        now="$(rb_now_ms)"
+        case "$rc" in
+        0 | 3 | 4)
+            if [ -n "$t_fail" ]; then
+                rb_log "the connection to the device dropped for $(rb_secs $((now - t_fail))) s during the $name ($n_fail poll(s) failed); the job went on on the device: $(rb_suspend_verdict "$ping")"
+                t_fail=""
+            fi
+            ;;
+        *)
+            n_fail=$((n_fail + 1))
+            if [ -z "$t_fail" ]; then
+                t_fail="$now"
+                ping="$(rb_ping_note)"
+            fi
+            rb_trace "job $name: poll failed (status $rc), polling on"
+            ;;
+        esac
+        case "$rc" in
+        0) break ;;
+        4)
+            cat "$f"
+            rm -f "$f"
+            echo "the $name job on the device ended without a status (killed?)"
+            rb_phase_since "job: $name" "$t0" "no status"
+            return 1
+            ;;
+        esac
+        if [ $(((now - t0) / 1000)) -ge "$limit" ]; then
+            rb_phase_since "job: $name" "$t0" "TIMEOUT"
+            if [ -n "$t_fail" ]; then
+                rm -f "$f"
+                echo "the device has not answered for $(rb_secs $((now - t_fail))) s at the end of the ${limit}s for the $name: unreachable (Wi-Fi drop or sleep; a suspend counter will tell once it answers)${ping:+; $ping}. The job may still run there; a backup or restore keeps its lock until it ends"
+                return 255
+            fi
+            dev_kit "${RB_JOB_POLL_TIMEOUT:-10}" "rb_job_log $(rb_q "$id")" 2>/dev/null || true
+            rm -f "$f"
+            echo "the $name still runs on the device after ${limit}s: given up here; it goes on there and keeps the lock of the backup and restore (psp-test.lock) until it ends, so the restore waits for it"
+            return 124
+        fi
+        sleep "${POLL_INTERVAL:-1}"
+    done
+    st="$(head -n 1 "$f")"
+    tail -n +2 "$f"
+    rm -f "$f"
+    dev_kit "${RB_JOB_POLL_TIMEOUT:-10}" "rb_job_clean $(rb_q "$id")" >/dev/null 2>&1 || true
+    case "$st" in "" | *[!0-9]*) st=1 ;; esac
+    rb_phase_since "job: $name" "$t0" "rc $st$([ "$n_fail" = 0 ] || echo ", $n_fail failed polls")"
+    return "$st"
 }
 
 # The settles run ON the device (a local one second loop: no ssh call per poll; the keep-awake taps
@@ -389,6 +534,7 @@ rb_trigger() {
     local fn="$1" t0 out pid i=0 steps rc=0 how="returned" saved=()
     rb_ssh_ready || { echo "DEVICE_HOST is not set" >&2; return 2; }
     saved=("${RB_SSH[@]}")
+    rb_suspend_record "before the reboot request" # (outside the clock, like the network setup)
     rb_net_prepare # before the clock starts: await_reboot must not spend the reboot on its setup
     steps=$((${RB_TRIGGER_LINGER:-3} * 5))
     out="$(mktemp "${TMPDIR:-/tmp}/rb-trigger.XXXXXX")" || return 2
@@ -673,7 +819,7 @@ await_reboot() {
     }
     if [ -n "$RB_NOT_REBOOTED" ]; then
         RB_TICK=$tick
-        rb_log "reboot: NOT rebooted: the device was unreachable (\"down\" at ${t_down}s: $RB_DOWN_VIA) and has answered with the SAME boot id since $(rb_secs "$RB_T_SAME") s after the trigger (${RB_SAME_ID_GRACE:-15}s in a row): it was asleep (idle suspend) or the network dropped; the reboot did not happen"
+        rb_log "reboot: NOT rebooted: the device was unreachable (\"down\" at ${t_down}s: $RB_DOWN_VIA) and has answered with the SAME boot id since $(rb_secs "$RB_T_SAME") s after the trigger (${RB_SAME_ID_GRACE:-15}s in a row): the reboot did not happen; $(rb_suspend_verdict)"
         return 1
     fi
     ms_el=$(($(rb_now_ms) - RB_T0))
@@ -687,6 +833,9 @@ await_reboot() {
     t_kit=$((($(rb_now_ms) - RB_T0 + 500) / 1000))
     dev_kit "${RB_PROBE_TIMEOUT:-10}" rb_tick >/dev/null 2>&1 || true # the first tap at once
     RB_LAST_TICK=$(($(rb_now_ms) / 1000))
+    # the keep-awake loop for the rest of the run (the reboot ended the one before) and a suspend reading of the new boot
+    if [ "$tick" = 1 ]; then dev_kit "${RB_PROBE_TIMEOUT:-10}" rb_keepawake_start >/dev/null 2>&1 || true; fi
+    rb_suspend_record "after the boot"
     rb_boot_snapshot "first contact after the boot (kit installed)"
     # The SD card is mounted a little after ssh is up: the backup flag lives on it, and the
     # evidence the power-off wrapper recorded too.

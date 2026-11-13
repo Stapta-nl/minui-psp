@@ -28,6 +28,13 @@
 # Before the tests it compares the installed pak with this checkout (or SRC_PAK) and warns if
 # they differ (tests/pakcheck.sh); PAK_MISMATCH=fail makes that fatal. The result is in the summary.
 #
+# Keep-awake: before the tests a detached keep-awake loop is started on the device (tests/helpers/reboot-device.bash,
+# rb_keepawake_start, from the test bundle): NextUI turns the screen off after its screentimeout without input and
+# suspends the device suspendTimeout later, and several on-device tests send no input for minutes. The loop taps a
+# harmless button (KEEPAWAKE_KEY, l1) every third of screentimeout (RB_KEEPAWAKE_EVERY), wakes a screen that went
+# off anyway (power tap), runs on across the hand-off to the reboot tests and is stopped (cooperatively) at the
+# end; KEEPAWAKE_INTERVAL=0 turns it off. Its log (the screen state at every tick) is keepawake-ondevice.log.
+#
 # Afterwards the tests tagged "reboot" (tests/bats/reboot.bats: they REBOOT the device) run on
 # this machine over ssh, see tests/run-reboot.sh; SKIP_REBOOT_TESTS=1 leaves them out. They
 # only run when the on-device tests passed or failed normally (exit status 0 or 1).
@@ -114,12 +121,15 @@ finishing=0
 # Best-effort removal of the remote temp dir: BatchMode, a connect timeout and an overall
 # timeout (CLEANUP_TIMEOUT, default 20 s), so an interrupted run never hangs on it.
 cleanup() {
+    local cmd
     case "$remote_tmp" in
     /tmp/psp-tests.*)
+        # also the keep-awake loop: SIGTERM, which it handles cooperatively (never in the middle of a tap)
+        cmd="p=\$(cat /tmp/psp-keepawake.pid 2>/dev/null); [ -z \"\$p\" ] || kill -TERM \"\$p\" 2>/dev/null; rm -rf '$remote_tmp'"
         if command -v timeout >/dev/null 2>&1; then
-            timeout -k 2 "${CLEANUP_TIMEOUT:-20}" "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "rm -rf '$remote_tmp'" >/dev/null 2>&1 </dev/null
+            timeout -k 2 "${CLEANUP_TIMEOUT:-20}" "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "$cmd" >/dev/null 2>&1 </dev/null
         else
-            rssh "rm -rf '$remote_tmp'" >/dev/null 2>&1 </dev/null
+            rssh "$cmd" >/dev/null 2>&1 </dev/null
         fi
         ;;
     esac
@@ -252,6 +262,26 @@ if [ "$pak_rc" != 0 ] && [ "${PAK_MISMATCH:-warn}" = fail ]; then
     finish 3 "the pak on the device is not the one under test (PAK_MISMATCH=fail)"
 fi
 
+# device_kit <limit s> <command>: runs a command of the reboot tests' device kit (tests/helpers/reboot-device.bash
+# with e2e.bash and devconfig.bash, from the test bundle on the device) after rb_init; bounded, best effort.
+# shellcheck disable=SC2317 # called below
+device_kit() {
+    local cmd kit v env=""
+    kit="$remote_tmp/tests/helpers/e2e.bash $remote_tmp/tests/helpers/devconfig.bash $remote_tmp/tests/helpers/reboot-device.bash"
+    for v in KEEPAWAKE_INTERVAL KEEPAWAKE_KEY RB_KEEPAWAKE_EVERY RB_KEEPAWAKE_MAX POWER_DEV_NAME SLEEP_PROBE; do
+        [ -z "${!v+x}" ] || env="$env $v=$(q "${!v}")"
+    done
+    cmd="cd '$remote_tmp' && PLATFORM=$(q "$platform") PAK_NAME=$(q "$pak_name") SD=$(q "$sd") RB_KIT_SOURCES=$(q "$kit")$env bash -c $(q "for f in \$RB_KIT_SOURCES; do . \"\$f\" || exit 97; done; rb_init && $2")"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -k 2 "$1" "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "$cmd" </dev/null
+    else
+        rssh "$cmd" </dev/null
+    fi
+}
+
+# The keep-awake loop for the whole run (see the header): started before the tests, kept across the hand-off.
+echo "== $platform: $(device_kit 20 'rb_tick >/dev/null; rb_keepawake_start' 2>&1 | redact | tail -n 1)"
+
 echo "== $platform: running the device tests"
 # shellcheck disable=SC2317 # called through run_step
 run_tests() {
@@ -262,27 +292,16 @@ run_tests() {
 run_step /dev/null run_tests
 rc=$?
 
-# The reboot tests follow: a keep-awake tap NOW (best effort, bounded), with the kit of the test bundle that
-# is still on the device. The last on-device tests send no input, so the device has been idle at the NextUI
-# menu for a while, and NextUI suspends it after its idle time (minuisettings.txt: screentimeout, then
-# suspendTimeout), which would drop the reboot tests' first ssh calls. reboot.bats taps again (and keeps the
-# device awake) from its first call on; this covers the time in between (fetching the results, the start).
-# shellcheck disable=SC2317 # called below
-wake_device() {
-    local cmd
-    cmd="cd '$remote_tmp' && PLATFORM=$(q "$platform") PAK_NAME=$(q "$pak_name") SD=$(q "$sd") bash -c '. tests/helpers/e2e.bash && . tests/helpers/devconfig.bash && . tests/helpers/reboot-device.bash && rb_init && rb_tick' >/dev/null 2>&1"
-    if command -v timeout >/dev/null 2>&1; then
-        timeout -k 2 20 "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "$cmd" >/dev/null 2>&1 </dev/null
-    else
-        rssh "$cmd" >/dev/null 2>&1 </dev/null
-    fi
-}
+# The reboot tests follow: the keep-awake loop is still running (the reboot tests keep it); its deadline is
+# moved and a tap is sent now (best effort), and its log of the on-device run is kept.
 case "${SKIP_REBOOT_TESTS:-}" in "" | 0)
     if [ "$rc" -le 1 ]; then
-        wake_device || echo "== $platform: (the keep-awake tap before the reboot tests did not go through; they tap again themselves)"
+        device_kit 20 'rb_tick >/dev/null; rb_keepawake_start' >/dev/null 2>&1 || echo "== $platform: (the keep-awake loop could not be checked before the reboot tests; they start it themselves)"
     fi
     ;;
 esac
+# shellcheck disable=SC2016 # runs on the device
+device_kit 20 'cat "$RB_TMP/psp-keepawake.log"' 2>/dev/null | redact >"$stage/keepawake-ondevice.log" || true
 
 # shellcheck disable=SC2317 # called through run_step
 fetch_results() {

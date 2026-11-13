@@ -340,7 +340,12 @@ make_device() {
     assert_output --partial "last poll: ping=n/a port=ok; new boot_id: no; it answers with the SAME boot id"
 }
 
-@test "await_reboot: unreachable (ssh failed too), then the SAME boot id for RB_SAME_ID_GRACE s: ends at once with 'asleep or unreachable, not rebooted' (no wait for the backup)" {
+@test "await_reboot: unreachable (ssh failed too), then the SAME boot id for RB_SAME_ID_GRACE s: ends at once with 'not rebooted' and the suspend counter's verdict (no wait for the backup)" {
+    dev_install_kit
+    export RB_SUSPEND_LEDGER="$T/ledger" RB_SUSPEND_STATS="$T/s"
+    echo 7 >"$T/s"
+    rb_suspend_record "before the reboot request"
+    echo 0 >"$FAKE_SSH_STATE"
     # the port is closed for the down poll and three up polls; the 3rd up poll asks ssh, which fails (asleep)
     export FAKE_PORT_DOWN_FROM=1 FAKE_PORT_DOWN_TO=4 FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=1 REBOOT_DOWN_TIMEOUT=10 REBOOT_UP_TIMEOUT=60 RB_SAME_ID_GRACE=1
     local start=$SECONDS
@@ -348,7 +353,7 @@ make_device() {
     assert_failure
     [ $((SECONDS - start)) -lt 20 ]
     assert_output --partial "reboot: NOT rebooted: the device was unreachable"
-    assert_output --partial "asleep (idle suspend) or the network dropped"
+    assert_output --partial "the reboot did not happen; the device did not suspend (suspend counter, sysfs: 7, unchanged since"
     run cat "$T/timings.txt"
     assert_output --partial "ssh answers with the SAME boot id (since"
 }
@@ -1940,28 +1945,6 @@ two"
     assert_success
 }
 
-@test "rb_stop_backup: stops the shell of a backup that still runs (its children finish), and nothing else" {
-    run rb_stop_backup 2
-    assert_success # nothing runs
-    bash -c 'sleep 30 & wait' &
-    local pid=$!
-    sleep 0.2
-    mkdir "$(rb_lock_dir)" && echo "$pid backup" >"$(rb_lock_dir)/pid"
-    run rb_stop_backup 1
-    # the shell is gone; its sleep child is not killed (it would finish by itself), so the wait times out here
-    if kill -0 "$pid" 2>/dev/null; then fail "the backup's shell still runs"; fi
-    pkill -P "$pid" 2>/dev/null || true
-    # a restore that holds the lock is never stopped
-    bash -c 'sleep 3' &
-    pid=$!
-    rm -rf "$(rb_lock_dir)"
-    mkdir "$(rb_lock_dir)" && echo "$pid restore" >"$(rb_lock_dir)/pid"
-    run rb_stop_backup 1
-    assert_failure
-    assert_output --partial "not a backup"
-    kill "$pid" 2>/dev/null || true
-}
-
 @test "rb_idle_settings: only screentimeout and suspendTimeout from minuisettings.txt (never the credentials)" {
     printf 'font=1\r\nscreentimeout=60\r\nraPassword=secret\r\nsuspendTimeout=30\r\nraToken=tok\r\n' >"$SHARED/minuisettings.txt"
     run rb_idle_settings
@@ -1971,90 +1954,7 @@ two"
     assert_output ""
 }
 
-@test "rb_unreachable_note: ssh dropped and no ping: probably ASLEEP, the idle times, press the power button; ping answers: not asleep" {
-    export RB_IDLE_INFO="screentimeout=60 suspendTimeout=30"
-    RB_PING_PROBE="return 1" run rb_unreachable_note 255
-    assert_output --partial "does not answer ping"
-    assert_output --partial "probably ASLEEP"
-    assert_output --partial "screentimeout=60 s"
-    assert_output --partial "suspendTimeout=30 s later, about 90 s"
-    assert_output --partial "Press the power button"
-    RB_PING_PROBE="return 0" run rb_unreachable_note 255
-    assert_output --partial "answers ping"
-    assert_output --partial "not asleep"
-    RB_PING_PROBE="return 2" RB_IDLE_INFO="" run rb_unreachable_note 124
-    assert_output --partial "ping cannot be used"
-    assert_output --partial "screentimeout, suspendTimeout"
-    run rb_unreachable_note 1
-    assert_output ""
-}
-
-@test "dev_definite: an unreachable device's message says it is probably asleep when ping fails too" {
-    export FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=999 RB_DEFINITE_TRIES=2 RB_PING_PROBE="return 1"
-    run dev_definite 5 true
-    assert_failure 2
-    assert_output --partial "probably ASLEEP"
-}
-
-@test "rb_backup_call: the connection drops during the backup: explained, the device answers again, retried ONCE and done" {
-    seed_files
-    dev_install_kit
-    export RB_PING_PROBE="return 1" RB_BACKUP_RETRY_WAIT=10
-    # the first backup's process outlives its dropped connection (here: a process holding the lock)
-    bash -c 'sleep 30' &
-    local first=$!
-    mkdir -p "$RB_TMP" && mkdir "$(rb_lock_dir)" && echo "$first backup" >"$(rb_lock_dir)/pid"
-    # ssh call 2 (the backup) and 3 (the first 'answers again?' probe) fail
-    echo 1 >"$FAKE_SSH_STATE"
-    export FAKE_SSH_DOWN_FROM=2 FAKE_SSH_DOWN_TO=3
-    run rb_backup_call 60 "$T/backup.out"
-    assert_success
-    run cat "$T/backup.out"
-    assert_output --partial "dropped during the backup"
-    assert_output --partial "probably ASLEEP"
-    assert_output --partial "retrying the backup once"
-    assert_file_exist "$BAK/active"
-    [ "$(grep -c 'rb_awake rb_backup' "$FAKE_SSH_LOG")" = 2 ]
-    grep -q 'rb_stop_backup' "$FAKE_SSH_LOG" # a first backup that still runs is stopped before the retry
-    if kill -0 "$first" 2>/dev/null; then fail "the first backup still runs"; fi
-    grep -q "stopping the backup that still runs (pid $first)" "$T/backup.out"
-    assert_file_not_exist "$(rb_lock_dir)"
-    # and the backup is good: a restore puts everything back
-    mess_up
-    rb_restore
-    run cat "$RECENT"
-    assert_output "/Roms/other.iso"
-}
-
-@test "rb_backup_call: a device that stays unreachable is not retried (bounded wait) and the reason is given" {
-    seed_files
-    dev_install_kit
-    export RB_PING_PROBE="return 1" RB_BACKUP_RETRY_WAIT=1 FAKE_SSH_DOWN_FROM=2 FAKE_SSH_DOWN_TO=999
-    echo 1 >"$FAKE_SSH_STATE"
-    local start=$SECONDS
-    run rb_backup_call 60 "$T/backup.out"
-    assert_failure 255
-    [ $((SECONDS - start)) -le 8 ]
-    run cat "$T/backup.out"
-    assert_output --partial "probably ASLEEP"
-    assert_output --partial "Press the power button"
-    assert_output --partial "not retried"
-    [ "$(grep -c 'rb_awake rb_backup' "$FAKE_SSH_LOG")" = 1 ]
-}
-
-@test "rb_backup_call: other failures (the backup itself failed) are not retried" {
-    dev_install_kit
-    printf '[ControlMapping]\nSelect = 10-196\n' >"$CONTROLS" # no Save State, no Exit App
-    unset SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS
-    export SET_HOTKEYS=0
-    run rb_backup_call 60 "$T/backup.out"
-    assert_failure 1
-    [ "$(grep -c 'rb_awake rb_backup' "$FAKE_SSH_LOG")" = 1 ]
-    run cat "$T/backup.out"
-    refute_output --partial "retrying"
-}
-
-@test "a backup cut short while it copies the save states leaves no truncated copy; the retry restores nothing wrong" {
+@test "a backup cut short while it copies the save states leaves no truncated copy; the next backup restores nothing wrong" {
     seed_files
     printf 'AAAAAAAAAA' >"$STATE_DIR/A_1.00_0.ppst"
     printf 'BBBBBBBBBB' >"$STATE_DIR/B_1.00_1.ppst"
@@ -2082,27 +1982,304 @@ two"
     assert_output "BBBBBBBBBB"
 }
 
-@test "reboot.bats: a wake tap right after the kit install in setup_file; the backup, preflight, settle, restore and game start run under rb_awake" {
-    local f="$TESTS_DIR/bats/reboot.bats" kit tick
+@test "reboot.bats: a wake tap and the keep-awake loop right after the kit install; preflight, backup, clean start and restore run as detached jobs" {
+    local f="$TESTS_DIR/bats/reboot.bats" kit tick loop
     kit="$(grep -n 'dev_install_kit || fail' "$f" | head -n 1 | cut -d: -f1)"
     tick="$(grep -n 'dev_kit 15 rb_tick' "$f" | head -n 1 | cut -d: -f1)"
-    [ -n "$tick" ] && [ "$tick" -gt "$kit" ]
-    [ "$(grep -n 'rb_discover' "$f" | head -n 1 | cut -d: -f1)" -gt "$tick" ]
-    grep -q 'rb_backup_call' "$f"
-    grep -q '"rb_awake rb_preflight"' "$f"
-    grep -q '"rb_awake rb_settle"' "$f"
-    grep -q 'rb_awake rb_restore' "$f"
+    loop="$(grep -n 'rb_keepawake_start' "$f" | head -n 1 | cut -d: -f1)"
+    [ -n "$tick" ] && [ "$tick" -gt "$kit" ] && [ "$loop" -gt "$tick" ]
+    [ "$(grep -n 'rb_discover' "$f" | head -n 1 | cut -d: -f1)" -gt "$loop" ]
+    grep -q 'rb_job 120 preflight rb_preflight' "$f"
+    grep -q 'backup rb_backup >"$OUT/hotkeys.txt"' "$f"
+    grep -q 'rb_job 300 "clean start" rb_settle' "$f"
+    grep -q 'rb_job 400 restore' "$f"
+    grep -q 'rb_suspend_record "start of the reboot suite"' "$f"
+    grep -q 'rb_suspend_total' "$f"
+    grep -q 'rb_keepawake_stop' "$f"
     grep -q "rb_awake 'rb_settle; rb_ini_set" "$f"
-    grep -q 'dev_kit "$limit" "rb_awake rb_backup"' "$HELPERS/reboot.bash"
+    grep -q 'rb_awake "$(cat "$d/script")"' "$HELPERS/reboot-device.bash" # every job runs under rb_awake
+    run grep -c 'rb_backup_call\|probably ASLEEP' "$f" "$HELPERS/reboot.bash"
+    refute_output --partial ":1"
 }
 
-@test "run-device.sh: a keep-awake tap right after the on-device tests, before the reboot tests (not when they are skipped)" {
-    local f="$TESTS_DIR/run-device.sh" tap tests reboot
+@test "run-device.sh: the keep-awake loop starts before the on-device tests, is kept (not stopped) for the reboot tests, and is stopped at the end" {
+    local f="$TESTS_DIR/run-device.sh" start tests keep reboot
+    start="$(grep -n "^echo .*rb_keepawake_start" "$f" | cut -d: -f1)"
     tests="$(grep -n '^run_step /dev/null run_tests' "$f" | cut -d: -f1)"
-    tap="$(grep -n '^        wake_device' "$f" | cut -d: -f1)"
+    keep="$(grep -n "device_kit 20 'rb_tick >/dev/null; rb_keepawake_start' >/dev/null" "$f" | cut -d: -f1)"
     reboot="$(grep -n 'run_step /dev/null run_reboot' "$f" | cut -d: -f1)"
-    [ "$tests" -lt "$tap" ] && [ "$tap" -lt "$reboot" ]
-    grep -q "rb_init && rb_tick" "$f"
+    [ -n "$start" ] && [ "$start" -lt "$tests" ] && [ "$tests" -lt "$keep" ] && [ "$keep" -lt "$reboot" ]
+    run grep -c 'rb_keepawake_stop' "$f"
+    assert_output 0 # not stopped between the suites; reboot.bats stops it, cleanup() too:
+    grep -q 'kill -TERM .*psp-keepawake.pid\|psp-keepawake.pid.*kill -TERM' "$f"
+    grep -q 'keepawake-ondevice.log' "$f"
+}
+
+# --- detached jobs, the suspend counter, the screen-off state, the keep-awake loop -------------
+# job_env: what a job test needs: the kit on the "device", a ledger and a suspend counter.
+job_env() {
+    dev_install_kit
+    export RB_SUSPEND_LEDGER="$T/ledger" RB_SUSPEND_STATS="$T/suspend_success" RB_DEFINITE_TRIES=3
+    echo 3 >"$RB_SUSPEND_STATS"
+    rb_suspend_record "start"
+}
+# fail_next <from> <to>: the fake ssh calls from <from> to <to> after the ones made so far fail (255).
+fail_next() {
+    local c
+    c="$(cat "$FAKE_SSH_STATE")"
+    export FAKE_SSH_DOWN_FROM=$((c + $1)) FAKE_SSH_DOWN_TO=$((c + $2))
+}
+
+@test "rb_job: runs detached and is polled; ssh failures in the middle (a Wi-Fi drop) only cost polls; the drop is explained: no suspend, the network" {
+    job_env
+    export RB_PING_PROBE="return 1"
+    fail_next 3 6 # the start (1) and the first poll (2) go through, polls 3..6 fail while the job runs on
+    run rb_job 30 backup 'echo begin; sleep 2; echo "done copying"; echo note >&2'
+    assert_success
+    assert_output --partial "begin"
+    assert_output --partial "done copying"
+    assert_output --partial "note"
+    [ "$(grep -c 'rb_job_start' "$FAKE_SSH_LOG")" = 1 ]
+    grep -q 'job backup: poll failed (status 255), polling on' "$T/timings.txt"
+    run grep 'dropped for' "$T/timings.txt"
+    assert_output --partial "4 poll(s) failed); the job went on on the device: the device did not suspend"
+    assert_output --partial "the network dropped (Wi-Fi), ping lost too"
+    refute_output --partial "ASLEEP"
+    # nothing left on the device
+    run find "$RB_TMP/psp-test-jobs" -mindepth 1
+    assert_output ""
+}
+
+@test "rb_job: a device that suspended during the drop: said so, and that the keep-awake did not prevent it" {
+    job_env
+    export RB_IDLE_INFO="screentimeout=60 suspendTimeout=30"
+    fail_next 3 5
+    run rb_job 30 backup 'echo 4 >"$RB_SUSPEND_STATS"; sleep 2'
+    assert_success
+    run grep 'dropped for' "$T/timings.txt"
+    assert_output --partial "the device SUSPENDED 1 time(s) since"
+    assert_output --partial "(suspend counter, sysfs: 3 -> 4)"
+    assert_output --partial "the keep-awake did not prevent it"
+    assert_output --partial "screentimeout=60 s"
+}
+
+@test "rb_job: the job's exit status is the result; a job that dies without a status is a failure; the start is idempotent" {
+    job_env
+    run rb_job 30 work 'echo out; echo err >&2; return 7'
+    assert_failure 7
+    assert_output --partial "out"
+    assert_output --partial "err"
+    run rb_job 30 work 'kill -9 ${BASHPID:-$$}'
+    assert_failure 1
+    assert_output --partial "ended without a status"
+    # a start sent twice (its first answer lost) starts the job once
+    rb_job_start same-id 'echo x >>"$RB_TMP/runs"; sleep 0.5'
+    rb_job_start same-id 'echo x >>"$RB_TMP/runs"; sleep 0.5'
+    local n=0
+    until [ -f "$RB_TMP/psp-test-jobs/same-id/status" ] || [ "$n" -ge 50 ]; do sleep 0.1; n=$((n + 1)); done
+    run cat "$RB_TMP/runs"
+    assert_output "x"
+    run rb_job_poll same-id
+    assert_success
+    assert_line --index 0 0
+}
+
+@test "rb_job: a host that gives up leaves the job running with its lock: a restore waits for it and refuses next to it, then works" {
+    job_env
+    seed_files
+    run rb_job 1 backup 'rb_lock backup 0; sleep 4; rb_unlock'
+    assert_failure 124
+    assert_output --partial "still runs on the device after 1s"
+    assert_output --partial "keeps the lock"
+    run rb_lock_holder
+    assert_output --partial " backup"
+    mkdir -p "$BAK" && echo id >"$BAK/active"
+    RB_LOCK_WAIT=1 run rb_restore
+    assert_failure
+    assert_output --partial "NOT restored"
+    assert_file_exist "$BAK/active"
+    RB_LOCK_WAIT=20 run rb_restore # waits for the job to end, then restores
+    assert_success
+    assert_file_not_exist "$BAK/active"
+}
+
+@test "rb_job: a device that stays unreachable until the limit: 255, unreachable (Wi-Fi drop or sleep), no guess" {
+    job_env
+    export RB_PING_PROBE="return 1"
+    fail_next 2 999
+    run rb_job 1 backup 'sleep 2'
+    assert_failure 255
+    assert_output --partial "unreachable (Wi-Fi drop or sleep; a suspend counter will tell once it answers); ping lost too"
+    refute_output --partial "ASLEEP"
+}
+
+@test "rb_unreachable_note: never claims sleep from ping (a flaky Wi-Fi loses ping while ssh works); only for ssh failures and cut calls" {
+    RB_PING_PROBE="return 1" run rb_unreachable_note 255
+    assert_output "the device does not answer (ssh status 255): unreachable (Wi-Fi drop or sleep; a suspend counter will tell once it answers); ping lost too"
+    RB_PING_PROBE="return 0" run rb_unreachable_note 124
+    assert_output --partial "ping still answers"
+    RB_PING_PROBE="return 2" run rb_unreachable_note 255
+    refute_output --partial "ping"
+    run rb_unreachable_note 1
+    assert_output ""
+}
+
+@test "rb_suspend_count: sysfs, else debugfs, else the dmesg lines; none: fails" {
+    echo 5 >"$T/s"
+    RB_SUSPEND_STATS="$T/s" run rb_suspend_count
+    assert_output "5 sysfs"
+    printf 'success: 2\nfail: 0\n' >"$T/d"
+    RB_SUSPEND_STATS="$T/none" RB_SUSPEND_DEBUGFS="$T/d" run rb_suspend_count
+    assert_output "2 debugfs"
+    printf '#!/bin/sh\nprintf "[1.0] boot\\n[9.0] PM: suspend entry 2026-11-13\\n[9.5] PM: suspend exit\\n[20.0] PM: suspend entry 2026-11-13\\n"\n' >"$T/bin/dmesg"
+    chmod +x "$T/bin/dmesg"
+    RB_SUSPEND_STATS="$T/none" RB_SUSPEND_DEBUGFS="$T/none" run rb_suspend_count
+    assert_output "2 dmesg"
+    printf '#!/bin/sh\nexit 1\n' >"$T/bin/dmesg"
+    RB_SUSPEND_STATS="$T/none" RB_SUSPEND_DEBUGFS="$T/none" run rb_suspend_count
+    assert_failure
+    RB_SUSPEND_STATS="$T/none" RB_SUSPEND_DEBUGFS="$T/none" run rb_power_info
+    assert_output "oldboot - none"
+}
+
+@test "rb_suspend_verdict / rb_suspend_total: per boot id; a reboot, a missing counter and a counter that went down are said as such" {
+    dev_install_kit
+    export RB_SUSPEND_LEDGER="$T/ledger" RB_SUSPEND_STATS="$T/s"
+    echo 0 >"$T/s"
+    rb_suspend_record start
+    run rb_suspend_verdict
+    assert_output --partial "did not suspend"
+    echo 2 >"$T/s"
+    run rb_suspend_verdict "ping still answers"
+    assert_output --partial "SUSPENDED 2 time(s)"
+    echo newboot >"$BOOT_ID_FILE"
+    echo 1 >"$T/s"
+    run rb_suspend_verdict
+    assert_output --partial "REBOOTED"
+    # the total: the first boot 0 -> 2, the second boot 1 (since its boot)
+    run rb_suspend_total
+    assert_output --partial "SUSPENDED 3 time(s) during the run (2 boot(s))"
+    printf '10:00:00 b1 4 sysfs start\n10:05:00 b1 4 sysfs end\n' >"$T/ledger2"
+    RB_SUSPEND_LEDGER="$T/ledger2" run rb_suspend_total
+    assert_output --partial "did not suspend during the run (1 boot(s)): the keep-awake worked"
+    printf '10:00:00 b1 - none start\n' >"$T/ledger3"
+    RB_SUSPEND_LEDGER="$T/ledger3" run rb_suspend_total
+    assert_output --partial "has none"
+    printf '10:00:00 b1 9 dmesg start\n10:05:00 b1 2 dmesg end\n' >"$T/ledger4"
+    RB_SUSPEND_LEDGER="$T/ledger4" run rb_suspend_total
+    assert_output --partial "went down"
+    # no counter on the device: said, not guessed
+    rm -f "$T/s"
+    printf '#!/bin/sh\nexit 1\n' >"$T/bin/dmesg"
+    chmod +x "$T/bin/dmesg"
+    RB_SUSPEND_DEBUGFS="$T/none" run rb_suspend_verdict "ping lost too"
+    assert_output --partial "no suspend counter"
+    assert_output --partial "cannot be told from a network drop (ping lost too)"
+    # unreachable: no verdict yet
+    FAKE_SSH_DOWN_FROM=1 FAKE_SSH_DOWN_TO=9999 run rb_suspend_verdict
+    assert_output --partial "still unreachable (Wi-Fi drop or sleep"
+}
+
+@test "rb_asleep: NextUI's screen-off state (keymon.elf stopped) counts; a running keymon does not; the screen state is logged at every tick" {
+    export RB_BACKLIGHT_DIR="$T/bl" RB_FB_DIR="$T/fb"
+    mkdir -p "$T/bl/backlight0" "$T/fb"
+    echo 0 >"$T/bl/backlight0/bl_power"
+    echo 50 >"$T/bl/backlight0/brightness"
+    echo 0 >"$T/fb/blank"
+    echo '123 (keymon.elf) S 1 123 123 0' >"$T/keymon.stat"
+    export RB_KEYMON_STAT="$T/keymon.stat"
+    run rb_asleep
+    assert_failure
+    run rb_screen_state
+    assert_output "keymon=S backlight0:bl_power=0,brightness=50 fb0_blank=0"
+    echo '123 (keymon.elf) T 1 123 123 0' >"$T/keymon.stat"
+    run rb_asleep
+    assert_success
+    # a tick on an off screen tries the power key (none here) and logs what it saw
+    POWER_DEV_NAME='nonexistent-device' run rb_tick
+    assert_output --partial "keymon=T"
+    assert_output --partial "SCREEN OFF: power tap"
+    grep -q 'SCREEN OFF' "$RB_TMP/psp-keepawake.log"
+    # no keymon at all: not asleep (no guess)
+    : >"$T/keymon.stat"
+    run rb_asleep
+    assert_failure
+}
+
+@test "rb_wake: one power tap at a time on the device: a second one right after is skipped (a woken screen is never put back to sleep)" {
+    mkdir -p "$T/proc"
+    pad() { echo "$*" >>"$T/keys"; }
+    awk() { echo "$T/pwr"; }
+    mknod "$T/pwr" c 1 3 2>/dev/null || skip "cannot make a character device here"
+    rb_wake &
+    sleep 0.3
+    rb_wake
+    wait
+    [ "$(grep -c '116 1' "$T/keys")" = 1 ]
+}
+
+@test "keep-awake loop: one per device (a second start keeps it), taps at its interval, ends cooperatively on stop or at its deadline" {
+    export RB_KIT_SOURCES="" KEEPAWAKE_INTERVAL=3 RB_KEEPAWAKE_EVERY=1
+    rb_tick() { echo t >>"$T/ticks"; }
+    run rb_keepawake_start 30
+    assert_output --partial "started"
+    sleep 0.5
+    local p
+    p="$(rb_keepawake_pid)"
+    [ -n "$p" ]
+    run rb_keepawake_start 30
+    assert_output --partial "already running (pid $p)"
+    sleep 2.2
+    [ "$(wc -l <"$T/ticks")" -ge 2 ]
+    run rb_keepawake_stop
+    assert_success
+    if kill -0 "$p" 2>/dev/null; then fail "the loop still runs"; fi
+    grep -q "keep-awake loop $p: stopped" "$RB_TMP/psp-keepawake.log"
+    # the deadline ends it by itself
+    rb_keepawake_start 1 >/dev/null
+    sleep 0.5
+    p="$(rb_keepawake_pid)"
+    [ -n "$p" ]
+    local n=0
+    while kill -0 "$p" 2>/dev/null && [ "$n" -lt 40 ]; do sleep 0.1; n=$((n + 1)); done
+    if kill -0 "$p" 2>/dev/null; then fail "the loop did not end at its deadline"; fi
+    grep -q "keep-awake loop $p: deadline reached" "$RB_TMP/psp-keepawake.log"
+    # off
+    KEEPAWAKE_INTERVAL=0 run rb_keepawake_start
+    assert_output --partial "off"
+}
+
+@test "rb_keepawake_every: a third of NextUI's screentimeout, 3..20 s, 10 s when unknown, RB_KEEPAWAKE_EVERY wins" {
+    printf 'screentimeout=60\r\n' >"$SHARED/minuisettings.txt"
+    run rb_keepawake_every
+    assert_output 20
+    printf 'screentimeout=15\n' >"$SHARED/minuisettings.txt"
+    run rb_keepawake_every
+    assert_output 5
+    printf 'screentimeout=0\n' >"$SHARED/minuisettings.txt"
+    run rb_keepawake_every
+    assert_output 10
+    RB_KEEPAWAKE_EVERY=2 run rb_keepawake_every
+    assert_output 2
+}
+
+@test "ssh: a call allowed more than 30 s survives 40 s without packets (ServerAliveCountMax 8, in front: ssh takes the first value); a short call keeps 15 s" {
+    rb_ssh_cmd 60
+    [ "${RB_SSH_CALL[1]}" = -o ] && [ "${RB_SSH_CALL[2]}" = ServerAliveCountMax=8 ]
+    rb_ssh_cmd 10
+    [ "${RB_SSH_CALL[*]}" = "${RB_SSH[*]}" ]
+    printf '%s\n' "${RB_SSH[@]}" | grep -qx 'ServerAliveCountMax=3'
+}
+
+@test "the host's keep-awake steps trace what the device answered (the screen state and the tap)" {
+    dev_install_kit
+    export KEEPAWAKE_INTERVAL=1 RB_KEYMON_STAT="$T/keymon.stat"
+    echo '123 (keymon.elf) S 1' >"$T/keymon.stat"
+    # shellcheck disable=SC2034 # read by rb_keepawake_maybe
+    RB_LAST_TICK=""
+    rb_keepawake_maybe
+    wait "$RB_TICK_PID"
+    grep -q 'keep-awake tick: keymon=S' "$T/timings.txt"
 }
 
 # --- e2e: waits on signals with a short poll step, and their timing lines --------------------
