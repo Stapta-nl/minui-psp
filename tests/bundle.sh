@@ -21,14 +21,22 @@ mkdir -p "$stage"
 
 sh tests/collect.sh tests/collectors/host.list "$stage/host"
 
+# The TAP files: the run's own and, for a device, the tests that reboot it (run from the host,
+# see run-reboot.sh).
 tap="$stage/output.tap"
+taps=""
+for t in "$tap" "$stage/reboot/output.tap"; do
+    [ -f "$t" ] && taps="$taps $t"
+done
 passed=0 failed=0 skipped=0
-if [ -f "$tap" ]; then
-    passed="$(grep -c '^ok .*' "$tap" | tr -d ' ')"
-    skipped="$(grep -c '^ok .* # skip' "$tap" | tr -d ' ')"
-    failed="$(grep -c '^not ok ' "$tap" | tr -d ' ')"
-    passed=$((passed - skipped))
-fi
+for t in $taps; do
+    p="$(grep -c '^ok .*' "$t" | tr -d ' ')"
+    s="$(grep -c '^ok .* # skip' "$t" | tr -d ' ')"
+    f="$(grep -c '^not ok ' "$t" | tr -d ' ')"
+    passed=$((passed + p - s))
+    skipped=$((skipped + s))
+    failed=$((failed + f))
+done
 if [ -s "$stage/interrupted.txt" ]; then
     verdict="INTERRUPTED"
 elif [ "$status" = 0 ]; then
@@ -56,6 +64,15 @@ bundle="dist/test-report-$target-$ts.tar.gz"
     echo "| Started | ${TEST_STARTED:-unknown} |"
     echo "| Finished | ${TEST_FINISHED:-unknown} |"
     echo "| Debug bundle | \`$(basename "$bundle")\` |"
+    [ -s "$stage/pak/check.txt" ] && echo "| Pak under test | $(head -n 1 "$stage/pak/check.txt" | sed -e 's/^Pak under test: //' -e 's/|/\\|/g') |"
+    if grep -q '^WARNING' "$stage/pak/check.txt" 2>/dev/null; then
+        echo
+        echo "### WARNING: the pak on the device is not the pak under test"
+        echo
+        echo '```'
+        cat "$stage/pak/check.txt"
+        echo '```'
+    fi
     if [ -s "$stage/error.txt" ]; then
         echo
         echo "### Error"
@@ -63,7 +80,7 @@ bundle="dist/test-report-$target-$ts.tar.gz"
         echo '```'
         cat "$stage/error.txt"
         echo '```'
-    elif [ ! -f "$tap" ]; then
+    elif [ -z "$taps" ]; then
         echo
         echo "No test results were produced."
     fi
@@ -72,6 +89,7 @@ bundle="dist/test-report-$target-$ts.tar.gz"
         echo "### Failed tests"
         echo
         # each failed test with the diagnostics bats printed (lines starting with "# ")
+        # shellcheck disable=SC2086 # $taps: paths without spaces, one or two files
         awk '
             function close_block() { if (open) print "  ```"; open = 0 }
             /^not ok / {
@@ -88,7 +106,7 @@ bundle="dist/test-report-$target-$ts.tar.gz"
             /^(ok |1\.\.)/ { close_block(); next }
             open && /^# / { line = $0; sub(/^# /, "", line); print "  " line }
             END { close_block() }
-        ' "$tap"
+        ' $taps
     fi
     # bats' own errors (e.g. a missing tool) explain a failed run without failed tests.
     if [ "$status" != 0 ] && [ "$failed" = 0 ] && [ -s "$stage/stderr.log" ]; then

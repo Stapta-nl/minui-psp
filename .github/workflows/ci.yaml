@@ -17,8 +17,21 @@ permissions:
   checks: write
 
 jobs:
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      # lint and the auto-resume test; the full suite (bats, incl. the poweroff shim; aarch64 jpg2bmp) runs in build.
+      - name: Run shell tests
+        run: make test-shell
+
   build:
     name: build
+    needs: test
     runs-on: ubuntu-24.04-arm
 
     steps:
@@ -92,6 +105,29 @@ jobs:
           if [ -f dist/test-out/host/summary.md ]; then
             cat dist/test-out/host/summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      # Runs the real launch.sh against a stub PPSSPP: power-off handshake, auto-resume marker, state file.
+      - name: Test auto-resume at power-off (dash)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: SRC_PAK="$RUNNER_TEMP/rel" OUT_DIR="$RUNNER_TEMP/test-out/autoresume-dash" sh tests/autoresume.sh
+
+      - name: Test auto-resume at power-off (BusyBox)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: |
+          # --privileged: launch.sh bind-mounts SAVEDATA/state, which needs CAP_SYS_ADMIN.
+          docker run --rm --privileged -v "$PWD:/repo:ro" -v "$RUNNER_TEMP:$RUNNER_TEMP" \
+            -e SRC_PAK="$RUNNER_TEMP/rel" -e OUT_DIR="$RUNNER_TEMP/test-out/autoresume-busybox" \
+            busybox:1.36.1 sh /repo/tests/autoresume.sh
+
+      - name: Upload auto-resume test logs
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: autoresume-test-logs
+          path: ${{ runner.temp }}/test-out
+          if-no-files-found: ignore
 
       - name: Upload test debug bundle
         if: always()

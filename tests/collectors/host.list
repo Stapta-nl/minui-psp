@@ -7,5 +7,5 @@ timestamps.txt | echo "started:  ${TEST_STARTED:-unknown}"; echo "finished: ${TE
 host-uname.txt | uname -srvm
 make-vars.txt | for v in ${MAKE_VARS:-}; do echo "$v"; done
 test-target.txt | echo "${TEST_TARGET_INFO:-host run (no device)}"
-env-overrides.txt | for v in SRC_PAK RELEASE_ZIP JPG2BMP PLATFORM OUT_DIR KEEP LAUNCH_SHELL TMP_ROOT PSP_KEYS EXIT_KEYS BOOT_WAIT UI_WAIT KEY_GAP SDCARD_PATH ROM_DIR ROM; do eval "if [ -n \"\${$v+x}\" ]; then echo \"$v=\${$v}\"; fi"; done
+env-overrides.txt | for v in PAK_MISMATCH SET_HOTKEYS SAVE_KEYS NEXT_SLOT_KEYS SRC_PAK RELEASE_ZIP JPG2BMP PLATFORM OUT_DIR KEEP LAUNCH_SHELL TMP_ROOT PSP_KEYS EXIT_KEYS BOOT_WAIT UI_WAIT BOOT_SETTLE UI_SETTLE NOGAME_WAIT NOGAME_SETTLE REBOOT_DOWN_TIMEOUT REBOOT_UP_TIMEOUT RESUME_TIMEOUT KEEPAWAKE_INTERVAL KEEPAWAKE_KEY POLL_INTERVAL SSH_CONNECT_TIMEOUT RB_PROBE_TIMEOUT RB_PORT_PROBE RB_PING_PROBE RB_TRIGGER_LINGER RB_TRIGGER_TIMEOUT RB_SAME_ID_GRACE RB_SETUP_STEP_TIMEOUT RB_TIMINGS_FILE RB_DEFINITE_TRIES KEY_GAP SDCARD_PATH ROM_DIR ROM; do eval "if [ -n \"\${$v+x}\" ]; then echo \"$v=\${$v}\"; fi"; done
 tool-versions.txt | bash --version | head -n 1; make --version | head -n 1; jq --version; git --version; file --version | head -n 1; shellcheck --version | sed -n 2p; unzip -v | head -n 1; gcc --version | head -n 1; tests/lib/bats-core/bin/bats --version

@@ -21,8 +21,26 @@
 # The pak is expected in Emus/<platform>/<PAK_NAME>.pak; PAK_NAME defaults to "name" in
 # pak.json (PSP) and is passed to the device.
 #
-# Forwarded to the device when set: SDCARD_PATH ROM_DIR ROM PSP_KEYS EXIT_KEYS BOOT_WAIT
-# UI_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT.
+# Host side only: PAK_MISMATCH=fail (default warn).
+# Forwarded to the device when set: SDCARD_PATH ROM_DIR ROM PSP_KEYS SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS BOOT_WAIT
+# UI_WAIT BOOT_SETTLE UI_SETTLE SAVE_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT.
+#
+# Before the tests it compares the installed pak with this checkout (or SRC_PAK) and warns if
+# they differ (tests/pakcheck.sh); PAK_MISMATCH=fail makes that fatal. The result is in the summary.
+#
+# Keep-awake: before the tests a detached keep-awake loop is started on the device (tests/helpers/reboot-device.bash,
+# rb_keepawake_start, from the test bundle): NextUI turns the screen off after its screentimeout without input and
+# suspends the device suspendTimeout later, and several on-device tests send no input for minutes. The loop taps a
+# harmless button (KEEPAWAKE_KEY, l1) every third of screentimeout (RB_KEEPAWAKE_EVERY), wakes a screen that went
+# off anyway is logged loudly (automatic power taps only with RB_POWER_WAKE=1), it runs on across the hand-off to
+# the reboot tests and is stopped (cooperatively) at the end. It has a lease (RB_KEEPAWAKE_LEASE, 600 s) that this
+# script renews every 2 minutes while the on-device tests run (e2e.bats renews it per test too, the reboot tests
+# while they work), so it ends by itself soon after a run that went away. KEEPAWAKE_INTERVAL=0 turns it off. Its
+# log (the screen state at every tick) is keepawake-ondevice.log.
+#
+# Afterwards the tests tagged "reboot" (tests/bats/reboot.bats: they REBOOT the device) run on
+# this machine over ssh, see tests/run-reboot.sh; SKIP_REBOOT_TESTS=1 leaves them out. They
+# only run when the on-device tests passed or failed normally (exit status 0 or 1).
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 2
@@ -102,16 +120,20 @@ redact() {
 
 remote_tmp=""
 run_pid=""
+renew_pid=""
 finishing=0
 # Best-effort removal of the remote temp dir: BatchMode, a connect timeout and an overall
 # timeout (CLEANUP_TIMEOUT, default 20 s), so an interrupted run never hangs on it.
 cleanup() {
+    local cmd
     case "$remote_tmp" in
     /tmp/psp-tests.*)
+        # also the keep-awake loop: SIGTERM, which it handles cooperatively (never in the middle of a tap)
+        cmd="rm -f /tmp/psp-keepawake.until; p=\$(cat /tmp/psp-keepawake.d/pid 2>/dev/null); [ -z \"\$p\" ] || kill -TERM \"\$p\" 2>/dev/null; rm -rf '$remote_tmp'"
         if command -v timeout >/dev/null 2>&1; then
-            timeout -k 2 "${CLEANUP_TIMEOUT:-20}" "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "rm -rf '$remote_tmp'" >/dev/null 2>&1 </dev/null
+            timeout -k 2 "${CLEANUP_TIMEOUT:-20}" "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "$cmd" >/dev/null 2>&1 </dev/null
         else
-            rssh "rm -rf '$remote_tmp'" >/dev/null 2>&1 </dev/null
+            rssh "$cmd" >/dev/null 2>&1 </dev/null
         fi
         ;;
     esac
@@ -125,6 +147,7 @@ finish() {
     finishing=1
     trap '' INT TERM HUP
     trap - EXIT
+    [ -z "$renew_pid" ] || kill "$renew_pid" 2>/dev/null
     if [ -n "${2:-}" ]; then
         printf '%s\n' "$2" | redact >"$stage/error.txt"
         printf 'ERROR %s: %s\n' "$platform" "$2" | redact >&2
@@ -199,9 +222,11 @@ run_step dist/psp-device-tests.tar.gz rssh "cd '$remote_tmp' && gzip -dc | tar -
     finish 3 "copying the test bundle to the device failed"
 
 # Tests tagged platform:<name> run only on that platform; untagged device tests run everywhere.
-# Built from pak.json, so a new platform needs no change here.
-filter_platform="device,platform:$platform"
-filter_generic="device"
+# Built from pak.json, so a new platform needs no change here. Tests tagged "reboot" are left
+# out: they reboot the device, which would end this ssh session and bats with it, so they run
+# on this machine afterwards (tests/run-reboot.sh).
+filter_platform="device,!reboot,platform:$platform"
+filter_generic="device,!reboot"
 while IFS= read -r p; do
     filter_generic="$filter_generic,!platform:$p"
 done < <(jq -r '.platforms[]' pak.json)
@@ -210,11 +235,57 @@ sd="${SDCARD_PATH:-/mnt/SDCARD}"
 pak_name="${PAK_NAME:-$(jq -r '.name // empty' pak.json 2>/dev/null)}"
 pak_name="${pak_name:-PSP}"
 assignments="PLATFORM=$(q "$platform") PAK_NAME=$(q "$pak_name") SRC_PAK=$(q "$sd/Emus/$platform/$pak_name.pak") RESULT_DIR=$(q "$remote_tmp/result") DEVICE_COLLECT=1"
-for v in SDCARD_PATH ROM_DIR ROM PSP_KEYS EXIT_KEYS BOOT_WAIT UI_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT; do
+for v in SDCARD_PATH ROM_DIR ROM PSP_KEYS SAVE_KEYS NEXT_SLOT_KEYS EXIT_KEYS SET_HOTKEYS BOOT_WAIT UI_WAIT BOOT_SETTLE UI_SETTLE SAVE_WAIT KEY_GAP CHORD_HOLD KEEP LAUNCH_SHELL TMP_ROOT; do
     if [ -n "${!v+x}" ]; then
         assignments="$assignments $v=$(q "${!v}")"
     fi
 done
+
+# Which pak is installed? A device that was not updated would make the results about an old
+# pak: say so right away and in the summary. Only a warning (PAK_MISMATCH=fail makes it fatal).
+echo "== $platform: checking which pak is installed"
+mkdir -p "$stage/pak"
+# The list is the collector's stdout, as it is (no redaction: it would corrupt names like
+# PPSSPPSDL_tg5040 when the ssh alias is the platform name; it holds no address). Its stderr and
+# ssh's go to a separate file, redacted.
+rssh "cd '$remote_tmp' && sh tests/collectors/pak-files.sh $(q "$sd/Emus/$platform/$pak_name.pak") $(q "$platform")" </dev/null >"$stage/pak/files.txt" 2>"$stage/pak/collector-stderr.txt"
+collect_rc=$?
+redact <"$stage/pak/collector-stderr.txt" >"$stage/pak/collector-stderr.txt.tmp" && mv "$stage/pak/collector-stderr.txt.tmp" "$stage/pak/collector-stderr.txt"
+pak_rc=1
+if [ "$collect_rc" != 0 ] || ! grep -q '^# algo: ' "$stage/pak/files.txt"; then
+    printf 'WARNING: the installed pak could not be read from the device (status %s: %s). Is it installed in Emus/%s/%s.pak? Nothing was compared.\n' \
+        "$collect_rc" "$({ sed -n "s/^# error: //p" "$stage/pak/files.txt"; head -n 1 "$stage/pak/collector-stderr.txt"; } | head -n 2 | tr "\n" " ")" "$platform" "$pak_name" >"$stage/pak/check.txt"
+else
+    bash tests/pakcheck.sh "$stage/pak/files.txt" >"$stage/pak/check.txt" 2>&1
+    pak_rc=$?
+    if [ "$pak_rc" = 2 ]; then
+        printf 'WARNING: the list of the installed pak could not be compared (%s)\n' "$(head -n 1 "$stage/pak/check.txt")" >"$stage/pak/check.txt"
+    fi
+fi
+cat "$stage/pak/check.txt" >&2
+if [ "$pak_rc" != 0 ] && [ "${PAK_MISMATCH:-warn}" = fail ]; then
+    finish 3 "the pak on the device is not the one under test (PAK_MISMATCH=fail)"
+fi
+
+# device_kit <limit s> <command>: runs a command of the reboot tests' device kit (tests/helpers/reboot-device.bash
+# with e2e.bash and devconfig.bash, from the test bundle on the device) after rb_init; bounded, best effort.
+# shellcheck disable=SC2317 # called below
+device_kit() {
+    local cmd kit v env=""
+    kit="$remote_tmp/tests/helpers/e2e.bash $remote_tmp/tests/helpers/devconfig.bash $remote_tmp/tests/helpers/reboot-device.bash"
+    for v in KEEPAWAKE_INTERVAL KEEPAWAKE_KEY RB_KEEPAWAKE_EVERY RB_KEEPAWAKE_LEASE RB_POWER_WAKE POWER_DEV_NAME SLEEP_PROBE; do
+        [ -z "${!v+x}" ] || env="$env $v=$(q "${!v}")"
+    done
+    cmd="cd '$remote_tmp' && PLATFORM=$(q "$platform") PAK_NAME=$(q "$pak_name") SD=$(q "$sd") RB_KIT_SOURCES=$(q "$kit")$env bash -c $(q "for f in \$RB_KIT_SOURCES; do . \"\$f\" || exit 97; done; rb_init || exit 98; $2")"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -k 2 "$1" "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "$cmd" </dev/null
+    else
+        rssh "$cmd" </dev/null
+    fi
+}
+
+# The keep-awake loop for the whole run (see the header): started before the tests, kept across the hand-off.
+echo "== $platform: $(device_kit 20 'rb_tick >/dev/null; rb_keepawake_start' 2>&1 | redact | tail -n 1)"
 
 echo "== $platform: running the device tests"
 # shellcheck disable=SC2317 # called through run_step
@@ -223,8 +294,32 @@ run_tests() {
         tee "$stage/console.log"
     return "${PIPESTATUS[0]}"
 }
+# renews the keep-awake loop's lease while the tests run (a plain shell command: the kit is not needed)
+renew_lease() {
+    while sleep 120; do
+        if command -v timeout >/dev/null 2>&1; then
+            timeout -k 2 20 "${ssh_base[@]}" ${ssh_extra[@]+"${ssh_extra[@]}"} "$host" "f=/tmp/psp-keepawake.until; [ ! -f \$f ] || echo \$((\$(date +%s) + ${RB_KEEPAWAKE_LEASE:-600})) >\$f" >/dev/null 2>&1 </dev/null
+        fi
+    done
+}
+renew_lease &
+renew_pid=$!
 run_step /dev/null run_tests
 rc=$?
+kill "$renew_pid" 2>/dev/null
+wait "$renew_pid" 2>/dev/null
+renew_pid=""
+
+# The reboot tests follow: the keep-awake loop is still running (the reboot tests keep it); its deadline is
+# moved and a tap is sent now (best effort), and its log of the on-device run is kept.
+case "${SKIP_REBOOT_TESTS:-}" in "" | 0)
+    if [ "$rc" -le 1 ]; then
+        device_kit 20 'rb_tick >/dev/null; rb_keepawake_start' >/dev/null 2>&1 || echo "== $platform: (the keep-awake loop could not be checked before the reboot tests; they start it themselves)"
+    fi
+    ;;
+esac
+# shellcheck disable=SC2016 # runs on the device
+device_kit 20 'cat "$RB_TMP/psp-keepawake.log"' 2>/dev/null | redact >"$stage/keepawake-ondevice.log" || true
 
 # shellcheck disable=SC2317 # called through run_step
 fetch_results() {
@@ -235,4 +330,21 @@ if ! run_step /dev/null fetch_results; then
     finish 3 "fetching the results from the device failed (exit status of the tests: $rc)"
 fi
 [ "$rc" != 255 ] || finish 3 "the ssh connection broke while the tests ran"
+
+# The tests that reboot the device run from here, over ssh, with the same device settings;
+# the test bundle on the device is no longer needed (and /tmp does not survive a reboot).
+reboot_rc=0
+if [ "$rc" -le 1 ]; then
+    export DEVICE_HOST="$host" DEVICE_SSH_OPTS="$opts"
+    # shellcheck disable=SC2317 # called through run_step
+    run_reboot() { bash tests/run-reboot.sh "$platform" "$stage"; }
+    run_step /dev/null run_reboot || reboot_rc=$?
+    # Every text file of the reboot run (console, TAP, JUnit XML, logs, evidence); not images.
+    while IFS= read -r f; do
+        redact <"$f" >"$f.tmp" && mv "$f.tmp" "$f"
+    done < <(find "$stage/reboot" "$stage/reboot-console.log" -type f \( -name '*.log' -o -name '*.tap' -o -name '*.xml' -o -name '*.txt' -o -name '*.shotname' -o -name exit-code \) 2>/dev/null)
+else
+    echo "== $platform: not running the tests that reboot the device (the device tests failed with status $rc)"
+fi
+[ "$rc" -ne 0 ] || rc="$reboot_rc"
 finish "$rc"

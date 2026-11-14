@@ -1,0 +1,108 @@
+#!/bin/sh
+# poweroff shim for the PSP pak.
+#
+# launch.sh puts $PAK_DIR/bin in front of /sbin in PATH, so the `poweroff` that
+# the power button's /tmp/selfgz*/shutdown script runs is this one. It gives
+# PPSSPP time to finish its "Save state on exit" (the shutdown script has just
+# sent it SIGTERM) and launch.sh time to write the auto-resume marker and the
+# Game Switcher preview, then hands over to the real poweroff.
+#
+# Protocol (all files in /tmp):
+#   psp-poweroff-req  created here: "a power-off is being requested" (holds the epoch)
+#   psp-poweroff-ok   created by launch.sh once it is ready for power-off
+#   psp-pak.pid       pid of launch.sh; if that process is gone nobody can
+#                     answer, so we stop waiting
+#
+# The wait is bounded and never happens when no PSP session is running.
+# Budget for the 15 s default: PPSSPP quits at most 5 s after SIGTERM even if
+# its save is not done, then shuts down (a second or two, it also writes
+# ppsspp.ini); launch.sh then needs about a second (marker, preview, sync).
+# launch.sh usually answers well before that, and the wait ends early if
+# launch.sh is gone.
+#
+# Test overrides (production uses the defaults):
+#   PSP_POWEROFF_TMP      directory of the files above   (default /tmp)
+#   PSP_POWEROFF_REAL     the real poweroff               (default /sbin/poweroff)
+#   PSP_POWEROFF_BUSYBOX  busybox fallback                (default /bin/busybox)
+#   PSP_POWEROFF_TIMEOUT  seconds to wait at most         (default 15)
+
+TMP_DIR="${PSP_POWEROFF_TMP:-/tmp}"
+REAL_POWEROFF="${PSP_POWEROFF_REAL:-/sbin/poweroff}"
+BUSYBOX="${PSP_POWEROFF_BUSYBOX:-/bin/busybox}"
+TIMEOUT="${PSP_POWEROFF_TIMEOUT:-15}"
+case "$TIMEOUT" in "" | *[!0-9]*) TIMEOUT=15 ;; esac
+
+REQ_FILE="$TMP_DIR/psp-poweroff-req"
+OK_FILE="$TMP_DIR/psp-poweroff-ok"
+PID_FILE="$TMP_DIR/psp-pak.pid"
+LOG_FILE="$TMP_DIR/psp-poweroff-shim.log"
+
+log() {
+    echo "poweroff shim: $*" >>"$LOG_FILE" 2>/dev/null
+}
+
+# True if the launch.sh named in the pid file is still running.
+pak_alive() {
+    pak_pid=""
+    [ -f "$PID_FILE" ] && read -r pak_pid <"$PID_FILE"
+    case "$pak_pid" in "" | *[!0-9]*) return 1 ;; esac
+    kill -0 "$pak_pid" 2>/dev/null
+}
+
+if pak_alive; then
+    log "requesting power-off from launch.sh (pid $pak_pid)"
+    # The epoch inside lets launch.sh tell a stale request from a live one.
+    date +%s >"$REQ_FILE" 2>/dev/null
+    waited=0
+    while :; do
+        if [ -f "$OK_FILE" ]; then
+            log "launch.sh is ready after ${waited}s"
+            break
+        fi
+        if ! pak_alive; then
+            log "launch.sh is gone after ${waited}s"
+            break
+        fi
+        if [ "$waited" -ge "$TIMEOUT" ]; then
+            log "gave up waiting after ${waited}s"
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+else
+    log "no PSP session running, not waiting"
+fi
+
+# Absolute paths first, so this can never call itself.
+if [ -x "$REAL_POWEROFF" ]; then
+    exec "$REAL_POWEROFF" "$@"
+fi
+[ -x "$BUSYBOX" ] && exec "$BUSYBOX" poweroff "$@"
+
+# Last resort: any other poweroff in PATH, skipping this script's own directory
+# (and anything that is this script).
+# (No dirname/basename: parameter expansion only, PATH may be odd here.)
+case "$0" in
+*/*) self_dir="$(cd "${0%/*}" 2>/dev/null && pwd)" ;;
+*) self_dir="" ;;
+esac
+self_name="${0##*/}"
+[ -n "$self_name" ] || self_name=poweroff
+old_ifs="$IFS"
+IFS=:
+for dir in $PATH; do
+    IFS="$old_ifs"
+    [ -n "$dir" ] || continue
+    [ "$dir" = "$self_dir" ] && continue
+    [ "$(cd "$dir" 2>/dev/null && pwd)" = "$self_dir" ] && continue
+    cand="$dir/$self_name"
+    if [ ! -f "$cand" ] || [ ! -x "$cand" ]; then continue; fi
+    # shellcheck disable=SC3013 # -ef is supported by BusyBox ash and dash
+    [ "$cand" -ef "$0" ] 2>/dev/null && continue
+    # shellcheck disable=SC2093 # exec is the point: the loop ends here
+    exec "$cand" "$@"
+done
+IFS="$old_ifs"
+log "no real poweroff found (tried $REAL_POWEROFF, $BUSYBOX, PATH)"
+exit 1

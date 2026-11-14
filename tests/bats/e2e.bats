@@ -15,7 +15,7 @@
 # least one file in a "...(PSP)" folder under Roms/. The test uses the FIRST file there.
 #
 # It temporarily changes recents / resume files of the test game and restores them at the end.
-# The backup is kept on the SD card (/.userdata/shared/.psp-e2e-backup); if a run is cut
+# The backup is kept on the SD card (/.userdata/shared/.psp-test-backup, shared with reboot.bats); if a run is cut
 # short, the next run restores from it first. Do not touch the device while it runs.
 #
 # The tests run in order and share state (E2 builds on the game that E2's first test starts).
@@ -24,18 +24,41 @@
 #   SDCARD_PATH (/mnt/SDCARD)  PLATFORM  ROM_DIR  ROM  OUT_DIR (this file uses OUT_DIR/e2e)
 #   PSP_KEYS   space separated steps run inside PPSSPP after boot, to make save states.
 #              Steps: up down left right a b x y l1 r1 select start | chords joined with +
-#              (select+r1) | sleep<sec> | shot
-#              Default uses the PPSSPP hotkeys set up on the device: select+r1 = save state,
-#              select+right = next slot. It saves slot 0, moves to slot 1 and saves again.
+#              (select+r1) | sleep<sec> | shot | saved (waits until a NEW save state has been written
+#              since the last key and its files stopped changing; SAVE_WAIT, 10 s, is the backup)
+#              Default: save, next slot, save (each save followed by "saved"; a fixed 1 s after Next
+#              Slot, for the evidence screenshot), using the hotkeys of the DEVICE: the Save State,
+#              Next Slot and Exit App bindings are read from the pak's controls.ini (see
+#              tests/helpers/devconfig.bash). PPSSPP has no default for them: a hotkey that is
+#              not bound there is reported by the preflight (bind it, or set the variables).
 #              PSP_KEYS="" skips saving: then there must be no preview (NextUI shows No Preview).
-#   EXIT_KEYS  how the emulator is quit (default select+start; "" kills PPSSPP instead).
+#   SAVE_KEYS, NEXT_SLOT_KEYS  override the two hotkeys above (same step syntax, one chord);
+#              a hotkey given this way is not touched in controls.ini.
+#   SET_HOTKEYS  (1) a needed hotkey that is not bound in controls.ini is bound by the test
+#              (Save State select+r1, Next Slot select+right, Exit App select+start, or a free
+#              fallback) and the original controls.ini is put back at the end; 0 = do not,
+#              an unbound hotkey is then a preflight failure.
+#   EXIT_KEYS  how the emulator is quit (default: the Exit App hotkey; "" kills PPSSPP instead).
 #   BOOT_WAIT (20)  UI_WAIT (6)  KEY_GAP (0.5)  CHORD_HOLD (0.3)
+#   BOOT_SETTLE (6)  UI_SETTLE (2)  how long the waits are quiet, in seconds. After a game start the test
+#              polls (every second) until PPSSPP has run the ROM (argv from /proc, and
+#              /tmp/emulator_pid naming it when minui-power-control wrote it) as the SAME process for
+#              BOOT_SETTLE seconds; a game that dies while starting ends the wait at once. After a NextUI
+#              start until the same nextui.elf has been up for UI_SETTLE seconds with no game and no
+#              auto-resume marker. No verified signal says "PPSSPP takes hotkeys" or "NextUI has drawn",
+#              so these defaults come from the maintainer's observations (a game starts within about 5 s
+#              including the state load, the Game Switcher loads in about 1 s), not from measurements by the test. Raise them for a slow
+#              device, lower them once verified. BOOT_WAIT and UI_WAIT are the upper bounds (each plus the
+#              quiet time); a default larger than the bound is cut to it.
+#              KEY_GAP and CHORD_HOLD are spacing of the injected key presses: no signal exists
+#              for them, so they stay fixed.
 #
 # The save states made by the test (new files in /.userdata/shared/PSP-ppsspp) are deleted
 # at the end. A state that already existed in slot 0 or 1 of the test game is overwritten.
 
 load '../helpers/common'
 load '../helpers/e2e'
+load '../helpers/devconfig'
 
 setup_file() {
     require_tools awk cmp cp mv rm mkdir grep head tail tr find ls wc sed cat sleep touch basename dirname sync pgrep killall id printf
@@ -51,35 +74,27 @@ setup_file() {
     BOOT_WAIT="${BOOT_WAIT:-20}"
     UI_WAIT="${UI_WAIT:-6}"
     KEY_GAP="${KEY_GAP:-0.5}"
-    PSP_KEYS="${PSP_KEYS-select+r1 sleep3 shot select+right sleep1 shot select+r1 sleep3 shot}"
-    EXIT_KEYS="${EXIT_KEYS-select+start}"
     STATE_DIR="$SD/.userdata/shared/PSP-ppsspp"
     PNGCOLOR="$TESTS_DIR/bin/pngcolor"
-    BAK="$SD/.userdata/shared/.psp-e2e-backup" # on the SD card, so a power loss cannot lose it
+    BAK="$SHARED/.psp-test-backup" # on the SD card, so a power loss cannot lose it; shared with reboot.bats
 
-    # --- preflight ---
-    [ "$(id -u)" = 0 ] || fail "run as root (needed to write to /dev/input)"
-    [ -d "$PAK" ] || fail "the pak is not installed at $PAK"
-    [ -x "$PAK/bin/jpg2bmp" ] || fail "$PAK/bin/jpg2bmp missing (install a pak built by CI or make build)"
-    [ -f "$MON/bin/screenshot" ] || fail "Screenshot Monitor pak not found at $MON"
-    [ -x "$PNGCOLOR" ] || fail "$PNGCOLOR missing (use the bundle from make test-bundle)"
-    [ -f /tmp/nextui_exec ] || fail "NextUI launcher not running (/tmp/nextui_exec missing)"
-
+    # --- preflight (the checks that need ROM etc. come after they are found, below) ---
     PAD="$(awk '/^N: Name="TRIMUI Player1"/{f=1} f&&/^H: Handlers=/{for(i=1;i<=NF;i++) if($i ~ /^event/){print "/dev/input/" $i; exit}}' /proc/bus/input/devices)"
-    [ -c "$PAD" ] || fail "TRIMUI Player1 input device not found"
+    INI="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
+    CONTROLS="$PAK/PPSSPP/.config/ppsspp/PSP/SYSTEM/controls.ini"
+    e2e_setup_hotkeys
 
     if [ -z "${ROM_DIR:-}" ]; then
         for d in "$SD"/Roms/*"(PSP)"; do
             [ -d "$d" ] && ROM_DIR="$d" && break
         done
     fi
-    [ -d "${ROM_DIR:-}" ] || fail "no Roms/*(PSP) folder found (set ROM_DIR)"
-    if [ -z "${ROM:-}" ]; then
+    if [ -z "${ROM:-}" ] && [ -d "${ROM_DIR:-}" ]; then
         for f in "$ROM_DIR"/*; do
             [ -f "$f" ] && ROM="$f" && break
         done
     fi
-    [ -f "${ROM:-}" ] || fail "no game file in $ROM_DIR (set ROM)"
+    [ -f "${ROM:-}" ] || ROM="" # reported by the preflight below
 
     # Same emu tag NextUI uses: the text in the last (...) of the Roms folder name.
     tag="${ROM%/*}"
@@ -90,7 +105,7 @@ setup_file() {
         tag="${tag%%)*}"
         ;;
     esac
-    ROM_FILE="$(basename "$ROM")"
+    ROM_FILE="$(basename "${ROM:-none}")"
     MINUI="$SHARED/.minui/$tag"
     SLOT_FILE="$MINUI/$ROM_FILE.txt"
     PREVIEW="$MINUI/$ROM_FILE.0.bmp" # slot 0, used by E1; E2 uses whatever slot the game saved
@@ -99,36 +114,48 @@ setup_file() {
     AUTORESUME="$SHARED/.minui/auto_resume.txt"
     SHOTDIR="$SD/Screenshots"
 
-    export SD PLATFORM PAK MON SHARED LOGS OUT BOOT_WAIT UI_WAIT KEY_GAP PSP_KEYS EXIT_KEYS \
+    # ONE message with everything that must change, before anything is touched.
+    if ! problems="$(e2e_preflight_problems)"; then
+        fail "the device is not set up for this test, change this and run again:
+$problems"
+    fi
+    info "hotkeys (read from the device):"
+    info "$(printf '%s' "$HOTKEY_INFO" | sed 's/^/  /')"
+    info "NextUI start screen: $(cfg_start_mode_info "$SHARED/minuisettings.txt") (the tests work in either mode)"
+
+    export INI CONTROLS SAVE_KEYS NEXT_SLOT_KEYS SD PLATFORM PAK MON SHARED LOGS OUT BOOT_WAIT UI_WAIT BOOT_SETTLE UI_SETTLE KEY_GAP PSP_KEYS EXIT_KEYS \
         STATE_DIR PNGCOLOR BAK PAD ROM_DIR ROM tag ROM_FILE MINUI SLOT_FILE PREVIEW RECENT \
         PERSIST AUTORESUME SHOTDIR
 
-    mkdir -p "$OUT" "$BAK"
-
-    # --- back up everything we will touch ---
-    if [ -f "$BAK/active" ]; then
-        info "found the backup of an aborted run: restoring those files first"
-        restore_files
-        rm -f "$BAK/active"
-    fi
-    rm -f "${OUT:?}"/*.png "${OUT:?}"/*.log "${OUT:?}"/*.shotname \
-        "${BAK:?}/present" "${BAK:?}/absent" "${BAK:?}/states.before" "${BAK:?}/marker"
+    mkdir -p "$OUT"
+    rm -f "${OUT:?}"/*.png "${OUT:?}"/*.log "${OUT:?}"/*.shotname
     info "device pad: $PAD"
     info "game:       $ROM"
     info "emu tag:    $tag"
 
-    # "active" is set before anything is copied or changed, so an abort at any point from here
-    # on (also halfway through the stashing) is restored by teardown_file or the next run.
-    : >"$BAK/active"
-    sync
-    for f in "$RECENT" "$PERSIST" "$AUTORESUME" "$SLOT_FILE" "$PREVIEW"; do stash "$f"; done
-    for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && stash "$f"; done # previews of other slots
-    sync
+    # Back everything up (a leftover backup of a cut-short run, e2e or reboot, is restored first).
+    # Nothing has been changed before this succeeds.
+    psp_backup >"$OUT/backup.txt" 2>&1 || fail "could not back up the device's files, nothing was changed: $(cat "$OUT/backup.txt")"
+    [ -s "$OUT/backup.txt" ] && info "$(cat "$OUT/backup.txt")"
+    # What a cut-short run had bound is gone again: resolve the hotkeys from the restored file.
+    e2e_reinit_hotkeys
+    [ -z "$HOTKEY_PROBLEMS" ] || fail "the device is not set up for this test, change this and run again:
+$HOTKEY_PROBLEMS"
+    # Bind the missing hotkeys (the backup above has the original; PPSSPP reads controls.ini when
+    # it starts, so this is in place before any game is launched).
+    cfg_apply_hotkeys >"$OUT/hotkeys.txt" 2>&1 || fail "could not set the hotkeys (see $OUT/hotkeys.txt): $(cat "$OUT/hotkeys.txt")"
+    [ -s "$OUT/hotkeys.txt" ] && info "$(cat "$OUT/hotkeys.txt")"
 
     # E1 starts from: the game in recents, slot 0 chosen.
     mkdir -p "$MINUI"
     seed_recent
     printf 0 >"$SLOT_FILE"
+}
+
+# Before every test: renew the lease of the keep-awake loop that run-device.sh runs on the device (it ends by
+# itself when nobody renews it).
+setup() {
+    keepawake_renew
 }
 
 # After every test: undo a preview that a test renamed to .off, even when the test aborted.
@@ -143,13 +170,19 @@ teardown() {
 }
 
 teardown_file() {
-    # Only when the backup was made (setup_file may have failed in the preflight).
+    # Only when there is a backup (setup_file may have failed in the preflight, before it).
     [ -n "${BAK:-}" ] && [ -f "$BAK/active" ] || return 0
-    killall PPSSPPSDL_"$PLATFORM" 2>/dev/null
-    restore_files
-    rm -f "$BAK/active"
-    kill_ui # relaunches NextUI with the restored files
-    echo "# restored; results in $OUT" >&3
+    local had_hotkeys=0
+    [ -f "$BAK/controls.bound" ] && had_hotkeys=1
+    # psp_finish stops PPSSPP first (it rewrites its ini files when it exits), restores NORMALLY
+    # only the backup this run made (PSP_RUN_ID) and strictly any other one.
+    if psp_finish 2>&3; then
+        kill_ui # relaunches NextUI with the restored files
+        CFG_CTL="$CONTROLS" cfg_report_restore "$had_hotkeys" | sed 's/^/# /' >&3
+        echo "# restored; results in $OUT" >&3
+    else
+        echo "# NOT restored: the backup is in $BAK and is restored by the next run (tests or reboot tests)" >&3
+    fi
 }
 
 # --- E1: NextUI renders the BMP that jpg2bmp makes ------------------------------------------
@@ -184,13 +217,11 @@ teardown_file() {
     for f in "$MINUI/$ROM_FILE".*.bmp; do [ -f "$f" ] && rm -f "$f"; done
     seed_recent
     mkdir -p "$STATE_DIR"
-    ls -1 "$STATE_DIR" >"$BAK/states.before" 2>/dev/null
-    touch "$BAK/marker"
-    sleep 2 # FAT mtimes have 2 s resolution
+    e2e_timed "marker (file system clock past it)" touch_marker "$BAK/marker" # (FAT mtimes have 2 s resolution: returns once the clock is past the mark)
     printf "'%s/launch.sh' '%s'\n" "$PAK" "$ROM" >/tmp/next
     kill_ui # the launcher loop then runs /tmp/next
-    wait_for 60 running PPSSPPSDL || fail "PPSSPP did not start within 60 s"
-    sleep "$BOOT_WAIT"
+    e2e_timed "PPSSPP started (process up)" wait_for 60 running PPSSPPSDL || fail "PPSSPP did not start within 60 s"
+    e2e_timed "game_settle (the same PPSSPP for BOOT_SETTLE s)" game_settle || fail "the game did not settle (see above)"
 
     shot e2-game
     have_shot e2-game
@@ -200,30 +231,38 @@ teardown_file() {
 }
 
 @test "E2 PPSSPP exits and NextUI is back" {
-    local i=0 k exit_ok=1
+    local i=0 k exit_ok=1 states=0
     for k in $PSP_KEYS; do
         i=$((i + 1))
         case "$k" in
-        sleep*) sleep "${k#sleep}" ;;
+        # explicit pacing from PSP_KEYS: waits for something on the screen (a save overlay) or lets
+        # PPSSPP finish a write; there is no signal for it, and the user chose the duration
+        sleep*) e2e_timed "step $i: $k (fixed)" sleep "${k#sleep}" ;;
+        # the save hotkey's positive signal: a new state written since the last key (and finished);
+        # not there within SAVE_WAIT s: go on, "two save states were written" says what is missing
+        saved) e2e_timed "step $i: a new save state written" wait_state_saved "$states" || true ;;
         shot) shot "e2-step$i" ;;
         *)
+            states="$(new_state_count)"
             press "$k"
-            sleep "$KEY_GAP"
+            sleep "$KEY_GAP" # spacing between injected key presses: no signal exists for "the emulator took the key"
             ;;
         esac
     done
 
     if [ -n "$EXIT_KEYS" ]; then
         press "$EXIT_KEYS"
-        wait_for 20 not_running PPSSPPSDL || exit_ok=0
+        # (PPSSPP saves a state on exit when SaveStateOnExit is on: that write is part of this wait)
+        e2e_timed "PPSSPP exited after the Exit hotkey (process gone)" wait_for 20 not_running PPSSPPSDL || exit_ok=0
     fi
     running PPSSPPSDL && killall PPSSPPSDL_"$PLATFORM" 2>/dev/null
-    wait_for 30 not_running PPSSPPSDL || fail "PPSSPP was still running 30 s after it was killed"
-    wait_for 90 running nextui.elf || fail "NextUI did not come back within 90 s"
-    sleep "$UI_WAIT"
+    e2e_timed "PPSSPP gone" wait_for 30 not_running PPSSPPSDL || fail "PPSSPP was still running 30 s after it was killed"
+    e2e_timed "NextUI back (process up)" wait_for 90 running nextui.elf || fail "NextUI did not come back within 90 s"
+    e2e_timed "ui_settle (the same NextUI for UI_SETTLE s)" ui_settle || fail "NextUI did not settle after the game"
     ls -l --full-time "$STATE_DIR" >"$OUT/e2-states.txt" 2>/dev/null || ls -l "$STATE_DIR" >"$OUT/e2-states.txt" 2>&1
     cp "$LOGS/PSP.txt" "$OUT/e2-PSP.log" 2>/dev/null
-    [ "$exit_ok" = 1 ] || fail "PPSSPP did not exit on $EXIT_KEYS (it had to be killed)"
+    [ "$exit_ok" = 1 ] || fail "PPSSPP did not exit on the Exit hotkey ($EXIT_KEYS) and had to be killed. Hotkeys used:
+$HOTKEY_INFO Check the Exit App binding in PPSSPP's Controls > Hotkeys (or set EXIT_KEYS)"
 }
 
 @test "E2 no save state: no slot file, no preview image" {
@@ -246,7 +285,8 @@ teardown_file() {
     local n
     n="$(new_state_thumbs | wc -l)"
     info "new states: $n"
-    [ "$n" -ge 2 ]
+    [ "$n" -ge 2 ] || fail "$n new state(s), expected 2: PPSSPP did not react to the keys that were pressed. Hotkeys used:
+$HOTKEY_INFO Check the bindings in PPSSPP's Controls > Hotkeys (or set SAVE_KEYS/NEXT_SLOT_KEYS)"
 }
 
 @test "E2 slot file holds the newest state's slot" {

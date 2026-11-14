@@ -1,7 +1,9 @@
 PAK_NAME := $(shell jq -r .name pak.json)
 
 MINUI_POWER_CONTROL_VERSION := 1.1.0
-PPSSPP_RELEASE_URL := https://github.com/ben16w/PPSSPP-spruce/releases/download/beta-main
+# PPSSPP build with "Save state on exit" (Stapta-nl/ppsspp save-on-exit-v1.20.3).
+# Override on the command line, e.g. make build PPSSPP_RELEASE_URL=https://.../beta-main
+PPSSPP_RELEASE_URL ?= https://github.com/Stapta-nl/PPSSPP-spruce/releases/download/beta-save-on-exit
 SPRUCEOS_PSP_URL := https://raw.githubusercontent.com/spruceUI/spruceOS/main/Emu/PSP
 STB_COMMIT := d14d46f6b44456eb88beac58cba833a4135d4c89
 
@@ -29,6 +31,24 @@ export $(DEVICE_VARS)
 
 # bin/jpg2bmp must be an aarch64 binary. CI builds natively on ubuntu-24.04-arm;
 # when building elsewhere pass a cross compiler, e.g. CC=aarch64-linux-gnu-gcc.
+
+# Off-device checks: syntax, shellcheck, the auto-resume test.
+# POSIX sh scripts (sh -n); the test runners tests/run-*.sh, bundle.sh and collect.sh are bash.
+SH_FILES := launch.sh bin/poweroff $(wildcard scripts/*.sh) tests/autoresume.sh tests/collectors/pak-files.sh
+SHELL_FILES := $(SH_FILES) $(filter-out $(SH_FILES),$(wildcard tests/*.sh))
+
+lint:
+	for f in $(SH_FILES); do sh -n "$$f" || exit 1; done
+	shellcheck -x $(SHELL_FILES)
+	# exactly what tests/bats/repo.bats runs (keep the two in step): also the bash helpers and the bats files
+	shellcheck -x launch.sh scripts/*.sh tests/*.sh tests/helpers/*.bash tests/bats/*.bats
+
+# The auto-resume logic (real launch.sh, stub PPSSPP, real bind mounts; needs root or sudo).
+# Plain sh on purpose: CI also runs it under BusyBox in docker (see ci.yaml). The poweroff shim
+# protocol is tests/bats/poweroff.bats. Part of "make test"; SRC_PAK is passed on to the script.
+.PHONY: lint test-shell
+test-shell: lint
+	sh tests/autoresume.sh
 
 clean:
 	rm -f bin/minui-power-control bin/setalpha bin/jpg2bmp PPSSPP/PPSSPPSDL_tg5040 PPSSPP/PPSSPPSDL_tg5050 PPSSPP/libstdc++.so.6 src/stb_image.h tests/bin/pngcolor dist/psp-device-tests.tar.gz dist/test-report-*.tar.gz
@@ -122,7 +142,7 @@ BATS_DEPS := tests/lib/bats-core/bin/bats tests/lib/bats-support/load.bash tests
 # JPG2BMP=<file> overrides the aarch64 converter.
 .PHONY: test test-device test-bundle $(addprefix test-device-,$(PLATFORMS))
 
-test: $(BATS_DEPS) $(if $(or $(SRC_PAK),$(JPG2BMP)),,bin/jpg2bmp)
+test: test-shell $(BATS_DEPS) $(if $(or $(SRC_PAK),$(JPG2BMP)),,bin/jpg2bmp)
 	MAKE_VARS="PAK_NAME=$(PAK_NAME) PLATFORMS=$(subst $(space),$(comma),$(PLATFORMS)) SRC_PAK=$(SRC_PAK) RELEASE_ZIP=$(RELEASE_ZIP) JPG2BMP=$(JPG2BMP) CC=$(CC) MAKECMDGOALS=$(MAKECMDGOALS)" \
 		bash tests/run-host.sh
 

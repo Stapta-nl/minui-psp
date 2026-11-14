@@ -10,7 +10,7 @@
 
 load '../helpers/common'
 
-REQUIRED_FILES="launch.sh scripts/ini.sh scripts/set_ini_values.awk scripts/retroachievements.sh pak.json bin/jpg2bmp"
+REQUIRED_FILES="launch.sh scripts/ini.sh scripts/set_ini_values.awk scripts/retroachievements.sh pak.json bin/jpg2bmp bin/poweroff"
 
 @test "shellcheck passes on all shell scripts and bats files" {
     require_tools shellcheck
@@ -36,6 +36,17 @@ REQUIRED_FILES="launch.sh scripts/ini.sh scripts/set_ini_values.awk scripts/retr
                 return 1
             }
         done
+    fi
+}
+
+@test "bin/poweroff is executable in the release" {
+    [ -x "$(psp_src_pak)/bin/poweroff" ]
+    if [ -n "${RELEASE_ZIP:-}" ]; then
+        require_tools unzip
+        run unzip -Z -l "$RELEASE_ZIP" bin/poweroff
+        assert_success
+        # the zip keeps the unix mode: -rwxr-xr-x
+        assert_output --partial "-rwx"
     fi
 }
 

@@ -35,17 +35,31 @@ PPSSPP_INI="$PPSSPP_SYSTEM_DIR/ppsspp.ini"
 # shellcheck source=scripts/retroachievements.sh
 . "$PAK_DIR/scripts/retroachievements.sh"
 
+# Teardown runs once: arm_auto_resume_and_wait calls it before its wait, and
+# the EXIT trap calls it again.
+CLEANED=""
+MOUNTED_SAVEDATA=""
+MOUNTED_STATE=""
 cleanup() {
+    [ -z "$CLEANED" ] || return 0
+    CLEANED=1
     write_game_switcher_preview
     rm -f /tmp/stay_awake
+    # Only our own pid file (a newer launch.sh may have replaced it).
+    [ "$(cat "$PAK_PID_FILE" 2>/dev/null)" = "$$" ] && rm -f "$PAK_PID_FILE"
     # Temp files left behind if a signal interrupted an ini/token write.
     rm -f "$PPSSPP_INI.tmp.$$" "$PPSSPP_RA_TOKEN_FILE.tmp.$$"
     
     restore_cpu_settings 0
     restore_cpu_settings 4
 
-    umount "$EMU_DIR/.config/ppsspp/PSP/SAVEDATA" || true
-    umount "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE" || true
+    # Only what we mounted. States, marker and preview are synced by now.
+    if [ -n "$MOUNTED_SAVEDATA" ]; then
+        umount "$EMU_DIR/.config/ppsspp/PSP/SAVEDATA" 2>/dev/null || echo "Could not unmount SAVEDATA."
+    fi
+    if [ -n "$MOUNTED_STATE" ]; then
+        umount "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE" 2>/dev/null || echo "Could not unmount PPSSPP_STATE."
+    fi
 }
 
 # Succeeds (and says so) when the user opted out of config changes.
@@ -109,6 +123,501 @@ set_cpu_settings() {
     echo "$governor" >"${cpu_path}/scaling_governor"
     echo "$min_freq" >"${cpu_path}/scaling_min_freq"
     echo "$max_freq" >"${cpu_path}/scaling_max_freq"
+}
+
+# Auto-resume after shutdown.
+# NextUI/MinUI read $SHARED_USERDATA_PATH/.minui/auto_resume.txt on boot
+# (autoResume()): it holds the ROM path relative to $SDCARD_PATH, is deleted
+# as soon as it is read, and the ROM is relaunched through its Emu Pak.
+# minarch writes it only right before it powers the device off, so a crash,
+# a forced power-off or a dead battery never resumes. We follow the same
+# rule: the marker is written only once a power-off has been positively
+# detected, never while the game is running.
+#
+# The game itself is resumed by PPSSPP, not by us: with "Save state on exit"
+# ([General] SaveStateOnExit) on, PPSSPP saves a state when it is stopped,
+# also on SIGTERM (power-off), within 5 s; with "Auto load savestate"
+# ([General] AutoLoadSaveState, 2 = newest) it loads it again on the next
+# start. We never pass --state: the pak only decides whether to relaunch.
+AUTO_RESUME_PATH="$SHARED_USERDATA_PATH/.minui/auto_resume.txt"
+# Written by NextUI/MinUI on an auto-resume (slot 9) for minarch, which reads
+# and deletes it. PPSSPP never reads it, so we remove it ourselves, otherwise
+# the next built-in core started in this boot would load its slot 9 state.
+RESUME_SLOT_PATH="/tmp/resume_slot.txt"
+
+set_auto_resume() {
+    rom_path="$1"
+    case "$rom_path" in
+        "$SDCARD_PATH"/*) ;;
+        *) return 1 ;;
+    esac
+    mkdir -p "$(dirname "$AUTO_RESUME_PATH")"
+    printf '%s' "${rom_path#"$SDCARD_PATH"}" >"$AUTO_RESUME_PATH.tmp" &&
+        mv -f "$AUTO_RESUME_PATH.tmp" "$AUTO_RESUME_PATH"
+    sync
+}
+
+# Seconds since the epoch (0 if date cannot tell).
+now() {
+    date +%s 2>/dev/null || echo 0
+}
+
+# Runs next to PPSSPP. PPSSPP promises to quit within ~5 s of the SIGTERM, but
+# if it hangs the poweroff shim gives up after 15 s and the device goes off
+# without a marker. So: once the shim has asked for the power-off and PPSSPP
+# is still running after PSP_PPSSPP_WAIT seconds (default 8), arm the marker
+# and release the shim right away; PPSSPP may still finish its save, and the
+# newest state is loaded either way.
+# If PPSSPP is still running PSP_REQ_MAX_AGE seconds (default 20: the shim's
+# cap plus a margin) after the request, the power-off did not happen (aborted:
+# poweroff would have killed us): the marker, request and ok file are withdrawn,
+# so a later crash or a later normal quit is not taken for a power-off.
+# $1 PPSSPP pid, $2 ROM path.
+poweroff_watchdog() {
+    wd_pid="$1"
+    wd_rom="$2"
+    wd_wait="${PSP_PPSSPP_WAIT:-8}"
+    case "$wd_wait" in "" | *[!0-9]*) wd_wait=8 ;; esac
+    wd_max="${PSP_REQ_MAX_AGE:-20}"
+    case "$wd_max" in "" | *[!0-9]*) wd_max=20 ;; esac
+    # The shim must have time to see the ok file.
+    [ "$wd_max" -ge $((wd_wait + 2)) ] || wd_max=$((wd_wait + 2))
+    while kill -0 "$wd_pid" 2>/dev/null; do
+        if [ -f "$POWEROFF_REQ" ]; then
+            i=0
+            while [ "$i" -lt "$wd_wait" ]; do
+                sleep 1
+                i=$((i + 1))
+                kill -0 "$wd_pid" 2>/dev/null || return 0
+            done
+            echo "PPSSPP still running ${wd_wait}s after the power-off request: arming auto-resume without waiting for it."
+            set_auto_resume "$wd_rom" && echo "Auto-resume armed for $wd_rom."
+            : >"$POWEROFF_OK"
+            while [ "$i" -lt "$wd_max" ]; do
+                sleep 1
+                i=$((i + 1))
+                kill -0 "$wd_pid" 2>/dev/null || return 0
+            done
+            echo "PPSSPP still running ${i}s after the power-off request: the power-off did not happen, withdrawing the auto-resume marker."
+            rm -f "$AUTO_RESUME_PATH" "$POWEROFF_REQ" "$POWEROFF_OK"
+            sync
+            continue
+        fi
+        sleep 1
+    done
+}
+
+# Power-off handshake with bin/poweroff (see that script). The power button's
+# shutdown script runs `poweroff` from our PATH; the shim creates
+# $POWEROFF_REQ and waits (at most ~15 s) for us to create $POWEROFF_OK, which
+# we do only once the auto-resume marker is on disk. $PAK_PID_FILE tells the
+# shim that we are alive. The request file may not exist yet when PPSSPP has
+# exited: the shutdown script signals PPSSPP, then syncs and shows its
+# "Powering off" message, and only then runs `poweroff`. That is fine: the
+# pgrep check in shutdown_in_progress() sees the shutdown script, and a shim
+# that arrives after the ok file exists does not wait at all.
+#
+# Time budget (the shim waits at most 15 s from its start, which is at or after
+# the SIGTERM; PPSSPP exits at most ~7 s after the SIGTERM: 5 s hard limit for
+# the save, then its shutdown):
+#   - PPSSPP still running 8 s after the request appears: poweroff_watchdog()
+#     arms the marker and releases the shim anyway (ok at ~9-10 s, cap 15 s).
+#   - PPSSPP exited on a signal but no power-off is visible yet: up to
+#     PSP_SHUTDOWN_GRACE seconds (default 3) of polling, see
+#     shutdown_in_progress(). This is spent before the shim's request exists
+#     (once it does, the first poll sees it), and it counts as time since
+#     PPSSPP exited, so it can only make the preview be skipped, never delay
+#     the ok file past the numbers below.
+#   - after PPSSPP exits: marker + sync first; the preview only if that was
+#     quick (PSP_PREVIEW_BUDGET, default 3 s), so the ok file is given at most
+#     ~7 s + 3 s + 3 s after the SIGTERM; nothing slow happens after it.
+POWEROFF_REQ="/tmp/psp-poweroff-req"
+POWEROFF_OK="/tmp/psp-poweroff-ok"
+PAK_PID_FILE="/tmp/psp-pak.pid"
+
+# Logs the global save-on-exit/auto-load settings (a per-game config of
+# PPSSPP may override them). Read only, for diagnosing resumes.
+log_resume_settings() {
+    [ -f "$PPSSPP_INI" ] || return 0
+    awk '
+        { sub(/\r$/, "") }
+        # The shipped ini starts with a UTF-8 BOM, so do not anchor at the start.
+        /\[[^]]*\]$/ { general = ($0 ~ /\[General\]$/); next }
+        general && /^(SaveStateOnExit|AutoLoadSaveState|StateSlot)[ \t]*=/ {
+            key = $0; sub(/[ \t]*=.*/, "", key)
+            val = $0; sub(/^[^=]*=[ \t]*/, "", val)
+            v[key] = val
+        }
+        END {
+            printf "PPSSPP settings: SaveStateOnExit=%s AutoLoadSaveState=%s StateSlot=%s\n",
+                ("SaveStateOnExit" in v ? v["SaveStateOnExit"] : "(unset, off)"),
+                ("AutoLoadSaveState" in v ? v["AutoLoadSaveState"] : "(unset, off)"),
+                ("StateSlot" in v ? v["StateSlot"] : "(unset)")
+        }' "$PPSSPP_INI"
+}
+
+# True if $POWEROFF_REQ is older than PSP_REQ_MAX_AGE seconds (default 20,
+# the shim's 15 s cap plus a margin). The shim writes the epoch into it; a
+# file without a number (older shim, tests) counts as fresh.
+request_is_stale() {
+    max_age="${PSP_REQ_MAX_AGE:-20}"
+    case "$max_age" in "" | *[!0-9]*) max_age=20 ;; esac
+    req_ts=""
+    read -r req_ts <"$POWEROFF_REQ" 2>/dev/null
+    case "$req_ts" in "" | *[!0-9]*) return 1 ;; esac
+    req_now="$(now)"
+    [ "$req_now" -gt 0 ] || return 1
+    [ $((req_now - req_ts)) -gt "$max_age" ]
+}
+
+# One look for signs of a power-off; says which one it found.
+power_off_visible() {
+    # Written by our poweroff shim (bin/poweroff): the primary signal.
+    if [ -f "$POWEROFF_REQ" ]; then
+        if request_is_stale; then
+            # A power-off that never happened (the watchdog normally clears it).
+            echo "Ignoring a stale power-off request ($POWEROFF_REQ is older than the shim's wait)."
+            rm -f "$POWEROFF_REQ" "$POWEROFF_OK"
+        else
+            echo "Power-off detected: $POWEROFF_REQ exists."
+            return 0
+        fi
+    fi
+    # Set by NextUI and by minui-power-control 3.0.0+.
+    if [ -f /tmp/poweroff ]; then
+        echo "Power-off detected: /tmp/poweroff exists."
+        return 0
+    fi
+    # minui-power-control 1.x/2.x: button-handler runs its `shutdown` script
+    # by absolute path (/tmp/selfgz*/shutdown). That script kills the
+    # emulator first, then syncs, shows "Powering off" and only then runs
+    # `poweroff`, so this can lose the race against it (hence the shim, and
+    # the grace period in shutdown_in_progress). Match the command line only:
+    # the selfgz dir itself is deleted as soon as power-control's launcher
+    # notices the emulator is gone.
+    if pgrep -f '/shutdown$|^([^ ]*/)?poweroff( |$)' >/dev/null 2>&1; then
+        echo "Power-off detected: shutdown/poweroff process found."
+        return 0
+    fi
+    return 1
+}
+
+# True if the device is powering off (rather than the user quitting PPSSPP).
+# Called once, right after PPSSPP exits. $1: grace period in seconds (0: look
+# once). When PPSSPP was stopped by a signal the shutdown script is at work
+# and its `poweroff` (our shim, which creates $POWEROFF_REQ) usually comes a
+# moment later, so look again for that long. A user quit passes 0: no delay.
+shutdown_in_progress() {
+    grace="$1"
+    case "$grace" in "" | *[!0-9]*) grace=0 ;; esac
+    ticks=0
+    while :; do
+        if power_off_visible; then
+            [ "$ticks" -eq 0 ] || echo "(found after waiting $((ticks / 2)).$((ticks % 2 * 5))s)"
+            return 0
+        fi
+        [ "$ticks" -lt $((grace * 2)) ] || break
+        # Half-second steps; a sleep without fractions takes a whole second.
+        if sleep 0.5 2>/dev/null; then
+            ticks=$((ticks + 1))
+        else
+            sleep 1
+            ticks=$((ticks + 2))
+        fi
+    done
+    if [ "$grace" -gt 0 ]; then
+        echo "No power-off detected within ${grace}s (no request file, no /tmp/poweroff, no shutdown process; pgrep: $(command -v pgrep || echo missing)): treating this as a normal exit."
+    fi
+    return 1
+}
+
+# What NextUI's minarch does on a power-off (workspace/all/common/api.c,
+# PWR_powerOff): the emulator process itself draws "Quicksave created,
+# powering off" (GFX_blitMessage on its own screen) after Menu_beforeSleep()
+# wrote the quicksave and the auto-resume file. Here the screen belongs to
+# minui-power-control's shutdown script instead: it SIGTERMs PPSSPP, then runs
+# `minui-presenter --message "Powering off" --timeout -1 &` (its own function
+# called show_message; neither is a command on our PATH: the presenter binary
+# lives in the self-extracting archive's temp dir, which is deleted when the
+# emulator exits), then sync and poweroff. So, once the save is known to be
+# done, we stop that presenter and start the same binary again with our text.
+# The binary is copied from the running presenter's /proc/<pid>/exe.
+QS_MSG="Quicksave created, powering off"
+QS_DIR="/tmp/psp-quicksave"
+QS_PID=""
+PROC_DIR="${PSP_PROC_DIR:-/proc}"
+
+# True if process $1 exists and is not a zombie (a dead presenter that nobody has
+# reaped yet still shows up in pgrep and answers kill -0).
+process_alive() {
+    kill -0 "$1" 2>/dev/null || return 1
+    ! grep -q '^State:.*Z' "$PROC_DIR/$1/status" 2>/dev/null
+}
+
+# One 0.1 s step of a wait loop; NAP_T counts the tenths of a second really
+# slept (BusyBox without fractional sleep sleeps 1 s and counts 10), so loops
+# bounded by NAP_T keep their budget, like shutdown_in_progress() does.
+nap() {
+    if sleep 0.1 2>/dev/null; then
+        NAP_T=$((NAP_T + 1))
+    else
+        sleep 1
+        NAP_T=$((NAP_T + 10))
+    fi
+}
+
+# True if any of the pids in $1 is alive.
+any_alive() {
+    for aa_pid in $1; do
+        process_alive "$aa_pid" && return 0
+    done
+    return 1
+}
+
+# Stops our quicksave presenter (the device did not power off after all).
+stop_quicksave_message() {
+    [ -z "$QS_PID" ] || kill -KILL "$QS_PID" 2>/dev/null # (we run with TERM ignored: scripts cannot undo that)
+    QS_PID=""
+    rm -rf "$QS_DIR"
+}
+
+# Copies $1 to $2 (cp, then cat if cp fails); true if $2 is a non-empty executable.
+copy_executable() {
+    rm -f "$2" # a leftover that is still running would be "text file busy"
+    cp "$1" "$2" 2>/dev/null || cat "$1" >"$2" 2>/dev/null
+    [ -s "$2" ] && chmod +x "$2" 2>/dev/null && [ -x "$2" ]
+}
+
+# Runs presenter $1 once without arguments. minui-presenter validates its
+# arguments (parse_arguments: "No message or file provided", exit 1) before it
+# initialises the display, so this does not touch the screen; a binary that
+# cannot be run (126/127, a signal) fails. True if it ran and exited by itself.
+presenter_runs() {
+    "$1" >/dev/null 2>&1 &
+    pr_pid=$!
+    NAP_T=0
+    while kill -0 "$pr_pid" 2>/dev/null && [ "$NAP_T" -lt 20 ]; do nap; done
+    if kill -0 "$pr_pid" 2>/dev/null; then
+        kill -KILL "$pr_pid" 2>/dev/null
+        wait "$pr_pid" 2>/dev/null
+        echo "Quicksave message: $1 did not exit on its own within 2 s without arguments."
+        return 1
+    fi
+    wait "$pr_pid" 2>/dev/null
+    pr_status=$?
+    echo "Quicksave message: preflight of $1: exit status $pr_status."
+    [ "$pr_status" -ne 126 ] && [ "$pr_status" -ne 127 ] && [ "$pr_status" -lt 128 ]
+}
+
+# Sets QS_BIN to a minui-presenter that passed the preflight (QS_HOW says where
+# it comes from), or "". Nothing is stopped here.
+find_quicksave_presenter() {
+    QS_BIN=""
+    QS_HOW=""
+    for qs_pid in $QS_OLD_PIDS; do
+        [ -r "$PROC_DIR/$qs_pid/exe" ] || continue
+        mkdir -p "$QS_DIR" 2>/dev/null || break
+        if ! copy_executable "$PROC_DIR/$qs_pid/exe" "$QS_DIR/minui-presenter"; then
+            echo "Quicksave message: could not copy $PROC_DIR/$qs_pid/exe to $QS_DIR."
+            continue
+        fi
+        if presenter_runs "$QS_DIR/minui-presenter"; then
+            QS_BIN="$QS_DIR/minui-presenter"
+            QS_HOW="copy of the running presenter $qs_pid"
+            return 0
+        fi
+        echo "Quicksave message: the copy of presenter $qs_pid is not usable."
+        rm -f "$QS_DIR/minui-presenter"
+    done
+    if qs_cmd="$(command -v minui-presenter 2>/dev/null)" && [ -n "$qs_cmd" ]; then
+        if presenter_runs "$qs_cmd"; then
+            QS_BIN="$qs_cmd"
+            QS_HOW="minui-presenter on PATH ($qs_cmd)"
+        else
+            echo "Quicksave message: $qs_cmd is not usable."
+        fi
+    fi
+}
+
+# Stops the presenters in $1 (SIGTERM, SIGKILL after 1 s) and waits until they are
+# gone: its shutdown must not clear the screen after ours has drawn, and two
+# presenters must never run at once. True if they are gone.
+stop_presenters() {
+    # shellcheck disable=SC2086 # a list of pids
+    kill $1 2>/dev/null
+    NAP_T=0
+    while any_alive "$1" && [ "$NAP_T" -lt 10 ]; do nap; done
+    if any_alive "$1"; then
+        echo "Quicksave message: still running after SIGTERM ($1), sending SIGKILL."
+        # shellcheck disable=SC2086
+        kill -KILL $1 2>/dev/null
+        NAP_T=0
+        while any_alive "$1" && [ "$NAP_T" -lt 10 ]; do nap; done
+    fi
+    if any_alive "$1"; then
+        echo "Quicksave message: $1 survived SIGKILL."
+        return 1
+    fi
+    return 0
+}
+
+# Starts $QS_BIN with message $1 as QS_PID.
+start_quicksave_presenter() {
+    "$QS_BIN" --message "$1" --timeout -1 >/dev/null 2>&1 &
+    QS_PID=$!
+    QS_TS="$(now)"
+    echo "Quicksave message: started presenter $QS_PID with \"$1\" at $QS_TS."
+}
+
+# Checks our presenter is alive; if it died (the screen would be blank or stale)
+# starts a "Powering off" one in its place, so the screen never stays empty.
+check_quicksave_presenter() {
+    [ -n "$QS_PID" ] || return 0
+    if process_alive "$QS_PID"; then
+        echo "Quicksave message: presenter $QS_PID is running ($1)."
+        return 0
+    fi
+    echo "Quicksave message: presenter $QS_PID is gone ($1); restoring the \"Powering off\" screen."
+    start_quicksave_presenter "Powering off"
+    NAP_T=0
+    while [ "$NAP_T" -lt 3 ]; do nap; done
+    process_alive "$QS_PID" || {
+        echo "Quicksave message: the restored presenter $QS_PID is gone too."
+        QS_PID=""
+    }
+}
+
+# Like NextUI's minarch, say "Quicksave created, powering off" instead of
+# "Powering off", but only once a state really was saved during this launch
+# (newer than $STATE_MARKER). Best effort; the log says every step (what was
+# found, what ran) so a device run shows what happened. A state counts as
+# saved if it is newer than the launch, so a state the player saved by hand
+# counts too when save-on-exit is off (no cheap reliable way to tell the two
+# apart here). The old presenter is only stopped once the replacement has
+# passed a preflight, and a "Powering off" presenter is restored if ours dies.
+show_quicksave_message() {
+    saved=""
+    for ppst in "$STATE_DIR"/*.ppst; do
+        case "$ppst" in *.undo.ppst) continue ;; esac
+        # shellcheck disable=SC3013 # -nt is supported by BusyBox ash and dash
+        if [ -f "$ppst" ] && [ "$ppst" -nt "$STATE_MARKER" ]; then
+            saved="$ppst"
+            break
+        fi
+    done
+    if [ -z "$saved" ]; then
+        echo "Quicksave message: no state newer than the launch in $STATE_DIR, not shown."
+        return 0
+    fi
+    echo "Quicksave message: state saved during this launch: $saved"
+    # The shim creates the request file only after the shutdown script has
+    # started its "Powering off" presenter: wait for it (at most 2 s, then go
+    # on anyway) so that we cannot come before that presenter.
+    NAP_T=0
+    while [ ! -f "$POWEROFF_REQ" ] && [ "$NAP_T" -lt 20 ]; do nap; done
+    QS_OLD_PIDS=""
+    for qs_pid in $(pgrep minui-presenter 2>/dev/null); do
+        process_alive "$qs_pid" && QS_OLD_PIDS="${QS_OLD_PIDS:+$QS_OLD_PIDS }$qs_pid"
+    done
+    echo "Quicksave message: at $(now): request file $([ -f "$POWEROFF_REQ" ] && echo present || echo absent), minui-presenter pids: ${QS_OLD_PIDS:-none}, pgrep: $(command -v pgrep || echo missing), show_message: $(command -v show_message || echo missing)"
+    find_quicksave_presenter
+    if [ -n "$QS_BIN" ]; then
+        echo "Showing the quicksave message (using the $QS_HOW)."
+        if [ -n "$QS_OLD_PIDS" ] && ! stop_presenters "$QS_OLD_PIDS"; then
+            echo "Quicksave message: not starting a second presenter."
+            return 0
+        fi
+        [ -z "$QS_OLD_PIDS" ] || echo "Quicksave message: stopped the presenter(s) $QS_OLD_PIDS."
+        start_quicksave_presenter "$QS_MSG"
+        NAP_T=0
+        while [ "$NAP_T" -lt 3 ]; do nap; done
+        check_quicksave_presenter "0.3 s after the start"
+        return 0
+    fi
+    # No usable presenter binary: a platform show_message, if there is one.
+    if command -v show_message >/dev/null 2>&1; then
+        echo "Showing the quicksave message (show_message, no usable minui-presenter found)."
+        killall minui-presenter >/dev/null 2>&1
+        echo "Quicksave message: killall exit status $?"
+        show_message "$QS_MSG" 10 >/dev/null 2>&1 &
+    else
+        echo "Quicksave message: no usable minui-presenter and no show_message: not shown."
+    fi
+    return 0
+}
+
+# Called just before the shim is released: poweroff kills everything as soon as
+# it runs, so keep the message visible for about a second in total, counting
+# what happened since it started (the clock is in whole seconds: coarse), and
+# check once more that it is still up.
+finish_quicksave_message() {
+    [ -n "$QS_PID" ] || return 0
+    elapsed=$(($(now) - QS_TS))
+    if [ "$elapsed" -ge 2 ]; then
+        hold=0
+    elif [ "$elapsed" -ge 1 ]; then
+        hold=5
+    else
+        hold=10
+    fi
+    NAP_T=0
+    while [ "$NAP_T" -lt "$hold" ]; do nap; done
+    echo "Quicksave message: held for ${NAP_T} tenths of a second ($elapsed s since the start)."
+    check_quicksave_presenter "before the power-off is released"
+}
+
+# Arm auto-resume, tell the poweroff shim it may go ahead, then wait for the
+# power-off to finish. We must not return to NextUI/MinUI here: on its next
+# start it would read (and delete) the marker before the device is off.
+# PPSSPP has already exited, so its save on exit (state and thumbnail) is
+# complete or was given up; the marker is armed either way, and PPSSPP then
+# loads the newest state it has for the game.
+arm_auto_resume_and_wait() {
+    rom_path="$1"
+
+    armed=0
+    if set_auto_resume "$rom_path"; then
+        armed=1
+        echo "Auto-resume armed for $rom_path."
+    else
+        echo "Auto-resume not armed ($rom_path is not on the SD card)."
+    fi
+    # set_auto_resume already synced (marker and the state PPSSPP just wrote).
+    [ "$armed" = 1 ] || sync
+    # The marker comes first, so a slow preview can never cost the resume.
+    # The preview (one small JPEG conversion, then sync) is only made when the
+    # steps since PPSSPP exited were quick: it is best effort, and the shim's
+    # window must not be eaten by it.
+    budget="${PSP_PREVIEW_BUDGET:-3}"
+    case "$budget" in "" | *[!0-9]*) budget=3 ;; esac
+    used=$(($(now) - ${PPSSPP_EXIT_TS:-0}))
+    if [ -n "$PPSSPP_EXIT_TS" ] && [ "$used" -gt "$budget" ]; then
+        echo "Skipping the Game Switcher preview: ${used}s since PPSSPP exited."
+        PREVIEW_ROM=""
+    fi
+    # The message is cheap (a background process), so it does not depend on the budget.
+    [ "$armed" = 1 ] && show_quicksave_message
+    write_game_switcher_preview
+    finish_quicksave_message
+    : >"$POWEROFF_OK"
+    echo "Told the poweroff shim to go ahead."
+    # Marker, states and preview are synced and PPSSPP is gone: release the
+    # bind mounts (poweroff would anyway) and restore CPU settings now; the
+    # EXIT trap's cleanup is then a no-op.
+    cleanup
+    # Nothing armed: nothing to protect, return as before PR #6.
+    [ "$armed" = 1 ] || return 0
+    # The caller ignores INT/TERM/HUP/QUIT (trap "") and children inherit
+    # that, so one sleep cannot be cut short; poweroff ends us with SIGKILL.
+    # If the device has not powered off after a minute (PSP_AUTORESUME_WAIT,
+    # for tests), drop the marker and go back to the menu.
+    wait_secs="${PSP_AUTORESUME_WAIT:-60}"
+    case "$wait_secs" in "" | *[!0-9]*) wait_secs=60 ;; esac
+    sleep "$wait_secs"
+    echo "Device did not power off, removing auto-resume marker."
+    stop_quicksave_message
+    rm -f "$AUTO_RESUME_PATH" "$POWEROFF_REQ" "$POWEROFF_OK"
+    sync
 }
 
 # Game switcher preview.
@@ -201,7 +710,20 @@ write_game_switcher_preview() {
 
 main() {
     echo "1" >/tmp/stay_awake
-    trap "cleanup" EXIT INT TERM HUP QUIT
+    trap "cleanup" EXIT
+    trap "exit 1" INT TERM HUP QUIT
+
+    # Power-off handshake: drop leftovers of a previous run, announce ourselves.
+    rm -f "$POWEROFF_REQ" "$POWEROFF_OK"
+    echo "$$" >"$PAK_PID_FILE"
+
+    # NextUI/MinUI already consumed the marker if this is an auto-resume and
+    # left the slot it chose here: 9 for an auto-resume, 8 for a normal open.
+    # Read it before it is dropped (minarch is its only real consumer).
+    resume_slot=""
+    [ -f "$RESUME_SLOT_PATH" ] && read -r resume_slot <"$RESUME_SLOT_PATH"
+    echo "Resume slot: '$resume_slot'"
+    rm -f "$RESUME_SLOT_PATH" "$AUTO_RESUME_PATH"
 
     if [ "$PLATFORM" = "tg3040" ] && [ -z "$DEVICE" ]; then
         export PLATFORM="tg5040"
@@ -233,12 +755,16 @@ main() {
         set_cpu_settings 4 performance 1992000 2160000
     fi
 
+    # chmod first: a zip that dropped the exec bit would otherwise fail the check below.
+    chmod +x "$PAK_DIR/bin/minui-power-control" 2>/dev/null
     if ! command -v minui-power-control >/dev/null 2>&1; then
-        show_message "Minui-power-control not found." 3
+        # (show_message only exists inside minui-power-control's own scripts)
+        echo "minui-power-control not found in $PAK_DIR/bin."
         exit 1
     fi
 
-    chmod +x "$PAK_DIR/bin/minui-power-control"
+    # Without the exec bit the poweroff shim is skipped and the marker may be written too late.
+    chmod +x "$PAK_DIR/bin/poweroff" 2>/dev/null
 
     allowed_platforms="tg5040 tg5050"
     if ! echo "$allowed_platforms" | grep -q "$PLATFORM"; then
@@ -250,23 +776,62 @@ main() {
 
     mkdir -p "$SDCARD_PATH/Saves/PSP"
     mkdir -p "$EMU_DIR/.config/ppsspp/PSP/SAVEDATA"
-    mount -o bind "$SDCARD_PATH/Saves/PSP" "$EMU_DIR/.config/ppsspp/PSP/SAVEDATA"
+    mount -o bind "$SDCARD_PATH/Saves/PSP" "$EMU_DIR/.config/ppsspp/PSP/SAVEDATA" && MOUNTED_SAVEDATA=1
 
     mkdir -p "$SHARED_USERDATA_PATH/PSP-ppsspp"
     mkdir -p "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE"
-    mount -o bind "$SHARED_USERDATA_PATH/PSP-ppsspp" "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE"
+    mount -o bind "$SHARED_USERDATA_PATH/PSP-ppsspp" "$EMU_DIR/.config/ppsspp/PSP/PPSSPP_STATE" && MOUNTED_STATE=1
 
-    # NextUI's Resume hands the chosen slot over in this file; PPSSPP does not use it, and
-    # minarch would load it in the next game it launches, so remove it.
-    rm -f /tmp/resume_slot.txt
     touch "$STATE_MARKER"
-    PREVIEW_ROM="$1"
+    # One ROM variable (NextUI passes the path as the argument(s)).
+    rom_arg="$*"
+    PREVIEW_ROM="$rom_arg"
+
+    # An auto-resume (slot 9) starts like any other launch: PPSSPP's own
+    # "Auto load savestate" loads the state it saved on exit.
+    [ "$resume_slot" = "9" ] && echo "Auto-resume launch: PPSSPP loads the game's save state itself."
+    log_resume_settings
 
     # Launch emulator
     minui-power-control "${PPSSPP_BIN}_${PLATFORM}" &
-    "${PPSSPP_BIN}_${PLATFORM}" "$*" --fullscreen --pause-menu-exit
+    # PPSSPP runs in the background so that poweroff_watchdog can bound the
+    # wait; signals are only noted until it is gone, like with a foreground
+    # child: a SIGTERM must not end this script while PPSSPP is still saving.
+    got_signal=""
+    trap 'got_signal=1' INT TERM HUP QUIT
+    "${PPSSPP_BIN}_${PLATFORM}" "$rom_arg" --fullscreen --pause-menu-exit &
+    ppsspp_pid=$!
+    poweroff_watchdog "$ppsspp_pid" "$rom_arg" &
+    watchdog_pid=$!
+    ppsspp_rc=0
+    while kill -0 "$ppsspp_pid" 2>/dev/null; do
+        wait "$ppsspp_pid" 2>/dev/null
+        ppsspp_rc=$?
+    done
+    PPSSPP_EXIT_TS="$(now)"
+    kill "$watchdog_pid" 2>/dev/null
+    wait "$watchdog_pid" 2>/dev/null
 
-    write_game_switcher_preview
+    # PPSSPP exited (after its save on exit, if that is on). A SIGTERM from
+    # here on most likely comes from poweroff tearing everything down: finish
+    # the decision instead of dying halfway.
+    trap "" INT TERM HUP QUIT
+    # Exit status above 128: killed by a signal (the shutdown script's SIGTERM
+    # if PPSSPP does not handle it itself). A user Exit is not delayed.
+    grace=0
+    if [ "$ppsspp_rc" -gt 128 ] || [ -n "$got_signal" ]; then
+        grace="${PSP_SHUTDOWN_GRACE:-3}"
+        echo "PPSSPP stopped by a signal (status $ppsspp_rc): looking for a power-off for up to ${grace}s."
+    fi
+    if shutdown_in_progress "$grace"; then
+        # Marker, then preview, then ok (see arm_auto_resume_and_wait).
+        arm_auto_resume_and_wait "$rom_arg"
+    else
+        write_game_switcher_preview
+    fi
+    trap "exit 1" INT TERM HUP QUIT
+    # Signalled while PPSSPP ran and it was no power-off: end as a signal does.
+    [ -z "$got_signal" ] || exit 1
 }
 
 main "$@"
