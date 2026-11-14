@@ -68,6 +68,10 @@ PASS=0
 FAIL=0
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
+
+# Log file name for the current case: the title minus characters that GitHub's
+# upload-artifact rejects in a path (: " < > | * ? \r \n) and that are awkward elsewhere.
+case_log() { printf '%s' "$OUT_DIR/$(printf '%s' "$CASE" | tr -c 'A-Za-z0-9._ ,()+=@-' '_').log"; }
 LAUNCH_PID=""
 
 # Mounts of a launch.sh that was SIGKILLed (stacked ones need several umounts).
@@ -350,11 +354,11 @@ run_game() {
     fi
     wait "$LAUNCH_PID" 2>/dev/null
     LAUNCH_PID=""
-    cp "$LOGS/PSP.txt" "$OUT_DIR/$CASE.log" 2>/dev/null
+    cp "$LOGS/PSP.txt" "$(case_log)" 2>/dev/null
 }
 
 LOG="$OUT_DIR/current.log"
-use_log() { LOG="$OUT_DIR/$CASE.log"; }
+use_log() { LOG="$(case_log)"; }
 reset_states() { rm -rf "${STATES:?}"/* "$SHARED/.minui/PSP"; }
 EXPECT_MARKER="/Roms/PlayStation Portable (PSP)/Game B.iso"
 
@@ -550,7 +554,7 @@ if kill -0 "$LAUNCH_PID" 2>/dev/null; then LAUNCH_HUNG=1; else LAUNCH_HUNG=""; f
 kill -KILL "$LAUNCH_PID" 2>/dev/null
 wait "$LAUNCH_PID" 2>/dev/null
 LAUNCH_PID=""
-cp "$LOGS/PSP.txt" "$OUT_DIR/$CASE.log" 2>/dev/null
+cp "$LOGS/PSP.txt" "$(case_log)" 2>/dev/null
 use_log
 check "launch.sh ended by itself (no 60 s re-arm)" test -z "$LAUNCH_HUNG"
 check "no marker after the later quit" absent "$MARKER"
@@ -575,7 +579,7 @@ if kill -0 "$LAUNCH_PID" 2>/dev/null; then LAUNCH_HUNG=1; else LAUNCH_HUNG=""; f
 kill -KILL "$LAUNCH_PID" 2>/dev/null
 wait "$LAUNCH_PID" 2>/dev/null
 LAUNCH_PID=""
-cp "$LOGS/PSP.txt" "$OUT_DIR/$CASE.log" 2>/dev/null
+cp "$LOGS/PSP.txt" "$(case_log)" 2>/dev/null
 use_log
 check "launch.sh ended by itself" test -z "$LAUNCH_HUNG"
 check "no marker" absent "$MARKER"

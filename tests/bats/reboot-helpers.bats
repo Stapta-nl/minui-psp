@@ -489,7 +489,9 @@ make_device() {
     export FAKE_SSH_LINGER=37 RB_TRIGGER_LINGER=1
     local t0=$SECONDS
     rb_trigger true
-    [ $((SECONDS - t0)) -lt 12 ]
+    # The fake call lingers 37 s; returning within 20 s shows it was cut at the linger time.
+    # Wall-clock bound, loose on purpose: slow CI runners took 11-12 s here.
+    [ $((SECONDS - t0)) -lt 20 ]
     [ -n "$RB_T_TRIGGER_RET" ]
     [ "$RB_TRIGGER_MS" -lt 8000 ]
     if pgrep -f 'sleep 37' >/dev/null; then echo "a lingering ssh child is still running"; return 1; fi
